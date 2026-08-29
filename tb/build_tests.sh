@@ -1,11 +1,13 @@
 #!/bin/sh
 # Assemble the AP040 self-test programs into $readmemh images.
-# Requires vasmm68k_mot (vbcc toolchain).
+# Requires vasmm68k_mot (vbcc toolchain) -- set VASM if it isn't on PATH
+# under the plain name (the previous hardcoded path only existed on one
+# machine).
 
 set -e
 cd "$(dirname "$0")"
 
-VASM=${VASM:-/opt/amiga-cc/vbcc/bin/vasmm68k_mot}
+VASM=${VASM:-vasmm68k_mot}
 mkdir -p build
 
 # bench_loop is a measurement program, not a regression leg: it is built

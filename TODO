@@ -1,0 +1,35 @@
+FIX FIRST
+- add support for AROS - ONGOING (IDE problems)
+- A8 kickstart ROM mirror - WONTFIX (memory block is partly occupied by HRTmon, besides it is very rarely used)
+
+
+IMPORTANT - AGA CHIPSET stuff
+- increment hpos counter in denise by two LSB bits (35ns counter)
+- hdiwstrt & hdiwstop (HDIWHIGH) also have two new high-resolution bits
+- actually, all (horizontal) comparators in AGA chipset have 35ns resolution
+- http://eab.abime.net/showpost.php?p=669147&postcount=77
+- bitplane shifter problems 
+  * more 'undocumented' stuff ... (looks like the output shifter is actually 256 bit to allow 64-pixel fetches in lowres to be shifted on shres resolution - implemented)
+  * upper is probably wrong, shifter is 64bits plus additional shres shifter (two bits?)
+  * even that bitplane shifter is probably wrong: http://eab.abime.net/showthread.php?t=71437
+  * check if shifter problems are the cause of minimig display shifted to the right too much in some cases (how is shres scrolling supposed to work - what to do if those bits are set to 0??)
+- bitplane DMA register delays (TLC - PowerTrax demo, hint by Toni Wilen):
+  * Writing to BPLxPT when exactly next cycle has DMA to matching BPLxDAT: write goes nowhere. (Same happens with sprites and blitter registers too, I assume all DMA channels have similar internal 2 cycle pipeline)
+  * Another similar special feature is bitplane modulos, writing to BPLxMOD when exactly next cycle is matching BPLxDAT write and it also does modulo add, _old_ modulo value is used! (Write to BPLxMOD is still accepted, next time BPLxMOD value is needed it is used normally)
+- sprites can be positioned on 35ns pixels - to add! - I think I did this - CHECK
+- add CD32 gamepad emulation and / or real amiga cd32 gamepad support (http://gerdkautzmann.de/cd32gamepad/cd32gamepad.html) - ONGOING
+- reimplement blitter - CONSIDERING
+
+
+IMPORTANT - CPU stuff
+- CPU kickstart turbo - DONE, some problems remain - ONGOING
+- CPU compatibility fixes are a must! - ONGOING (Till fixed most of the instructions, still need to check stack frames - see (http://lxr.free-electrons.com/source/include/asm-m68k/traps.h?v=2.2.26 ... http://ftp.dei.uc.pt/pub/linux/kernel/people/geert/uClinux-amiga-2.6.x-merging/008-frame.diff)
+- CPU fix cart compatibility problems (overlay detection should be moved to TG68K.vhd); big problems with turbo kickstart - ONGOING
+
+
+LOW - waaay down the line
+- ethernet - ONGOING
+- turbo blitter
+- RTG
+- AHI audio
+

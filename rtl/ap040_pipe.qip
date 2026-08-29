@@ -1,0 +1,17 @@
+# Milestone 8 (DBcc). Not yet referenced by any project-level .qip -- this
+# core is built and tested standalone (tb/run_pipe_tests.sh) until a later
+# milestone wires it into a real host. As of milestone 6 (folder
+# independence), rtl/ is fully self-contained: it forks its own ALU and
+# register file (ap040_pipe_alu.v/ap040_pipe_regfile.v) rather than reusing
+# rtl_old/'s, so both must be listed here -- neither comes from any other
+# .qip the way an earlier draft of this comment assumed.
+set_global_assignment -name SEARCH_PATH      [file join $::quartus(qip_path) . ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_inst_fetch.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_decode.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_ea_calc.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_ea_fetch.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_execute.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_writeback.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_alu.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_regfile.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_core.v ]

@@ -1,5 +1,9 @@
 #!/bin/sh
-# AP68040 self-test suite.
+# AP68040 self-test suite -- the WORKING sequential core (rtl_old/), kept as
+# the golden reference while rtl/ap040_pipe_* is built up to replace it (see
+# tb/run_pipe_tests.sh). Do not repoint RTL below at rtl/ -- that directory
+# holds the pipelined core under construction and does not implement this
+# module set; see AP040_IMPLEMENTATION_PLAN.md.
 #
 # Needs iverilog and vasmm68k_mot (vbcc).  Everything here runs against the
 # core alone -- no host-project sources -- so a failure is the CPU's, not an
@@ -10,7 +14,7 @@ set -eu
 cd "$(dirname "$0")"
 
 VASM=${VASM:-vasmm68k_mot}
-RTL=../rtl
+RTL=../rtl_old
 WORK=build
 mkdir -p "$WORK"
 

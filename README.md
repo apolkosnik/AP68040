@@ -14,8 +14,12 @@ failures — the corpus records expectations no real MC68040 can satisfy; see
 
 ## What is here
 
+This tree currently holds **two** cores, mid-transition from one to the
+other -- see `AP040_IMPLEMENTATION_PLAN.md` for the full status and roadmap.
+
 ```
-rtl/                    the core, and nothing else
+rtl_old/                the WORKING reference core (what "Integrating it"
+                        below describes) -- a sequential multi-cycle FSM
   ap040.qip             Quartus file list, in dependency order
   ap040_defs.svh        shared defines (every .v includes this)
   ap040_tg68k_compat.v  top level: TG68K-shaped port set
@@ -30,15 +34,34 @@ rtl/                    the core, and nothing else
   ap040_bus_timeout.v   bus watchdog
   ap040_walker_cdc.v    table-walk port clock crossing
   primitives/dpram.v    inferred true-dual-port RAM -- substitutable
-tb/                     self-contained test suite (see Testing)
+rtl/                    the IN-PROGRESS pipelined replacement (not yet wired
+                        into anything -- built and tested standalone)
+  ap040_pipe_core.v      top level: six-stage IF/ID/EA-calc/EA-fetch/EX/WB
+  ap040_inst_fetch.v     IF
+  ap040_decode.v         ID
+  ap040_ea_calc.v        EA-calc
+  ap040_ea_fetch.v       EA-fetch (register forwarding lives here)
+  ap040_execute.v        EX (condition checks, misprediction recovery)
+  ap040_writeback.v      WB
+  ap040_pipe_alu.v       ALU (forked from rtl_old/ap040_alu.v)
+  ap040_pipe_regfile.v   register file (forked from rtl_old/ap040_regfile.v)
+  ap040_pipe_defs.svh    shared defines, independent copy of ap040_defs.svh
+tb/                     self-contained test suites for BOTH cores (see Testing)
 doc/
 ```
 
+`rtl_old/` and `rtl/` are deliberately independent -- deleting either cannot
+affect the other (no shared includes, no shared module names).
+
 ## Integrating it
 
-Add `rtl/ap040.qip` to a Quartus project, or hand the eleven `rtl/*.v` files
-plus `rtl/primitives/dpram.v` to any other flow — `ap040_defs.svh` must be on
-the include path (`-I rtl` for iverilog).
+This section describes `rtl_old/` -- the working core. (`rtl/`'s pipelined
+replacement isn't ready to integrate anywhere yet; see
+`AP040_IMPLEMENTATION_PLAN.md`.)
+
+Add `rtl_old/ap040.qip` to a Quartus project, or hand the eleven
+`rtl_old/*.v` files plus `rtl_old/primitives/dpram.v` to any other flow —
+`ap040_defs.svh` must be on the include path (`-I rtl_old` for iverilog).
 
 The top level is `ap040_tg68k_compat`, which presents a TG68K-shaped port set
 so it can drop into a host that already speaks that interface:
@@ -94,14 +117,18 @@ double-apply the store of an RMW instruction.
 ## Testing
 
 ```
-cd tb && ./run_tests.sh          # needs iverilog and vasmm68k_mot (vbcc)
+cd tb && ./run_tests.sh          # rtl_old (reference core): needs iverilog and vasmm68k_mot (vbcc)
+cd tb && ./run_pipe_tests.sh     # rtl (pipeline, in progress): needs only iverilog
 ```
 
-Everything under `tb/` runs against the core alone, with no host-project
-sources, so a failure is the CPU's rather than an integration artifact. The
-suite covers the integer ISA, the exception and trace model, the MMU
+Everything under `tb/` runs against a core alone, with no host-project
+sources, so a failure is the CPU's rather than an integration artifact.
+`run_tests.sh` covers the integer ISA, the exception and trace model, the MMU
 (translation, TTRs, page-table walks, access faults, 4K and 8K pages), the
-caches, and the FPU.
+caches, and the FPU -- against `rtl_old`. `run_pipe_tests.sh` covers whatever
+the pipeline has reached so far (see `AP040_IMPLEMENTATION_PLAN.md` for the
+milestone list); each `tb_ap040_pipe_*.v` bench pokes a tiny program directly
+into the fetch stage's ROM, so it needs no assembler.
 
 The Minimig-AGA tree adds further benches that co-simulate the core against a
 real Amiga chipset, an SDRAM controller and a DDR3 controller, and drives the
