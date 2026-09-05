@@ -955,7 +955,6 @@ reg         fp_lsb;               // FMOVEM predec store: mask consumed LSB firs
 reg   [3:0] fp_n;                 // loop index
 reg         fp_ea_pd, fp_ea_pi;   // predecrement / postincrement EA
 reg         fp_ea_v;              // t_a holds a resolved operand address
-reg         fp_force_unsupp;      // packed store: trap after resolving EA
 reg   [6:0] fp_adj;               // total An adjustment (up to 8*12 = 96 bytes)
 
 wire        fpu_done, fpu_unimp, fpu_unsupp, fpu_exc_req, fpu_used;
@@ -1845,7 +1844,6 @@ always @(posedge clk) begin
 		fp_rev <= 0; fp_lsb <= 0;
 		fp_creg <= 0; fp_pred <= 0; fp_n <= 0;
 		fp_ea_pd <= 0; fp_ea_pi <= 0; fp_adj <= 0; fp_ea_v <= 0;
-		fp_force_unsupp <= 0;
 		m_bidx <= 0; m_acc <= 0;
 		rr_a <= 0; rr_b <= 0;
 		aux_we <= 0; aux_sel <= 0; aux_wdata <= 0;
@@ -3778,7 +3776,6 @@ always @(posedge clk) begin
 				fp_ea_pd  <= 0;
 				fp_ea_v   <= 0;
 				fp_ea_pi  <= 0;
-				fp_force_unsupp <= 0;
 				case (imm[15:13])
 					3'b000: begin
 						// FPm to FPn general.  Nonexisting opmodes fault
@@ -3858,12 +3855,10 @@ always @(posedge clk) begin
 						// encodings that F-line out
 						fpu_srcr <= imm[9:7];
 						fp_st <= 1;
-						// Packed output is an unsupported data type.  For a memory
-						// destination this is a post-instruction exception whose
-						// format-$3 frame must contain the calculated EA, so do not
-						// trap until normal EA resolution has completed.
-						if (imm[12:10] == 3'd3 || imm[12:10] == 3'd7)
-							fp_force_unsupp <= 1;
+						// Packed stores must engage the FPU after EA resolution.
+						// It prepares the BUSY frame (command, source, E1/T) that
+						// the FPSP needs; directly raising vector 55 here leaves
+						// FSAVE reporting IDLE and the handler reading stale stack.
 						if (d_mode == 3'b000) begin
 							// Packed output is a datatype fault even when the
 							// nominal destination is Dn.  Datatype classification
@@ -3871,8 +3866,8 @@ always @(posedge clk) begin
 							// addressable destination, the format-$3 EA is zero.
 							if (imm[12:10] == 3'd3 || imm[12:10] == 3'd7) begin
 								fpu_iawe <= 1;
-								go_fp_unsupp(1'b1, 1'b1, 1'b0, 32'd0);
-								state <= S_POST_EXC;
+								fpu_req <= 1;
+								state <= S_FPU_GO;
 							end
 							// A data register cannot hold a double or
 							// extended result: the 68040 reports these as
@@ -4049,21 +4044,8 @@ always @(posedge clk) begin
 					3'b010: state <= S_FPU_RD;
 					3'b011: begin
 						fpu_iawe <= 1;
-						if (fp_force_unsupp) begin
-							// post-instruction: the address register update
-							// stands here too (see S_FPU_GO)
-							if (d_mode == 3'b100)
-								rfw({1'b1, d_rn},
-								    rf_rdata_a - {25'd0, adj});
-							else
-								rfw({1'b1, d_rn},
-								    rf_rdata_a + {25'd0, adj});
-							go_fp_unsupp(1'b1, 1'b1, 1'b1,
-							    (d_mode == 3'b100) ?
-								    (rf_rdata_a - {25'd0, adj}) : rf_rdata_a);
-							state <= S_POST_EXC;
-						end
-						else begin fpu_req <= 1; state <= S_FPU_GO; end
+						fpu_req <= 1;
+						state <= S_FPU_GO;
 					end
 					3'b100, 3'b101: state <= S_FPU_CR;
 					default: state <= S_FPU_MVM;
@@ -4077,11 +4059,8 @@ always @(posedge clk) begin
 					3'b010: state <= S_FPU_RD;
 					3'b011: begin
 						fpu_iawe <= 1;
-						if (fp_force_unsupp) begin
-							go_fp_unsupp(1'b1, 1'b1, 1'b1, ea_addr);
-							state <= S_POST_EXC;
-						end
-						else begin fpu_req <= 1; state <= S_FPU_GO; end
+						fpu_req <= 1;
+						state <= S_FPU_GO;
 					end
 					3'b100, 3'b101: state <= S_FPU_CR;
 					default: state <= S_FPU_MVM;

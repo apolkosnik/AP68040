@@ -407,7 +407,10 @@ fs_idle_pd_ok:
 	subq.w	#1,(cnt_fpline).l
 
 	; A packed STORE through (An)+ is post-instruction too: the address
-	; register update stands across the datatype fault.
+	; register update stands across the datatype fault.  It also MUST
+	; prepare the BUSY frame before vector 55: NeXT's real FPSP otherwise
+	; sees IDLE and dispatches using unrelated old kernel-stack contents.
+	fmove.l	#7,fp0
 	lea	($3340).l,a0
 	move.l	a0,d2
 	move.l	#0,(unsup_resume).l
@@ -415,7 +418,61 @@ fs_idle_pd_ok:
 	move.l	a0,d0
 	sub.l	d2,d0
 	chkl	d0,12,329
+	move.l	(unsup_fhdr).l,d0
+	chkl	d0,$41600000,650
+	move.l	(unsup_fsave+64).l,d0
+	chkl	d0,$6C000000,651	; packed static store command
+	move.l	(unsup_fsave+72).l,d0
+	chkl	d0,$04100000,652	; E1 and T
+	move.l	(unsup_fsave+88).l,d0
+	chkl	d0,$40010000,653	; ETEMP = extended +7
+	move.l	(unsup_fsave+92).l,d0
+	chkl	d0,$E0000000,654
+	move.l	(unsup_fsave+80).l,d0
+	chkl	d0,$E0000000,655	; FPTEMP also carries the source
 	subq.w	#1,(cnt_fpunsup).l
+
+	; libsys_s.B.shlib __dbltopdfp uses this dynamic-k form.
+	moveq	#-1,d0
+packed_dynamic:
+	dc.w	$F210,$7C00	; fmove.p fp0,(a0){d0}
+	move.l	(unsup_fsave+64).l,d0
+	chkl	d0,$7C000000,656
+	move.l	(unsup_fsave+40).l,d0
+	chkl	d0,packed_dynamic,657
+	subq.w	#1,(cnt_fpunsup).l
+
+	; A packed source is split between FPTEMP_LO and ETEMP_HI/LO.
+	; Use nonzero words throughout: an empty placeholder frame must fail.
+	move.l	#$40010001,($3340).l
+	move.l	#$23456789,($3344).l
+	move.l	#$01234567,($3348).l
+	fmove.p	($3340).l,fp1
+	move.l	(unsup_fsave+84).l,d0
+	chkl	d0,$40010001,658
+	move.l	(unsup_fsave+92).l,d0
+	chkl	d0,$23456789,659
+	move.l	(unsup_fsave+96).l,d0
+	chkl	d0,$01234567,660
+	move.l	(unsup_fsave+60).l,d0
+	chkl	d0,$E0000000,661	; packed tag
+	subq.w	#1,(cnt_fpunsup).l
+
+	; An emulated opcode with the same packed source uses the short
+	; unimplemented frame, retaining E1 and the identical split payload.
+	move.w	#1,(save_unimp).l
+	move.l	#$202C,(exp_fmt).l
+	fint.p	($3340).l,fp2
+	move.l	(unimp_frame+$18).l,d0
+	chkl	d0,$04000000,662
+	move.l	(unimp_frame+$24).l,d0
+	chkl	d0,$40010001,663
+	move.l	(unimp_frame+$2C).l,d0
+	chkl	d0,$23456789,664
+	move.l	(unimp_frame+$30).l,d0
+	chkl	d0,$01234567,665
+	subq.w	#1,(cnt_fpunimp).l
+	clr.w	(save_unimp).l
 
 	fmove.l	#7,fp0		; FPU in use again
 	move.l	#$202C,(exp_fmt).l
