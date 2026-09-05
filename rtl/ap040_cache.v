@@ -311,7 +311,8 @@ assign c_ack   = pass_active ? m_ack : ack_r;
 assign c_rdata = pass_active ? m_rdata : rdata_r;
 
 assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
-                   c_req && !ack_r && !c_write && !bypass && !ci_inv_pend;
+                   c_req && !ack_r && !c_write && !bypass &&
+                   !ci_inv_pend && !store_inv_lost;
 
 assign tag_ridx  = a_row;
 wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
@@ -457,8 +458,13 @@ always @(posedge clk) begin
 				// request-low cycle, and it keeps ci_inv_row single-slot
 				// so a second CI hit cannot overwrite a pending row and
 				// lose its invalidate.  The cost is nil in practice.
+				// A store's first-row invalidate can also remain owed
+				// after its memory ack if snoops kept port B occupied.
+				// Hold reads until it lands.  Accepting on the replay
+				// edge reads the old (or undefined) tag row and can
+				// return pre-store data even though RAM is up to date.
 				else if (c_req && !ack_r && !err_hold &&
-				         (c_write || !ci_inv_pend)) begin
+				         (c_write || (!ci_inv_pend && !store_inv_lost))) begin
 					if (c_write) begin
 						if (store_inv_lost) begin
 							// port B owes a recorded invalidate: hold the

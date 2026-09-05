@@ -1297,6 +1297,117 @@ imix_cw:
 	pflusha
 imix_done:
 
+;------------------------------------------------- NeXTSTEP kernel shape
+; NeXT Mach 3.3 runs the kernel through transparent translation windows
+; and walks tables only for user space and dynamically mapped kernel
+; regions (loadable kernel servers around LA $3C000000).  The observed
+; panic is a supervisor instruction fetch at $3C014D9C reporting an
+; invalid descriptor: root index $1E, pointer index 0, page index 10
+; under 8K pages, walked through SRP while URP points at a different
+; tree.  Replay exactly that: map the page, call through it, remap it
+; the way pmap_enter does, and prove the used/modified writebacks land
+; on their own descriptors only.
+	moveq	#0,d0
+	movec	d0,tc
+	pflusha
+
+	; clear root $4000, decoy user root $5000, pointer table $4600,
+	; page tables $4800/$4880
+	lea	($4000).l,a0
+	move.w	#127,d1
+nsclr1:	clr.l	(a0)+
+	dbra	d1,nsclr1
+	lea	($5000).l,a0
+	move.w	#127,d1
+nsclr2:	clr.l	(a0)+
+	dbra	d1,nsclr2
+	lea	($4600).l,a0
+	move.w	#127,d1
+nsclr3:	clr.l	(a0)+
+	dbra	d1,nsclr3
+	lea	($4800).l,a0
+	move.w	#63,d1
+nsclr4:	clr.l	(a0)+
+	dbra	d1,nsclr4
+
+	; SRP tree: root[$1E] -> pointer $4600, pointer[0] -> page table
+	; $4800, page[10] -> PA $6000
+	move.l	#$00004603,($4078).l
+	move.l	#$00004803,($4600).l
+	move.l	#$00006003,($4828).l
+
+	; target routines at the fault's page offset: move.l #tag,d3 / rts
+	move.l	#$263CC0DE,($6D9C).l
+	move.l	#$00404E75,($6DA0).l
+	move.l	#$263CC0DE,($8D9C).l
+	move.l	#$00414E75,($8DA0).l
+
+	; SRP the real tree, URP an empty decoy: a supervisor walk that
+	; wrongly uses URP dies on an invalid root entry
+	move.l	#$4000,d0
+	movec	d0,srp
+	move.l	#$5000,d0
+	movec	d0,urp
+
+	; kernel-style transparent windows for supervisor code and data
+	move.l	#$000FA000,d0
+	movec	d0,itt0
+	movec	d0,dtt0
+
+	move.l	#$C000,d0	; E=1, P=1: 8K pages
+	movec	d0,tc
+	pflusha
+
+	; the exact kernel gesture: supervisor jsr into the walked region
+	moveq	#0,d3
+	jsr	($3C014D9C).l
+	chkl	d3,$C0DE0040,200
+
+	; the used bit came back on this walk's descriptors and nowhere else
+	move.l	($4078).l,d0
+	chkl	d0,$0000460B,201	; root: resident + U
+	move.l	($4074).l,d0
+	chkl	d0,0,202		; root neighbor untouched
+	move.l	($4600).l,d0
+	chkl	d0,$0000480B,203	; pointer: resident + U
+	move.l	($4604).l,d0
+	chkl	d0,0,204		; pointer neighbor untouched
+	move.l	($4828).l,d0
+	chkl	d0,$0000600B,205	; page: resident + U
+	move.l	($4824).l,d0
+	chkl	d0,0,206
+	move.l	($482C).l,d0
+	chkl	d0,0,207
+
+	; a walked write sets M on the page descriptor and lands physically
+	move.l	#$5EC70001,($3C014000).l
+	move.l	($6000).l,d0
+	chkl	d0,$5EC70001,208
+	move.l	($4828).l,d0
+	chkl	d0,$0000601B,209	; page: U + M
+
+	; pmap_enter: retarget the pointer entry at a fresh page table,
+	; flush, and the same LA must reach the new physical page
+	move.l	#$00008003,($48A8).l	; new table $4880, page[10] -> $8000
+	move.l	#$00004883,($4600).l
+	pflusha
+	moveq	#0,d3
+	jsr	($3C014D9C).l
+	chkl	d3,$C0DE0041,210
+
+	move.l	($4828).l,d0
+	chkl	d0,$0000601B,211	; old page descriptor left alone
+	move.l	($4600).l,d0
+	chkl	d0,$0000488B,212	; new pointer entry: resident + U
+
+	; translation off first (the code window is a TTR), then the
+	; windows themselves
+	moveq	#0,d0
+	movec	d0,tc
+	movec	d0,itt0
+	movec	d0,dtt0
+	pflusha
+
 	; leave translation off for the harness epilogue
 	moveq	#0,d0
 	movec	d0,tc

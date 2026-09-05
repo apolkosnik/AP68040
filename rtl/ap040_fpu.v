@@ -508,7 +508,9 @@ task capture_datatype;
 		fstate_grs   <= 0;
 		fstate_wbte15 <= 0;
 		fstate_wbt   <= 0;
-		fstate_fpiar_c <= fpiar;
+		// Stores can dispatch on the same edge as the FPIAR side-port
+		// update.  Capture this instruction, not the previous FPIAR value.
+		fstate_fpiar_c <= ia_we ? ia_wdata : fpiar;
 		fstate_busy  <= 1;
 		fstate_e1    <= e1_flag;
 		// fstate_unimp marks "a frame is prepared", so FSAVE extracts it
@@ -779,12 +781,12 @@ always @(posedge clk) begin
 						               frame_tag_x(fr_e[dst_r], fr_m[dst_r]));
 					end
 					else if (src_fmt == 3'd3) begin
-						// Packed conversion needs the datatype/FPSP path; retain a
-						// deterministic empty source until that payload is modeled.
+						// Packed operands use the same split payload in the short
+						// unimplemented frame as in a datatype BUSY frame.
 						capture_unimp({op_class, src_fmt, dst_r, opmode},
-						               96'd0, 3'd1,
-						               {fr_s[dst_r], fr_e[dst_r], 16'd0, fr_m[dst_r]},
-						               frame_tag_x(fr_e[dst_r], fr_m[dst_r]));
+						               {32'd0, din[63:0]}, 3'd7,
+						               {32'd0, din[63:32], din[95:64]}, 3'd0);
+						fstate_flags <= 3'b100; // E1 tells get_op to unpack
 					end
 					else begin
 						// Reuse the normal sequential source converter instead of
@@ -818,13 +820,13 @@ always @(posedge clk) begin
 					// its exception could retain a complete state frame.
 					if (src_fmt == 3'd3) begin
 						unsupp <= 1;
-						// packed memory operand: E1 distinguishes it, and
-						// the operand words arrive later, so ETEMP carries
-						// what the dispatch cycle has
+						// The core has fetched all twelve bytes.  The 040 stores
+						// the first packed longword in FPTEMP_LO, not ETEMP_EX;
+						// FPSP get_op copies it back before calling decbin.
+						// Match Previous fp_unimp_datatype's split frame layout.
 						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    96'd0, 3'd7,
-						    {fr_s[dst_r], fr_e[dst_r], 16'd0, fr_m[dst_r]},
-						    frame_tag_x(fr_e[dst_r], fr_m[dst_r]),
+						    {32'd0, din[63:0]}, 3'd7,
+						    {32'd0, din[63:32], din[95:64]}, 3'd0,
 						    1'b0, 1'b1);   // packed -> E1, stag 7
 					end
 					else begin

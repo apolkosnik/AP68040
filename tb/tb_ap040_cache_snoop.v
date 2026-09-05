@@ -624,6 +624,55 @@ initial begin
 	mem_lat = 2'd2;
 	repeat (6) @(posedge clk);
 
+	//------------------------------------------------------------------
+	// T10: consecutive snoops defer a store's first-row invalidate past
+	// its memory acknowledgement.  A no-gap read of that same row must
+	// not consume the tag RAM output from the invalidate's write cycle:
+	// the primitive returns OLD data, and M10K may return unknown data.
+	// Exercise a snoop ending at read acceptance, during the lookup,
+	// and later, at each supported memory latency.
+	//------------------------------------------------------------------
+	for (i = 0; i < 4; i = i + 1) begin
+		mem_lat = i;
+		for (off = 0; off < 4; off = off + 1) begin
+			expect_read(32'h0000_E000, mem[32'hE000>>2], 10);
+			@(negedge clk);
+			c_req = 1; c_write = 1; c_addr = 32'h0000_E000;
+			c_size = 2'b10; c_wdata = 32'h5700_0000 + (i << 8) + off;
+			s_stb = 1; s_addr = 32'h0000_E310;
+			guard5 = 0;
+			while (!(c_ack && ce) && guard5 < 200) begin
+				@(posedge clk); guard5 = guard5 + 1;
+			end
+			if (guard5 == 200) $fatal(1, "T10: store timed out");
+			@(negedge clk);
+			c_write = 0; // request remains high, same address
+			fork
+				begin
+					guard5 = 0;
+					// The store ack is gone at the preceding falling edge.
+					@(posedge clk);
+					while (!(c_ack && ce) && guard5 < 200) begin
+						@(posedge clk); guard5 = guard5 + 1;
+					end
+					if (guard5 == 200) $fatal(1, "T10: read timed out");
+					if (c_rdata !== c_wdata) begin
+						$display("FAIL test 10 (latency %0d, snoop tail %0d): got %h expected %h",
+						         i, off, c_rdata, c_wdata);
+						errors = errors + 1;
+					end
+					@(negedge clk); c_req = 0;
+				end
+				begin
+					repeat (off) @(negedge clk);
+					s_stb = 0;
+				end
+			join
+			repeat (6) @(posedge clk);
+		end
+	end
+	mem_lat = 2'd2;
+
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", errors);
 	$finish;
