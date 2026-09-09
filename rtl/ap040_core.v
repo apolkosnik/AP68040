@@ -629,7 +629,15 @@ reg        sh_rox;
 reg        sh_any;
 
 reg  [7:0] exc_vec;
-reg  [3:0] exc_fmt;
+// exc_fmt is the 68040 exception-frame FORMAT nibble.  It used to be a
+// register written from the ~130 inlined exc() sites, so its worst bit
+// (exc_fmt[0], set only for the FP post-instruction format $3) sat on the
+// exception-format priority tree -- the core's critical path.  It is now
+// derived from three predicate registers captured the way exc_vec is (a
+// per-site constant under the shared exception enable), which keeps the
+// format-3 detection off exc_fmt's own timing cone.
+reg        exc_f1, exc_f2, exc_f3;
+wire [3:0] exc_fmt = exc_f1 ? 4'd1 : exc_f3 ? 4'd3 : exc_f2 ? 4'd2 : 4'd0;
 reg [31:0] exc_spc, exc_addr, exc_sp;
 reg        exc_is_irq, exc_pass2;
 reg [15:0] sr_saved;
@@ -1490,7 +1498,15 @@ task exc;
 	input [31:0] spc;
 	input [31:0] addr;
 	begin
-		exc_vec <= vec; exc_fmt <= fmt; exc_spc <= spc; exc_addr <= addr;
+		exc_vec <= vec; exc_spc <= spc; exc_addr <= addr;
+		// Format predicates are SET here only at the sites whose constant
+		// fmt matches (a statically false `if` is no write), and CLEARED
+		// once at S_EXC5, the end of every frame push.  Clearing them at
+		// every exc() site instead put all three on the ~130-site global
+		// exception enable, which is the core's critical routing cone.
+		if (fmt == 4'd1) exc_f1 <= 1;
+		if (fmt == 4'd2) exc_f2 <= 1;
+		if (fmt == 4'd3) exc_f3 <= 1;
 		exc_is_irq <= 0; exc_pass2 <= 0;
 		// A T0 trace does NOT survive an exception on the 68040.  This
 		// used to arm one for illegal/privilege/A-line/F-line, reading
@@ -1651,7 +1667,7 @@ task fetch_next;
 				tr_t1 <= 0;
 			end
 			exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-			exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+			exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= pc; exc_addr <= 0;
 			exc_is_irq <= 1; exc_pass2 <= 0;
 			irq_lvl_l <= irq_take_lvl;
 			// As with trace, an interrupt recognized at the instruction
@@ -1722,7 +1738,7 @@ task go_pc;
 				texc_pend <= 1;
 				texc_pc <= pc_i;
 				exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-				exc_fmt <= 0; exc_spc <= t; exc_addr <= 0;
+				exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= t; exc_addr <= 0;
 				exc_is_irq <= 1; exc_pass2 <= 0;
 				irq_lvl_l <= irq_take_lvl;
 				epf_flush;
@@ -1748,7 +1764,7 @@ task go_pc;
 			fc_ovr_v <= 0;
 			if (irq_pend) begin
 				exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-				exc_fmt <= 0; exc_spc <= t; exc_addr <= 0;
+				exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= t; exc_addr <= 0;
 				exc_is_irq <= 1; exc_pass2 <= 0;
 				irq_lvl_l <= irq_take_lvl;
 				// BSR/JSR and taken DBcc can commit A7/Dn on the
@@ -1871,7 +1887,7 @@ always @(posedge clk) begin
 		p_dst_mem_bit <= 0;
 		exec_kind <= EK_ALU;
 		src_mode_r <= 0; src_rn_r <= 0; dst_mode_r <= 0; dst_rn_r <= 0;
-		exc_vec <= 0; exc_fmt <= 0; exc_spc <= 0; exc_addr <= 0; exc_sp <= 0;
+		exc_vec <= 0; exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= 0; exc_addr <= 0; exc_sp <= 0;
 		exc_is_irq <= 0; exc_pass2 <= 0; sr_saved <= 0; irq_lvl_l <= 0;
 		texc_pend <= 0; texc_pc <= 0;
 		flow_t0_pend <= 0; flow_t0_oldpc <= 0;
@@ -2021,7 +2037,7 @@ always @(posedge clk) begin
 				// Discard the fetched word and stack a return to the handler entry.
 				if (in_exc && irq_pend) begin
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+					exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
@@ -2804,6 +2820,10 @@ always @(posedge clk) begin
 				// this A7 write commits on the next ce edge, while SR.M is
 				// still set for the master stack case
 				rfw(4'd15, exc_sp);
+				// frame pushed: retire the format predicates so the next
+				// exception starts clean (S_EXC6 re-arms exc_f1 for its
+				// format $1 throwaway frame on the very next cycle)
+				exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0;
 				if (exc_is_irq && sr[12] && !exc_pass2) state <= S_EXC6;
 				else state <= S_EXC_VEC;
 			end
@@ -2818,7 +2838,7 @@ always @(posedge clk) begin
 				// where the real frame lives.
 				sr[12] <= 0;
 				sr_saved <= sr_saved | 16'h2000;
-				exc_fmt <= 4'd1;
+				exc_f1 <= 1; exc_f2 <= 0; exc_f3 <= 0;
 				exc_pass2 <= 1;
 				state <= S_EXC1;
 			end
@@ -2865,7 +2885,7 @@ always @(posedge clk) begin
 					// returns to that handler address.
 					pc <= m_val;
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= m_val; exc_addr <= 0;
+					exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= m_val; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
@@ -2951,7 +2971,7 @@ always @(posedge clk) begin
 					pc <= rte_pc;
 					pc_i <= rte_pc;
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, rte_irq_lvl};
-					exc_fmt <= 0; exc_spc <= rte_pc; exc_addr <= 0;
+					exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= rte_pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= rte_irq_lvl;
 					epf_flush;
@@ -5966,7 +5986,7 @@ always @(posedge clk) begin
 			S_STOPPED: begin
 				if (irq_pend) begin
 					exc_vec <= `AP040_VEC_AUTOVEC + {5'd0, irq_take_lvl};
-					exc_fmt <= 0; exc_spc <= pc; exc_addr <= 0;
+					exc_f1 <= 0; exc_f2 <= 0; exc_f3 <= 0; exc_spc <= pc; exc_addr <= 0;
 					exc_is_irq <= 1; exc_pass2 <= 0;
 					irq_lvl_l <= irq_take_lvl;
 					epf_flush;
