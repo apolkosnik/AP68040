@@ -624,6 +624,16 @@ reg [31:0] m_addr_c;
 reg  [1:0] m_size_c;
 reg        m_wr_c;
 reg [31:0] m_wdat_c;
+// The function code rides the same carriers as the address.  MOVES selects
+// SFC/DFC by writing fc_ovr_v/fc_ovr, which are REGISTERS: the early issue
+// below happens in the cycle the state calls mrd/mwr, one edge before those
+// land, so reading them there gave the instruction supervisor space instead
+// of the space it asked for -- FC 5 where FC 1 was required.  MOVES is how a
+// kernel copies to and from user memory, so the failure is a kernel reading
+// its own address space and finding whatever lives there: NetBSD's init
+// pathname came back empty and PID 1 never loaded.
+reg        m_fcv_c;
+reg  [2:0] m_fc_c;
 reg  [1:0] epf_pop;              // words consumed this cycle
 reg  [1:0] epf_fillw;            // words appended this cycle
 
@@ -783,7 +793,6 @@ reg  [5:0] bf_w;
 reg [31:0] bf_addr;
 reg  [2:0] bf_bib;              // bit offset inside the first byte
 reg  [2:0] bf_span;             // bytes touched (1..5)
-reg        bf_narrow;           // this read was sized down to dodge a page end
 reg [31:0] bf_w1;
 reg  [7:0] bf_w2;
 reg [31:0] bf_du;
@@ -1957,6 +1966,8 @@ always @(posedge clk) begin
 	m_size_c    = 2'd0;
 	m_wr_c      = 1'b0;
 	m_wdat_c    = 32'd0;
+	m_fcv_c     = fc_ovr_v;
+	m_fc_c      = fc_ovr;
 
 	if (!nreset) begin
 		state <= S_START;
@@ -2050,7 +2061,6 @@ always @(posedge clk) begin
 		nmi_ack_t <= 0;
 		irq_ack_t <= 0;
 		bf_off <= 0; bf_w <= 0; bf_addr <= 0; bf_bib <= 0; bf_span <= 0;
-		bf_narrow <= 0;
 		bf_w1 <= 0; bf_w2 <= 0; bf_du <= 0; cas_dc <= 0;
 		bf_t40 <= 0; bf_field <= 0; bf_ones <= 0; bf_maskl <= 0;
 		in_exc <= 0;
@@ -3535,12 +3545,14 @@ always @(posedge clk) begin
 				else begin
 					rr_b <= {x_ext[15], x_ext[14:12]};   // old value for merge
 					fc_ovr_v <= 1; fc_ovr <= sfc;
+					m_fcv_c = 1; m_fc_c = sfc;   // and for an issue THIS cycle
 					mrd(ea_addr, op_size, S_MOVES_RD);
 				end
 			end
 
 			S_MOVES_WR: begin
 				fc_ovr_v <= 1; fc_ovr <= dfc;
+				m_fcv_c = 1; m_fc_c = dfc;   // and for an issue THIS cycle
 				mwr(ea_addr, op_size, rf_rdata_a, S_NEXT);
 			end
 
@@ -4856,60 +4868,35 @@ always @(posedge clk) begin
 
 			S_BF_MEM0: begin : bf_mem0
 				reg [2:0] span;
-				reg [31:0] a;
-				reg        narrow;
 				span = ({3'd0, bf_off[2:0]} + bf_w + 6'd7) >> 3;
-				a    = ea_addr + {{3{bf_off[31]}}, bf_off[31:3]};
-				// Read bytes the field does not occupy ONLY where reading
-				// them is harmless.  A longword covers spans 1-3 as well, and
-				// that is what this did for years; it is wrong only when the
-				// three bytes past the field fall in the next page and that
-				// page is not mapped -- OPENSTEP's WindowServer, BFTST
-				// 3(A1){6:2} at the last mapped byte.
-				//
-				// So narrow exactly there and nowhere else.  Widening the
-				// rule cost a NetBSD regression: the size decides
-				// cacheability -- ap040_cache serves only accesses inside one
-				// aligned longword -- so a longword at an arbitrary address
-				// bypasses the cache three times in four, while a byte never
-				// does.  Sizing every bitfield read moved most of them onto
-				// the cached path, which the cputest corpus cannot see
-				// because it runs with CACR and TC forced to zero.  Restrict
-				// the change to the faulting case and the rest of the
-				// machine keeps the behaviour it was validated with.
-				//
-				// Spans 4 and 5 need the longword regardless: their field
-				// really does reach into those bytes, so a crossing there is
-				// a genuine fault the handler should see.
-				narrow = (span <= 3'd3) && cross_of(a, `AP040_SZ_L);
-				bf_addr   <= a;
-				bf_bib    <= bf_off[2:0];
-				bf_span   <= span;
-				bf_narrow <= narrow;
+				bf_addr <= ea_addr + {{3{bf_off[31]}}, bf_off[31:3]};
+				bf_bib <= bf_off[2:0];
+				bf_span <= span;
 				if (ir[10:8] == 3'd7) rr_b <= {1'b0, x_ext[14:12]};
-				mrd(a, !narrow          ? `AP040_SZ_L :
-				       (span == 3'd1)   ? `AP040_SZ_B : `AP040_SZ_W, S_BF_MEM1);
+				// Only read bytes containing the field.  A short field at a
+				// page end must not fault on an unmapped following page.
+				mrd(ea_addr + {{3{bf_off[31]}}, bf_off[31:3]},
+				    (span == 3'd1) ? `AP040_SZ_B :
+				    (span <= 3'd3) ? `AP040_SZ_W : `AP040_SZ_L, S_BF_MEM1);
 			end
 
 			S_BF_MEM1: begin
 				// m_val is right aligned for byte/word reads; the bitfield
 				// datapath consumes a left-aligned 40-bit memory window.
-				if (bf_narrow)
-					bf_w1 <= (bf_span == 3'd1) ? {m_val[7:0], 24'd0}
-					                           : {m_val[15:0], 16'd0};
-				else	bf_w1 <= m_val;
+				case (bf_span)
+					3'd1: bf_w1 <= {m_val[7:0], 24'd0};
+					3'd2, 3'd3: bf_w1 <= {m_val[15:0], 16'd0};
+					default: bf_w1 <= m_val;
+				endcase
 				bf_w2 <= 8'd0;
 				bf_du <= rf_rdata_b;
-				// the third byte only when the word read left it out
-				if (bf_narrow && bf_span == 3'd3)
-					mrd(bf_addr + 32'd2, `AP040_SZ_B, S_BF_MEM2);
-				else if (bf_span == 3'd5)
-					mrd(bf_addr + 32'd4, `AP040_SZ_B, S_BF_MEM2);
+				if (bf_span == 3'd3) mrd(bf_addr + 32'd2, `AP040_SZ_B, S_BF_MEM2);
+				else if (bf_span == 3'd5) mrd(bf_addr + 32'd4, `AP040_SZ_B, S_BF_MEM2);
 				else state <= S_BF_EXECM;
 			end
 
 			S_BF_MEM2: begin
-				if (bf_narrow && bf_span == 3'd3) bf_w1[15:8] <= m_val[7:0];
+				if (bf_span == 3'd3) bf_w1[15:8] <= m_val[7:0];
 				else bf_w2 <= m_val[7:0];
 				state <= S_BF_EXECM;
 			end
@@ -6222,7 +6209,7 @@ always @(posedge clk) begin
 				mem_req <= 1; mem_write <= m_wr_c; mem_instr <= 0;
 				mem_size <= m_size_c; mem_addr <= m_addr_c;
 				mem_wdata <= m_wdat_c;
-				fc_r <= fc_ovr_v ? fc_ovr :
+				fc_r <= m_fcv_c ? m_fc_c :
 				        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 				m_issued <= 1;
 				epf_issue = 1;
