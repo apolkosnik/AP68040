@@ -624,6 +624,16 @@ reg [31:0] m_addr_c;
 reg  [1:0] m_size_c;
 reg        m_wr_c;
 reg [31:0] m_wdat_c;
+// The function code rides the same carriers as the address.  MOVES selects
+// SFC/DFC by writing fc_ovr_v/fc_ovr, which are REGISTERS: the early issue
+// below happens in the cycle the state calls mrd/mwr, one edge before those
+// land, so reading them there gave the instruction supervisor space instead
+// of the space it asked for -- FC 5 where FC 1 was required.  MOVES is how a
+// kernel copies to and from user memory, so the failure is a kernel reading
+// its own address space and finding whatever lives there: NetBSD's init
+// pathname came back empty and PID 1 never loaded.
+reg        m_fcv_c;
+reg  [2:0] m_fc_c;
 reg  [1:0] epf_pop;              // words consumed this cycle
 reg  [1:0] epf_fillw;            // words appended this cycle
 
@@ -1956,6 +1966,8 @@ always @(posedge clk) begin
 	m_size_c    = 2'd0;
 	m_wr_c      = 1'b0;
 	m_wdat_c    = 32'd0;
+	m_fcv_c     = fc_ovr_v;
+	m_fc_c      = fc_ovr;
 
 	if (!nreset) begin
 		state <= S_START;
@@ -3533,12 +3545,14 @@ always @(posedge clk) begin
 				else begin
 					rr_b <= {x_ext[15], x_ext[14:12]};   // old value for merge
 					fc_ovr_v <= 1; fc_ovr <= sfc;
+					m_fcv_c = 1; m_fc_c = sfc;   // and for an issue THIS cycle
 					mrd(ea_addr, op_size, S_MOVES_RD);
 				end
 			end
 
 			S_MOVES_WR: begin
 				fc_ovr_v <= 1; fc_ovr <= dfc;
+				m_fcv_c = 1; m_fc_c = dfc;   // and for an issue THIS cycle
 				mwr(ea_addr, op_size, rf_rdata_a, S_NEXT);
 			end
 
@@ -6195,7 +6209,7 @@ always @(posedge clk) begin
 				mem_req <= 1; mem_write <= m_wr_c; mem_instr <= 0;
 				mem_size <= m_size_c; mem_addr <= m_addr_c;
 				mem_wdata <= m_wdat_c;
-				fc_r <= fc_ovr_v ? fc_ovr :
+				fc_r <= m_fcv_c ? m_fc_c :
 				        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
 				m_issued <= 1;
 				epf_issue = 1;
