@@ -6190,7 +6190,12 @@ always @(posedge clk) begin
 		if (m_go) begin
 			m_addr_r <= m_addr_c; m_size <= m_size_c;
 			m_wr <= m_wr_c; m_wdat <= m_wdat_c;
-			if (!epf_pend && !epf_issue && !mem_req && !mem_ack &&
+			// MOVES selects SFC/DFC in its calling state on this edge.
+			// That nonblocking override is not visible here yet: issuing
+			// now would use the old FC and potentially the wrong MMU root.
+			// Let S_MRD/S_MWR issue it after the override has registered.
+			if (state != S_MOVES2 && state != S_MOVES_WR &&
+			    !epf_pend && !epf_issue && !mem_req && !mem_ack &&
 			    !cross_of(m_addr_c, m_size_c)) begin
 				mem_req <= 1; mem_write <= m_wr_c; mem_instr <= 0;
 				mem_size <= m_size_c; mem_addr <= m_addr_c;
