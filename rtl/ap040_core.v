@@ -783,6 +783,7 @@ reg  [5:0] bf_w;
 reg [31:0] bf_addr;
 reg  [2:0] bf_bib;              // bit offset inside the first byte
 reg  [2:0] bf_span;             // bytes touched (1..5)
+reg        bf_narrow;           // this read was sized down to dodge a page end
 reg [31:0] bf_w1;
 reg  [7:0] bf_w2;
 reg [31:0] bf_du;
@@ -2049,6 +2050,7 @@ always @(posedge clk) begin
 		nmi_ack_t <= 0;
 		irq_ack_t <= 0;
 		bf_off <= 0; bf_w <= 0; bf_addr <= 0; bf_bib <= 0; bf_span <= 0;
+		bf_narrow <= 0;
 		bf_w1 <= 0; bf_w2 <= 0; bf_du <= 0; cas_dc <= 0;
 		bf_t40 <= 0; bf_field <= 0; bf_ones <= 0; bf_maskl <= 0;
 		in_exc <= 0;
@@ -4854,35 +4856,60 @@ always @(posedge clk) begin
 
 			S_BF_MEM0: begin : bf_mem0
 				reg [2:0] span;
+				reg [31:0] a;
+				reg        narrow;
 				span = ({3'd0, bf_off[2:0]} + bf_w + 6'd7) >> 3;
-				bf_addr <= ea_addr + {{3{bf_off[31]}}, bf_off[31:3]};
-				bf_bib <= bf_off[2:0];
-				bf_span <= span;
+				a    = ea_addr + {{3{bf_off[31]}}, bf_off[31:3]};
+				// Read bytes the field does not occupy ONLY where reading
+				// them is harmless.  A longword covers spans 1-3 as well, and
+				// that is what this did for years; it is wrong only when the
+				// three bytes past the field fall in the next page and that
+				// page is not mapped -- OPENSTEP's WindowServer, BFTST
+				// 3(A1){6:2} at the last mapped byte.
+				//
+				// So narrow exactly there and nowhere else.  Widening the
+				// rule cost a NetBSD regression: the size decides
+				// cacheability -- ap040_cache serves only accesses inside one
+				// aligned longword -- so a longword at an arbitrary address
+				// bypasses the cache three times in four, while a byte never
+				// does.  Sizing every bitfield read moved most of them onto
+				// the cached path, which the cputest corpus cannot see
+				// because it runs with CACR and TC forced to zero.  Restrict
+				// the change to the faulting case and the rest of the
+				// machine keeps the behaviour it was validated with.
+				//
+				// Spans 4 and 5 need the longword regardless: their field
+				// really does reach into those bytes, so a crossing there is
+				// a genuine fault the handler should see.
+				narrow = (span <= 3'd3) && cross_of(a, `AP040_SZ_L);
+				bf_addr   <= a;
+				bf_bib    <= bf_off[2:0];
+				bf_span   <= span;
+				bf_narrow <= narrow;
 				if (ir[10:8] == 3'd7) rr_b <= {1'b0, x_ext[14:12]};
-				// Only read bytes containing the field.  A short field at a
-				// page end must not fault on an unmapped following page.
-				mrd(ea_addr + {{3{bf_off[31]}}, bf_off[31:3]},
-				    (span == 3'd1) ? `AP040_SZ_B :
-				    (span <= 3'd3) ? `AP040_SZ_W : `AP040_SZ_L, S_BF_MEM1);
+				mrd(a, !narrow          ? `AP040_SZ_L :
+				       (span == 3'd1)   ? `AP040_SZ_B : `AP040_SZ_W, S_BF_MEM1);
 			end
 
 			S_BF_MEM1: begin
 				// m_val is right aligned for byte/word reads; the bitfield
 				// datapath consumes a left-aligned 40-bit memory window.
-				case (bf_span)
-					3'd1: bf_w1 <= {m_val[7:0], 24'd0};
-					3'd2, 3'd3: bf_w1 <= {m_val[15:0], 16'd0};
-					default: bf_w1 <= m_val;
-				endcase
+				if (bf_narrow)
+					bf_w1 <= (bf_span == 3'd1) ? {m_val[7:0], 24'd0}
+					                           : {m_val[15:0], 16'd0};
+				else	bf_w1 <= m_val;
 				bf_w2 <= 8'd0;
 				bf_du <= rf_rdata_b;
-				if (bf_span == 3'd3) mrd(bf_addr + 32'd2, `AP040_SZ_B, S_BF_MEM2);
-				else if (bf_span == 3'd5) mrd(bf_addr + 32'd4, `AP040_SZ_B, S_BF_MEM2);
+				// the third byte only when the word read left it out
+				if (bf_narrow && bf_span == 3'd3)
+					mrd(bf_addr + 32'd2, `AP040_SZ_B, S_BF_MEM2);
+				else if (bf_span == 3'd5)
+					mrd(bf_addr + 32'd4, `AP040_SZ_B, S_BF_MEM2);
 				else state <= S_BF_EXECM;
 			end
 
 			S_BF_MEM2: begin
-				if (bf_span == 3'd3) bf_w1[15:8] <= m_val[7:0];
+				if (bf_narrow && bf_span == 3'd3) bf_w1[15:8] <= m_val[7:0];
 				else bf_w2 <= m_val[7:0];
 				state <= S_BF_EXECM;
 			end
