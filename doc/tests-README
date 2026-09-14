@@ -45,6 +45,10 @@ Testbenches (Icarus Verilog -g2012 and ModelSim, see run_tests.sh):
                         (format $7) fault-fix-restart for write protection,
                         invalid data page, instruction fetch, and user access
                         to a supervisor page
+    asm/t_bitfield_mmu.s memory-bitfield access sizing at an 8K page boundary:
+                        user-mode WindowServer BFTST regression, spans 1-5,
+                        signed dynamic offsets, extraction/CCR and modified
+                        memory, plus genuine crossing faults and restart
     asm/t_cache.s       milestone G caches: CACR enables, I-cache staleness
                         with self-modifying code and CINV recovery, D-cache
                         staleness against DMA-style pokes and CINV recovery,
