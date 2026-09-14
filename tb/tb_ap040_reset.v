@@ -49,6 +49,7 @@ wire        clkena_in = (busstate == 2'b01) | mem_ready;
 ap040_tg68k_compat dut
 (
 	.clk(clk),
+	.tick_in(1'b1),        // no P2 tick grid here: the core runs every clock
 	.nreset(nreset),
 	.cache_allow_all(1'b1),
 	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),

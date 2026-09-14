@@ -23,6 +23,7 @@ module ap040_tg68k_compat
 	input         clk,
 	input         nreset,
 	input         clkena_in,
+	input         tick_in,     // P2 tick grid (cpu_wrapper core_tick); tie 1 elsewhere
 
 	// Physical cacheability windows for the internal caches when no MMU
 	// translation supplies CM attributes: only configured fast RAM may be
@@ -162,6 +163,7 @@ ap040_core #(
 	.clk(clk),
 	.nreset(nreset),
 	.ce(clkena_in),
+	.tick(tick_in),
 
 	.mem_req(mem_req),
 	.mem_write(mem_write),

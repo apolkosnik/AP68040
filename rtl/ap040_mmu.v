@@ -160,10 +160,14 @@ wire [ROWW-1:0] row_q, frow_q;
 reg   [4:0] l_row;
 reg  [16:0] l_tag;
 reg         l_ld;
+reg   [4:0] sweep_row_q;
+reg         sweep_valid_q;
 always @(posedge clk) begin
 	l_row <= a_row;
 	l_tag <= a_tag;
 	l_ld  <= c_req && !sweep_on && !fill_we;
+	sweep_row_q <= sweep_row;
+	sweep_valid_q <= nreset && sweep_on;
 end
 wire lk_fresh = l_ld && (l_row == a_row) && (l_tag == a_tag);
 
@@ -485,8 +489,10 @@ always @(posedge clk) begin
 			end
 
 			// Tag sweep for PFLUSH page/nonglobal variants and the PTEST
-			// pre-flush.  Two-cycle pipeline over the 32 rows: the row
-			// addressed at count N is judged at count N+1 from q_a.
+			// pre-flush. The RAM runs even when ce is low: pair its data
+			// with the registered read address, and advance only after the
+			// requested row has arrived. Counting enabled clocks as RAM
+			// latency can otherwise skip rows when the CPU is divided/stalled.
 			W_SWEEP: begin : sweep
 				reg [16:0] sw_tag;
 				reg  [3:0] sw_set;
@@ -498,9 +504,9 @@ always @(posedge clk) begin
 				                       : {pf_fc[2], pf_addr[31:16]});
 				sw_set = sw_pt ? (tc_p ? pt_addr[16:13] : pt_addr[15:12])
 				               : (tc_p ? pf_addr[16:13] : pf_addr[15:12]);
-				if (sweep_cnt != 0) begin : sweep_act
+				if (sweep_valid_q && sweep_row_q == sweep_row) begin : sweep_act
 					reg [4:0] pr;
-					pr = sweep_cnt[4:0] - 5'd1;
+					pr = sweep_row_q;
 					for (w = 0; w < 4; w = w + 1) begin : sweep_way
 						reg [EW-1:0] e;
 						e = row_q[w*EW +: EW];
@@ -515,17 +521,17 @@ always @(posedge clk) begin
 								atc_v[{pr, w[1:0]}] <= 0;
 						end
 					end
-				end
-				if (sweep_cnt == 6'd32) begin
-					sweep_on  <= 0;
-					sweep_cnt <= 0;
-					if (!sw_pt) begin
-						pf_done <= 1;
-						wst <= W_IDLE;
+					if (sweep_cnt == 6'd31) begin
+						sweep_on  <= 0;
+						sweep_cnt <= 0;
+						if (!sw_pt) begin
+							pf_done <= 1;
+							wst <= W_IDLE;
+						end
+						else wst <= W_PTGO;
 					end
-					else wst <= W_PTGO;
+					else sweep_cnt <= sweep_cnt + 1'd1;
 				end
-				else sweep_cnt <= sweep_cnt + 1'd1;
 			end
 
 			// PTEST proper, after its pre-flush sweep

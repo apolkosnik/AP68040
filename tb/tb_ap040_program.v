@@ -139,6 +139,7 @@ end
 ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE)) dut
 (
 	.clk(clk),
+	.tick_in(1'b1),        // no P2 tick grid here: the core runs every clock
 	.nreset(nreset),
 	.cache_allow_all(1'b1),
 	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),
