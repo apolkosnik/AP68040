@@ -34,6 +34,18 @@ iverilog -g2012 -I "$RTL" -o "$WORK/tb_bus16.vvp"     tb_ap040_bus16_gap.v $RTL/
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_timeout.vvp"   tb_ap040_bus_timeout.v $RTL/ap040_bus_timeout.v
 iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -o "$WORK/tb_snoop.vvp" \
 	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
+# the same bench at the 4:1 clock enable, and both with the tag row's
+# mixed-port read-during-write modelled, which is what makes the lookup
+# guard load-bearing at all
+iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -P tb_ap040_cache_snoop.CE_DIV=4 \
+	-o "$WORK/tb_snoop_ce4.vvp" \
+	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
+iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -DSNOOP_MIXED_X \
+	-o "$WORK/tb_snoop_x.vvp" \
+	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
+iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -DSNOOP_MIXED_X \
+	-P tb_ap040_cache_snoop.CE_DIV=4 -o "$WORK/tb_snoop_x_ce4.vvp" \
+	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
 
 echo "== running =="
 fail=0
@@ -46,12 +58,33 @@ run() {
 		fail=1
 	fi
 }
+# A negative leg passes only when the bench FAILS.  Each lookup-guard term is
+# load-bearing in one clock-enable regime and redundant in the other, so
+# blinding it must break the bench at its own divide -- a guard that cannot be
+# shown to matter is not being tested.
+negrun() {
+	name=$1; shift
+	if vvp "$@" 2>&1 | tee "$WORK/$name.log" | grep -q "TEST FAILED"; then
+		echo "  pass  $name  (control: failed as required)"
+	else
+		echo "  FAIL  $name  (control did NOT fail; see $WORK/$name.log)"
+		fail=1
+	fi
+}
 run reset        "$WORK/tb_reset.vvp"
 run double_fault "$WORK/tb_dblflt.vvp"
 run walker_cdc   "$WORK/tb_walker.vvp"
 run bus16_gap    "$WORK/tb_bus16.vvp"
 run bus_timeout  "$WORK/tb_timeout.vvp"
 run cache_snoop  "$WORK/tb_snoop.vvp"
+run cache_snoop_ce4       "$WORK/tb_snoop_ce4.vvp"
+run cache_snoop_x         "$WORK/tb_snoop_x.vvp"
+run cache_snoop_x_lkw     "$WORK/tb_snoop_x.vvp"     +inj_look_whole
+run cache_snoop_x_ce4     "$WORK/tb_snoop_x_ce4.vvp"
+run cache_snoop_x_ce4_accw "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_whole
+run cache_snoop_x_ce4_accs "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_settle
+negrun cache_snoop_x_neg_accw   "$WORK/tb_snoop_x.vvp"     +inj_acc_whole
+negrun cache_snoop_x_ce4_neg_lkw "$WORK/tb_snoop_x_ce4.vvp" +inj_look_whole
 for t in integer exceptions mmu bitfield_mmu cache fpu; do
 	run "$t" "$WORK/tb_prog.vvp" "+prog=$WORK/t_$t.hex"
 done
