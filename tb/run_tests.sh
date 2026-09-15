@@ -20,7 +20,7 @@ SRC="$RTL/ap040_tg68k_compat.v $RTL/ap040_core.v $RTL/ap040_bus16_adapter.v \
      $RTL/ap040_walker_cdc.v $RTL/primitives/dpram.v"
 
 echo "== assembling test programs =="
-for t in t_integer t_exceptions t_mmu t_cache t_fpu bench_loop; do
+for t in t_integer t_exceptions t_mmu t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop; do
 	$VASM -Fbin -m68040 -no-opt -o "$WORK/$t.bin" "asm/$t.s" >/dev/null
 	python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
 done
@@ -52,7 +52,7 @@ run walker_cdc   "$WORK/tb_walker.vvp"
 run bus16_gap    "$WORK/tb_bus16.vvp"
 run bus_timeout  "$WORK/tb_timeout.vvp"
 run cache_snoop  "$WORK/tb_snoop.vvp"
-for t in integer exceptions mmu cache fpu; do
+for t in integer exceptions mmu bitfield_mmu bitfield_cache moves_fc cache fpu; do
 	run "$t" "$WORK/tb_prog.vvp" "+prog=$WORK/t_$t.hex"
 done
 
