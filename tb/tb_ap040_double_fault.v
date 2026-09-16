@@ -174,7 +174,10 @@ task expect_warm_reset_mmu_state;
 		// entry 17 = row 4 (bank 0, set 4), way 1: the payload lives in
 		// the ATC dpram row's way-1 bit slice, validity in the flop
 		dut.mmu.atc_v[17] = 1'b1;
-		dut.mmu.atc_ram.mem[4][89:45] = {17'h12345, 20'habcde, 8'hd3};
+		dut.mmu.atc_ram.mem[4][91:46] = {1'b1, 17'h12345, 20'habcde, 8'hd3};
+		// A warm reset must preserve nonresident entries as well.
+		dut.mmu.atc_v[18] = 1'b1;
+		dut.mmu.atc_ram.mem[4][137:92] = {1'b0, 17'h12346, 28'd0};
 
 		nreset = 0;
 		repeat (8) @(posedge clk);
@@ -191,8 +194,11 @@ task expect_warm_reset_mmu_state;
 			$display("FAIL: warm reset altered retained MMU registers");
 		end
 		else if (dut.mmu.atc_v[17] !== 1'b1 ||
-		         dut.mmu.atc_ram.mem[4][89:45] !==
-		         {17'h12345, 20'habcde, 8'hd3}) begin
+		         dut.mmu.atc_ram.mem[4][91:46] !==
+		         {1'b1, 17'h12345, 20'habcde, 8'hd3} ||
+		         dut.mmu.atc_v[18] !== 1'b1 ||
+		         dut.mmu.atc_ram.mem[4][137:92] !==
+		         {1'b0, 17'h12346, 28'd0}) begin
 			errors = errors + 1;
 			$display("FAIL: warm reset invalidated or altered an ATC entry");
 		end

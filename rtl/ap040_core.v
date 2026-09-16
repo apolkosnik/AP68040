@@ -10,12 +10,12 @@
 //    CINV/CPUSH/PFLUSH/PTEST with MMU/cache sidebands                      //
 //  - exceptions: formats $0/$1/$2/$3 ($4 RTE-accepted when built FPU-less //
 //    but never generated) and format $7 access errors with                 //
-//    pure instruction restart and EA register rollback (MMU faults),       //
+//    instruction restart, MOVEM saved-EA continuation and EA rollback,     //
 //    RTE with format validation and $1 throwaway continuation, trace       //
 //    (T1/T0), autovectored interrupts with M-bit master/interrupt stack    //
 //    switching                                                             //
 //  - integrated 68040 FPU arithmetic, conversions, control and condition   //
-//    operations; FSAVE/FRESTORE support NULL, IDLE and rev-$41 UNIMP state //
+//    operations; FSAVE/FRESTORE support NULL, IDLE and rev-$40/$41 state   //
 //                                                                          //
 // Known gaps, all documented in tests/ap040/README:                        //
 //  - TAS/CAS/CAS2 are not bus-locked (single-master fabric here)           //
@@ -23,7 +23,7 @@
 //    distinguishes a translation fault from a physical bus error          //
 //  - interrupts are always autovectored (ipl_autovector is ignored)        //
 //  - true pipelined arithmetic BUSY state frames are not generated         //
-//  - access faults use pure restart; CM/CT and WB2/WB1 are not generated   //
+//  - access faults replay operands; CT and WB2/WB1 are not generated       //
 //                                                                          //
 // The whole core advances only when ce (clkena_in) is high.                //
 //--------------------------------------------------------------------------//
@@ -36,7 +36,9 @@ module ap040_core
 	parameter AP040_HAS_FPU      = 0,
 	parameter AP040_ENABLE_CACHE = 0,
 	parameter AP040_FAST_SIM     = 0,
-	parameter AP040_FAST_OPERANDS = 1
+	parameter AP040_FAST_OPERANDS = 1,
+	parameter AP040_DEBUG_EXCEPTIONS = 0,
+	parameter [7:0] AP040_FPU_REVISION = 8'h41
 )
 (
 	input             clk,
@@ -101,8 +103,27 @@ module ap040_core
 	// stacking an exception frame is only explicable with these -- the
 	// active A7 alone cannot say whether the stack switch failed or the
 	// supervisor stack pointer was already wrong.
-	output    [127:0] debug_status2
+	output    [127:0] debug_status2,
+	output            debug_exception_valid,
+	output    [511:0] debug_exception
 );
+
+// Revision $40 omits CMDREG3B and the following reserved longword from
+// UNIMP frames. Old non-Turbo NeXT kernels depend on this 44-byte layout.
+// Keep $41 as the default for existing integrations (52-byte UNIMP).
+localparam FPU_REV40 = AP040_FPU_REVISION == 8'h40;
+localparam [31:0] FPU_IDLE_HEADER = {AP040_FPU_REVISION, 24'd0};
+localparam [31:0] FPU_UNIMP_HEADER = {AP040_FPU_REVISION,
+	(FPU_REV40 ? 8'h28 : 8'h30), 16'd0};
+localparam [31:0] FPU_BUSY_HEADER = {AP040_FPU_REVISION, 8'h60, 16'd0};
+localparam [31:0] FPU_UNIMP_BYTES = FPU_REV40 ? 32'd44 : 32'd52;
+localparam [3:0] FPU_UNIMP_LAST = FPU_REV40 ? 4'd10 : 4'd12;
+// synthesis translate_off
+initial begin
+	if (AP040_FPU_REVISION != 8'h40 && AP040_FPU_REVISION != 8'h41)
+		$fatal(1, "AP040_FPU_REVISION must be 0x40 or 0x41");
+end
+// synthesis translate_on
 
 //---------------------------------------------------------------------------
 // architectural state
@@ -540,6 +561,9 @@ localparam S_FSAVE_B   = 8'd186;
 localparam S_FSAVE_BD  = 8'd187;
 localparam S_FREST_B   = 8'd188;
 localparam S_FREST_BD  = 8'd189;
+localparam S_MOVEM_FIN = 8'd191;   // commit a held MOVEM index register
+localparam S_RTE_SSW   = 8'd192;   // format-7 continuation status
+localparam S_RTE_EA    = 8'd193;   // CM's saved MOVEM effective address
 
 // exec kinds
 localparam EK_ALU     = 4'd0;
@@ -751,6 +775,16 @@ reg [31:0] mm_addr, mm_init_an;
 reg        mm_base_ea;            // the EA depends on An (see S_MOVEM_LD)
 reg        mm_base_pend;          // a loaded base register awaits commit
 reg [31:0] mm_base_val;           // its value, written with the last transfer
+// Hold a loaded index as well as the base until the transfer list completes.
+// The format-7 CM path below additionally preserves the calculated EA:
+// register deferral alone cannot protect an indirect pointer overwritten by
+// an earlier store. MC68040UM, SSW CM and access-error RTE (pp. 8-25/8-27).
+reg        mm_idx_pend;
+reg [31:0] mm_idx_val;
+reg  [3:0] mm_idx_reg;            // captured from the extension word
+reg        mm_idx_en;             // ... and whether the EA uses it at all
+reg        mm_resume;             // RTE supplied the EA for the next MOVEM
+reg [31:0] mm_start_ea;           // original EA, before any operand transfer
 reg  [3:0] mm_reg;
 
 reg  [2:0] mp_cnt, mp_idx;     // byte counts: 2 for word, 4 for long
@@ -807,6 +841,8 @@ reg        in_exc;              // exception stacking in progress
 reg [31:0] aer_fa, aer_sp;
 reg        aer_bus;          // fault came from the bus, not the ATC
 reg        aer_ma;           // ATC fault occurred on second page of transfer
+reg        aer_cm;
+reg [31:0] aer_ea;
 reg        aer_wr;
 reg  [1:0] aer_sz;
 reg  [2:0] aer_tm;
@@ -1026,6 +1062,8 @@ reg         fpu_frestore_unimp;
 reg  [15:0] fp_restore_cmd1, fp_restore_cmd3;
 reg   [2:0] fp_restore_stag, fp_restore_dtag, fp_restore_flags;
 reg  [95:0] fp_restore_fpt, fp_restore_et;
+reg   [7:0] fp_restore_cusavepc;
+reg         fp_restore_et15, fp_restore_fpt15;
 reg   [1:0] fp_cnt;               // long transfers remaining
 reg   [3:0] fp_nb;                // operand bytes
 reg         fp_st;                // 1: store direction
@@ -1054,6 +1092,7 @@ reg   [7:0] fpu_pend_vec;
 wire        fpu_fstate_unimp;
 wire  [7:0] fpu_cur_vec;
 wire        fpu_frestore_e1_pend;
+wire        fpu_frestore_resume;
 wire  [2:0] fpu_fstate_grs;
 wire        fpu_fstate_wbte15;
 reg         fpu_pendcap;
@@ -1100,6 +1139,9 @@ generate if (AP040_HAS_FPU) begin : g_fpu
 		.fstate_fpt(fpu_fstate_fpt), .fstate_et(fpu_fstate_et),
 		.pend_capture(fpu_pendcap), .cur_vec(fpu_cur_vec),
 		.frestore_e1_pend(fpu_frestore_e1_pend),
+		.frestore_resume(fpu_frestore_resume),
+		.frestore_cusavepc(fp_restore_cusavepc),
+		.frestore_et15(fp_restore_et15), .frestore_fpt15(fp_restore_fpt15),
 		.fstate_grs(fpu_fstate_grs), .fstate_wbte15(fpu_fstate_wbte15),
 		.frestore_grs(fp_restore_grs), .frestore_wbte15(fp_restore_wbte15),
 		.fstate_busy(fpu_fstate_busy), .fstate_wbt(fpu_fstate_wbt),
@@ -1130,6 +1172,7 @@ end else begin : g_nofpu
 	assign fpu_fstate_unimp = 0;
 	assign fpu_cur_vec = 0;
 	assign fpu_frestore_e1_pend = 0;
+	assign fpu_frestore_resume = 0;
 	assign fpu_fstate_grs = 0;
 	assign fpu_fstate_wbte15 = 0;
 	assign fpu_fstate_busy = 0;
@@ -1158,9 +1201,8 @@ function [3:0] fp_bytes;
 	end
 endfunction
 
-// Revision-$41 MC68040 unimplemented-instruction frame.  The size field in
-// the header is the payload size (48 bytes), making 13 longwords total.
-// the $41/$60 BUSY frame: 25 longwords, offsets per WinUAE's 68040
+// Both revisions use a 100-byte BUSY frame (header + 96-byte payload).
+// Offsets per Previous/WinUAE's 68040
 // fpuop_save writer (WBTEMP at +24, FPIARCU at +40, CMDREG3B at +52,
 // STAG/GRS at +60, CMDREG1B at +64, DTAG/WBTE15 at +68, flags at +72,
 // FPTEMP at +76, ETEMP at +88; CU_SAVEPC and the reserved words zero)
@@ -1168,7 +1210,7 @@ function [31:0] fsave_busy_word;
 	input [4:0] n;
 	begin
 		case (n)
-			5'd0:  fsave_busy_word = 32'h4160_0000;
+			5'd0:  fsave_busy_word = FPU_BUSY_HEADER;
 			5'd6:  fsave_busy_word = {fpu_fstate_wbt[95:80], 16'd0};
 			5'd7:  fsave_busy_word = fpu_fstate_wbt[63:32];
 			5'd8:  fsave_busy_word = fpu_fstate_wbt[31:0];
@@ -1196,8 +1238,9 @@ endfunction
 function [31:0] fsave_unimp_word;
 	input [3:0] n;
 	begin
-		case (n)
-			4'd0:  fsave_unimp_word = 32'h4130_0000;
+		// Internal fields use the $41 indices. $40 skips words 1 and 2.
+		case ((FPU_REV40 && n != 0) ? n + 4'd2 : n)
+			4'd0:  fsave_unimp_word = FPU_UNIMP_HEADER;
 			4'd1:  fsave_unimp_word = {fpu_fstate_cmd3, 16'd0};
 			4'd2:  fsave_unimp_word = 32'd0;
 			4'd3:  fsave_unimp_word = {fpu_fstate_stag, 3'd0,
@@ -1665,6 +1708,12 @@ task aerr_start;
 		// identified by the continuation state, not by `state` itself
 		aer_m16  <= !mem_instr &&
 		            (r_m_ret >= S_M16_RD2 && r_m_ret <= S_M16_INC2);
+		// Only operand transfers, not faults while calculating the EA,
+		// carry CM. A fault fetching a resumed MOVEM retains its saved EA.
+		aer_cm <= mm_resume || (!mem_instr &&
+		          (r_m_ret == S_MOVEM_LD || r_m_ret == S_MOVEM_LOOP));
+		aer_ea <= mm_start_ea;
+		mm_resume <= 0;
 		// MOVES faults report the alternate space in TT/TM: FC 0, 3, 4 and 7
 		// keep the raw FC with TT = 10; FC 2 and 6 are remapped onto the
 		// corresponding data space (WinUAE mmu_bus_error's ismoves block)
@@ -1701,10 +1750,10 @@ task u_rec;
 	end
 endtask
 
-// Access-error SSW.  CP/CU/CT/CM stay clear: pure instruction restart.
+// Access-error SSW. CP/CU/CT stay clear; CM preserves a MOVEM's original EA.
 // MOVE16 line faults report SIZE = line with TT0; locked TAS/CAS cycles
 // report LK with RW clear (WinUAE mmu_bus_error).
-wire [15:0] aer_ssw = {4'b0000, aer_ma, ~aer_bus, aer_lk,
+wire [15:0] aer_ssw = {3'b000, aer_cm, aer_ma, ~aer_bus, aer_lk,
                        (~aer_wr & ~aer_lk), 1'b0,
                        aer_m16 ? 2'b11 :
                        (aer_sz == `AP040_SZ_B) ? 2'b01 :
@@ -1721,11 +1770,11 @@ function [15:0] aerr_word;
 			5'd1:  aerr_word = pc_i[31:16];
 			5'd2:  aerr_word = pc_i[15:0];
 			5'd3:  aerr_word = 16'h7008;               // format $7, vector 2
-			// WinUAE stacks the fault address in EA as well (aligned to the
-			// line for MOVE16); handlers that honour CM/CT never see those
-			// bits set here, so the field is informational
-			5'd4:  aerr_word = aer_fa[31:16];
-			5'd5:  aerr_word = aer_m16 ? {aer_fa[15:4], 4'd0} : aer_fa[15:0];
+			// CM needs the ORIGINAL effective address, not the failed
+			// transfer address. All other EA-field behavior is unchanged.
+			5'd4:  aerr_word = aer_cm ? aer_ea[31:16] : aer_fa[31:16];
+			5'd5:  aerr_word = aer_cm ? aer_ea[15:0] :
+			                   aer_m16 ? {aer_fa[15:4], 4'd0} : aer_fa[15:0];
 			5'd6:  aerr_word = aer_ssw;
 			// WB3S stays CLEAR: this core RESTARTS the faulting
 			// instruction after the handler repairs the mapping, so it
@@ -1759,6 +1808,9 @@ task dispatch_word;
 		in_exc <= 0;
 		epf_pop = 2'd1;
 		ir <= fw;
+		// A forged/edited CM frame must not leak into a later instruction.
+		if ((fw & 16'hfb80) != 16'h4880 || fw[5:3] < 3'd2)
+			mm_resume <= 0;
 		pc <= pc + 32'd2;
 		tr_t1 <= sr[15];
 		tr_t0 <= sr[14];
@@ -2008,6 +2060,8 @@ always @(posedge clk) begin
 		fp_restore_cmd1 <= 0; fp_restore_cmd3 <= 0;
 		fp_restore_stag <= 0; fp_restore_dtag <= 0; fp_restore_flags <= 0;
 		fp_restore_fpt <= 0; fp_restore_et <= 0;
+		fp_restore_cusavepc <= 0;
+		fp_restore_et15 <= 0; fp_restore_fpt15 <= 0;
 		fp_cnt <= 0; fp_nb <= 0; fp_st <= 0; fp_list <= 0; fp_mode <= 0;
 		fp_st_epend <= 0; fp_st_evec <= 0;
 		fp_rev <= 0; fp_lsb <= 0;
@@ -2049,6 +2103,9 @@ always @(posedge clk) begin
 		mm_mask <= 0; mm_dir <= 0; mm_predec <= 0; mm_postinc <= 0;
 		mm_size <= 0; mm_addr <= 0; mm_init_an <= 0; mm_reg <= 0;
 		mm_base_ea <= 0; mm_base_pend <= 0; mm_base_val <= 0;
+		mm_idx_pend <= 0; mm_idx_val <= 0; mm_idx_reg <= 0; mm_idx_en <= 0;
+		mm_resume <= 0; mm_start_ea <= 0;
+		aer_cm <= 0; aer_ea <= 0;
 		mp_cnt <= 0; mp_idx <= 0; mp_dir <= 0; mp_addr <= 0; mp_val <= 0;
 		t_a <= 0; t_b <= 0; srop_kind <= 0; srop_sr <= 0;
 		mvc_dir <= 0; fc_ovr_v <= 0; fc_ovr <= 0;
@@ -2462,6 +2519,9 @@ always @(posedge clk) begin
 			S_EA_EXTW: begin
 				extw <= imm[15:0];
 				rr_b <= {imm[15], imm[14:12]};
+				// remember which register the index came from, for MOVEM
+				mm_idx_reg <= {imm[15], imm[14:12]};
+				mm_idx_en  <= !imm[8] || !imm[6];   // full format may suppress it
 				ea_base_v <= ea_pcmode ? ea_pcb : rf_rdata_a;
 				state <= S_EA_EXTW2;
 			end
@@ -2498,6 +2558,13 @@ always @(posedge clk) begin
 				if (extw[2:0] == 3'b000) begin
 					ea_addr <= ea_base_v + ea_idx_v + bd;
 					state <= r_ea_ret;
+				end
+				else if (mm_resume && r_ea_ret == S_MOVEM_EA) begin
+					// Consume extension words but NEVER reread the indirect
+					// pointer: an earlier MOVEM store may have overwritten it.
+					// S_MOVEM_EA takes the address restored from the frame.
+					if (extw[1:0] == 2'b01) state <= r_ea_ret;
+					else immf(extw[1:0] == 2'b10 ? 2'd1 : 2'd2, S_EA_OD);
 				end
 				else begin
 					// memory indirect: pre-indexed adds the index before the
@@ -3061,7 +3128,10 @@ always @(posedge clk) begin
 			end
 
 			//------------------------------------------------------------- RTE
-			S_RTE_SR:  mrd(dbg_a7, `AP040_SZ_W, S_RTE_PC);
+			S_RTE_SR: begin
+				mm_resume <= 0;
+				mrd(dbg_a7, `AP040_SZ_W, S_RTE_PC);
+			end
 			S_RTE_PC:  begin rte_sr <= m_val[15:0]; mrd(dbg_a7 + 32'd2, `AP040_SZ_L, S_RTE_FMT); end
 			S_RTE_FMT: begin rte_pc <= m_val; mrd(dbg_a7 + 32'd6, `AP040_SZ_W, S_RTE_FIN); end
 
@@ -3089,17 +3159,32 @@ always @(posedge clk) begin
 						end
 					end
 					4'd7: begin
-						// access error frame: restart semantics, the
-						// continuation/writeback fields are not consumed
-						rfw(4'd15, dbg_a7 + 32'd60);
-						ret_kind <= 2'b00;
-						state <= S_RTE_FIN2;
+						mrd(dbg_a7 + 32'd12, `AP040_SZ_W, S_RTE_SSW);
 					end
 					default: exc(`AP040_VEC_FMTERR, 4'd0, pc_i, 32'd0);
 				endcase
 			end
 
+			S_RTE_SSW: begin
+				if (m_val[12]) mrd(dbg_a7 + 32'd8, `AP040_SZ_L, S_RTE_EA);
+				else begin
+					rfw(4'd15, dbg_a7 + 32'd60);
+					ret_kind <= 2'b00;
+					state <= S_RTE_FIN2;
+				end
+			end
+
+			S_RTE_EA: begin
+				mm_start_ea <= m_val;
+				mm_resume <= 1;
+				rfw(4'd15, dbg_a7 + 32'd60);
+				ret_kind <= 2'b00;
+				state <= S_RTE_FIN2;
+			end
+
 			S_RTE_FIN2: begin
+				// CM returns into an unfinished instruction, not an interrupt/
+				// trace boundary. Sample those again after MOVEM completes.
 				sr <= rte_sr & `AP040_SR_MASK;
 				if (ret_kind[0]) begin
 					// format $1: continue with the next frame; the popped
@@ -3114,14 +3199,14 @@ always @(posedge clk) begin
 					exc(`AP040_VEC_ADDRERR, 4'd2, pc_i,
 					    {rte_pc[31:1], 1'b0});
 				end
-				else if (tr_t1 || tr_t0) begin
+				else if (!mm_resume && (tr_t1 || tr_t0)) begin
 					// the RTE itself was traced (T set before the RTE)
 					tr_t1 <= 0;
 					tr_t0 <= 0;
 					pc <= rte_pc;
 					exc(`AP040_VEC_TRACE, 4'd2, rte_pc, pc_i);
 				end
-				else if (rte_irq_pend) begin
+				else if (!mm_resume && rte_irq_pend) begin
 					// The restored mask unblocks a pending request: it is
 					// taken AT this boundary, before the instruction RTE
 					// returns to.  This path used to go straight to
@@ -3333,6 +3418,15 @@ always @(posedge clk) begin
 			//---------------------------------------------------------- MOVEM
 			S_MOVEM_SET: begin
 				mm_mask <= imm[15:0];
+				// The manual uses the saved EA only for indexed/PC-relative
+				// modes. Ordinary modes still calculate their address normally.
+				if (d_mode != 3'b110 && !(d_mode == 3'b111 &&
+				    (d_rn == 3'b010 || d_rn == 3'b011))) mm_resume <= 0;
+				mm_idx_pend <= 0;
+				// only the indexed modes carry one; every other mode reaches
+				// here without having run S_EA_EXTW, so clear it explicitly
+				if (d_mode != 3'b110 &&
+				    !(d_mode == 3'b111 && d_rn == 3'b011)) mm_idx_en <= 0;
 				// the EA depends on An for these modes: a LOADED base
 				// register must not be written mid-loop (restart safety;
 				// see S_MOVEM_LD)
@@ -3348,22 +3442,34 @@ always @(posedge clk) begin
 
 			S_MOVEM_SET2: begin
 				mm_addr <= rf_rdata_a;
+				mm_start_ea <= rf_rdata_a;
 				mm_init_an <= rf_rdata_a;
 				state <= S_MOVEM_LOOP;
 			end
 
 			S_MOVEM_EA: begin
-				mm_addr <= ea_addr;
+				mm_addr <= mm_resume ? mm_start_ea : ea_addr;
+				if (!mm_resume) mm_start_ea <= ea_addr;
+				mm_resume <= 0;
 				state <= S_MOVEM_LOOP;
 			end
 
 			S_MOVEM_LOOP: begin
 				if (mm_mask == 16'd0) begin
-					if (mm_predec || mm_postinc)
-						rfw({1'b1, d_rn}, mm_addr);
-					else if (mm_base_pend)
-						rfw({1'b1, d_rn}, mm_base_val);
-					fetch_next;
+					// One write port, and the base and the index can both be
+					// pending, so a held index takes a cycle of its own.
+					if (mm_idx_pend) begin
+						rfw(mm_idx_reg, mm_idx_val);
+						mm_idx_pend <= 0;
+						state <= S_MOVEM_FIN;
+					end
+					else begin
+						if (mm_predec || mm_postinc)
+							rfw({1'b1, d_rn}, mm_addr);
+						else if (mm_base_pend)
+							rfw({1'b1, d_rn}, mm_base_val);
+						fetch_next;
+					end
 				end
 				else begin : movem_step
 					reg [3:0] bit_i;
@@ -3384,6 +3490,16 @@ always @(posedge clk) begin
 						end
 					end
 				end
+			end
+
+			// The index was committed on the previous edge; finish exactly as
+			// the loop exit would have.
+			S_MOVEM_FIN: begin
+				if (mm_predec || mm_postinc)
+					rfw({1'b1, d_rn}, mm_addr);
+				else if (mm_base_pend)
+					rfw({1'b1, d_rn}, mm_base_val);
+				fetch_next;
 			end
 
 			S_MOVEM_RD: begin : movem_rd
@@ -3416,6 +3532,10 @@ always @(posedge clk) begin
 						mm_base_pend <= 1;
 						mm_base_val  <= lv;
 					end
+				end
+				else if (mm_idx_en && mm_reg == mm_idx_reg) begin
+					mm_idx_pend <= 1;
+					mm_idx_val  <= lv;
 				end
 				else rfw(mm_reg, lv);
 				mm_addr <= mm_addr + ((mm_size == `AP040_SZ_L) ? 32'd4 : 32'd2);
@@ -3733,9 +3853,9 @@ always @(posedge clk) begin
 			end
 
 			//------------------------------------------- FSAVE / FRESTORE
-			// NULL frame ($00000000) when the FPU is untouched, 4-byte IDLE
-			// frame ($41000000) once it has state, or the 52-byte revision-$41
-			// UNIMP frame retained by the FPU.  The generic EA engine has
+			// NULL frame ($00000000) when untouched, 4-byte revision-specific
+			// IDLE frame, or the 44/52-byte UNIMP frame retained by the FPU.
+			// The generic EA engine has
 			// already adjusted -(An) by one longword; extend that adjustment
 			// to the complete exception frame before issuing any writes.
 			S_FSAVE1: begin
@@ -3756,7 +3876,7 @@ always @(posedge clk) begin
 				end
 				else if (fpu_fstate_unimp && fpu_fstate_busy) begin
 					// an e3 arithmetic pend extracts as the 100-byte
-					// $41/$60 BUSY frame
+					// revision-specific $60 BUSY frame
 					fpu_pend_exc <= 0;
 					t_a <= (ea_mode == 3'b100) ? ea_addr - 32'd96 : ea_addr;
 					if (ea_mode == 3'b100)
@@ -3767,16 +3887,16 @@ always @(posedge clk) begin
 				else if (fpu_fstate_unimp) begin
 					// pending state (unimplemented instruction, or a
 					// prepared/lingering arithmetic e1 frame) is extracted
-					// into the $30 frame; extraction consumes the pend
+					// into the $28/$30 frame; extraction consumes the pend
 					fpu_pend_exc <= 0;
-					t_a <= (ea_mode == 3'b100) ? ea_addr - 32'd48 : ea_addr;
+					t_a <= (ea_mode == 3'b100) ? ea_addr - (FPU_UNIMP_BYTES - 32'd4) : ea_addr;
 					if (ea_mode == 3'b100)
-						rfw({1'b1, ea_rn}, ea_addr - 32'd48);
+						rfw({1'b1, ea_rn}, ea_addr - (FPU_UNIMP_BYTES - 32'd4));
 					fp_n <= 0;
 					state <= S_FSAVE_U;
 				end
 				else mwr(ea_addr, `AP040_SZ_L,
-				             fpu_used ? 32'h4100_0000 : 32'h0000_0000, S_NEXT);
+				             fpu_used ? FPU_IDLE_HEADER : 32'h0000_0000, S_NEXT);
 			end
 
 			S_FSAVE_U:
@@ -3784,7 +3904,7 @@ always @(posedge clk) begin
 				    fsave_unimp_word(fp_n), S_FSAVE_UD);
 
 			S_FSAVE_UD: begin
-				if (fp_n == 4'd12) begin
+				if (fp_n == FPU_UNIMP_LAST) begin
 					// Do not acknowledge/lose the pending state until the final
 					// bus write has completed successfully.
 					fpu_fsave_ack <= 1;
@@ -3817,8 +3937,8 @@ always @(posedge clk) begin
 
 			S_FREST2: begin
 				// version byte 0 = NULL frame: reset the FPU state.
-				// $41/$00 is the MC68040 IDLE frame.  $41/$30 is the 52-byte
-				// unimplemented-instruction frame; read its complete payload so
+				// Match the configured revision for IDLE, UNIMP and BUSY.
+				// Read the complete 44/52-byte UNIMP payload so
 				// bus faults remain precise before installing any FPU state.
 				// A completed FRESTORE replaces the FPU state wholesale, so
 				// a pending deferred exception from the OLD context is
@@ -3832,17 +3952,19 @@ always @(posedge clk) begin
 					fpu_pend_exc <= 0;
 					fetch_next;
 				end
-				else if (m_val == 32'h4100_0000) begin
+				else if (m_val == FPU_IDLE_HEADER) begin
 					fpu_frestore_idle <= 1;
 					fpu_pend_exc <= 0;
 					fetch_next;
 				end
-				else if (m_val == 32'h4130_0000) begin
+				else if (m_val == FPU_UNIMP_HEADER) begin
 					fp_restore_busy <= 0;
+					// $40 has no CMDREG3B; do not inherit it from a prior BUSY.
+					if (FPU_REV40) fp_restore_cmd3 <= 0;
 					fp_n <= 4'd1;
 					mrd(ea_addr + 32'd4, `AP040_SZ_L, S_FREST_U);
 				end
-				else if (m_val == 32'h4160_0000) begin
+				else if (m_val == FPU_BUSY_HEADER) begin
 					fp_restore_busy <= 1;
 					fpb_n <= 5'd1;
 					mrd(ea_addr + 32'd4, `AP040_SZ_L, S_FREST_B);
@@ -3851,7 +3973,7 @@ always @(posedge clk) begin
 			end
 
 			S_FREST_U: begin
-				case (fp_n)
+				case (FPU_REV40 ? fp_n + 4'd2 : fp_n)
 					4'd1: fp_restore_cmd3 <= m_val[31:16];
 					4'd3: begin
 					fp_restore_stag <= m_val[31:29];
@@ -3871,7 +3993,7 @@ always @(posedge clk) begin
 					4'd12: fp_restore_et[31:0] <= m_val;
 					default: ; // reserved longword at offset $08
 				endcase
-				if (fp_n == 4'd12) state <= S_FREST_UD;
+				if (fp_n == FPU_UNIMP_LAST) state <= S_FREST_UD;
 				else begin
 					fp_n <= fp_n + 4'd1;
 					mrd(ea_addr + ({28'd0, fp_n} << 2) + 32'd4,
@@ -3881,6 +4003,7 @@ always @(posedge clk) begin
 
 			S_FREST_B: begin
 				case (fpb_n)
+					5'd2:  fp_restore_cusavepc <= m_val[31:24];
 					5'd6:  fp_restore_wbt[95:64] <= m_val;
 					5'd7:  fp_restore_wbt[63:32] <= m_val;
 					5'd8:  fp_restore_wbt[31:0]  <= m_val;
@@ -3888,11 +4011,13 @@ always @(posedge clk) begin
 					5'd13: fp_restore_cmd3 <= m_val[31:16];
 					5'd15: begin
 						fp_restore_stag <= m_val[31:29];
+						fp_restore_et15 <= m_val[28];
 						fp_restore_grs  <= m_val[25:23];
 					end
 					5'd16: fp_restore_cmd1 <= m_val[31:16];
 					5'd17: begin
 						fp_restore_dtag   <= m_val[31:29];
+						fp_restore_fpt15  <= m_val[28];
 						fp_restore_wbte15 <= m_val[20];
 					end
 					5'd18: fp_restore_flags <= {m_val[26], m_val[25], m_val[20]};
@@ -3916,7 +4041,12 @@ always @(posedge clk) begin
 				if (ea_mode == 3'b011)
 					rfw({1'b1, ea_rn}, ea_addr + 32'd100);
 				fpu_frestore_unimp <= 1;
-				fpu_pend_exc <= fpu_frestore_e1_pend;
+				// CU_SAVEPC=$fe resumes the prepared arithmetic command.
+				// Wait through the existing background interlock before the
+				// next FP dispatch/FSAVE; completion may re-arm a NEW exception.
+				// All frame reads have succeeded before any execution starts.
+				fpu_bg <= fpu_frestore_resume;
+				fpu_pend_exc <= !fpu_frestore_resume && fpu_frestore_e1_pend;
 				fpu_pend_vec <= fpu_cur_vec;
 				fetch_next;
 			end
@@ -3924,7 +4054,7 @@ always @(posedge clk) begin
 			S_FREST_UD: begin
 				fp_restore_busy <= 0;
 				if (ea_mode == 3'b011)
-					rfw({1'b1, ea_rn}, ea_addr + 32'd52);
+					rfw({1'b1, ea_rn}, ea_addr + FPU_UNIMP_BYTES);
 				fpu_frestore_unimp <= 1;
 				// see S_FREST2: a completed FRESTORE discards the old
 				// context's pending deferred exception -- and a restored
@@ -4537,6 +4667,13 @@ always @(posedge clk) begin
 				else begin
 					fp_list <= fp_list & ~(8'd1 << b);
 					fpu_fmsel <= (!fp_st || fp_mode[1]) ? (3'd7 - b) : b;
+					// FMOVEM stores share the FPU's ordinary source-register
+					// read port, because the register file is now a memory
+					// with two read ports rather than flip-flops with three
+					// muxes.  S_FPU_MVM2 gives it a full setup cycle before
+					// fm_rdata is consumed; loads still write through fm_sel.
+					if (fp_st)
+						fpu_srcr <= (!fp_st || fp_mode[1]) ? (3'd7 - b) : b;
 					if (fp_ea_pd) t_a <= t_a;   // base already lowered
 					fp_n <= 0;
 					state <= S_FPU_MVM2;
@@ -6333,6 +6470,97 @@ end
 assign debug_busy   = mem_req;
 assign debug_fault  = fault_r;
 assign debug_halted = (state == S_HALT);
+
+// Passive diagnostic tap.  S_EXC1 has the original (pre-entry) SR and
+// stacked PC, even though the live SR has already switched to supervisor.
+// Qualifying with ce emits exactly one event per frame, including bus waits.
+// No diagnostic register feeds the execution, exception or memory controls.
+generate if (AP040_DEBUG_EXCEPTIONS == 1) begin : g_debug_exceptions
+	reg [31:0] last_rte_pc;
+	reg [15:0] last_rte_sr;
+	reg last_rte_valid;
+	always @(posedge clk) begin
+		if (!nreset) begin
+			last_rte_pc <= 0;
+			last_rte_sr <= 0;
+			last_rte_valid <= 0;
+		end
+		else if (ce) begin
+			// Record the final frame pop, not a format-1 continuation.
+			// An odd target is recorded too: it faults after SR restoration.
+			if (state == S_RTE_FIN2 && !ret_kind[0]) begin
+				last_rte_pc <= rte_pc;
+				last_rte_sr <= rte_sr & `AP040_SR_MASK;
+				last_rte_valid <= 1;
+			end
+		end
+	end
+	assign debug_exception_valid = nreset && ce && state == S_EXC1 &&
+		!exc_pass2 && !sr_saved[13] &&
+		(exc_vec == `AP040_VEC_TRACE || exc_vec == 8'd47);
+	// Version 2: four informative u64 words and four reserved zero words.
+	// Keeping general-register and RTE-frame snapshots here congested the
+	// nearly-full FPGA. The trace frame's extra address identifies the
+	// source instruction even when a T0 branch has already redirected pc_i.
+	// Word zero is in bits [63:0]; unused bits synthesize away.
+	assign debug_exception = {
+		16'h0002, 15'd0, last_rte_valid, last_rte_sr, 4'd0, exc_fmt, exc_vec,
+		256'd0,
+		urp, usp_q,
+		last_rte_pc, ir, sr_saved,
+		exc_addr, exc_spc
+	};
+end else if (AP040_DEBUG_EXCEPTIONS == 2) begin : g_debug_unhandled
+	// Passive, image-specific probes for Improv's Mach 2.0 mk-94 kernel.
+	// Raw traces are routine AST machinery, not necessarily application
+	// exceptions. An external history matches the final delivery to its
+	// original frame and URP; user RTE records invalidate consumed frames.
+	// Shadow A4 through the existing write port, without adding RF ports.
+	reg [31:0] a4_shadow;
+	always @(posedge clk) begin
+		if (!nreset) a4_shadow <= 0;
+		else if (ce && rf_we && rf_waddr == 4'd12) a4_shadow <= rf_wdata;
+	end
+	wire candidate = state == S_EXC1 && !exc_pass2 && !sr_saved[13] &&
+		(exc_vec == `AP040_VEC_TRACE || exc_vec == 8'd47);
+	// Mach can compact a format-2 frame to format 0, moving it four bytes
+	// before RTE. Retire the ORIGINAL key before that copy, as well as
+	// frames returned directly by RTE. Otherwise a stale trace can survive.
+	wire compact_return = state == S_DECODE && sr_s &&
+		pc_i == 32'h04002126 && ir == 16'h204f;
+	wire retired = (state == S_RTE_FIN2 && !ret_kind[0] && !rte_sr[13]) || compact_return;
+	// Match instruction address AND opcode in supervisor decode, never
+	// speculative instruction fetches or the same address in user space.
+	wire trace_delivery = state == S_DECODE && sr_s &&
+		pc_i == 32'h040573bc && ir == 16'h42a7;
+	wire breakpoint_delivery = state == S_DECODE && sr_s &&
+		pc_i == 32'h04056b94 && ir == 16'h61ff && dbg_d2 == 32'd6;
+	wire signal_exit = state == S_DECODE && sr_s &&
+		pc_i == 32'h04007d6c && ir == 16'h2f02 &&
+		(dbg_d2 == 32'd5 || dbg_d2 == 32'h85);
+	wire delivery = trace_delivery || breakpoint_delivery || signal_exit;
+	wire [1:0] kind = signal_exit ? 2'd3 : breakpoint_delivery ? 2'd2 : 2'd1;
+	wire [31:0] frame = candidate ? dbg_a7 - exc_fsize :
+		compact_return ? dbg_a7 + 32'h44 : retired ? dbg_a7 :
+		signal_exit ? 32'd0 : a4_shadow + 32'h44;
+	assign debug_exception_valid = nreset && ce && (candidate || retired || delivery);
+	// Transport class: 0=candidate, 1=retired frame, 2=delivery trigger.
+	// Four nonzero u64 words; the trigger fills otherwise-unused words
+	// only AFTER a matching record is selected from block-RAM history.
+	assign debug_exception = {
+		16'h0003, (candidate ? 2'd0 : retired ? 2'd1 : 2'd2),
+		(delivery ? kind : 2'd0), 12'd0,
+		(delivery ? dbg_d2[15:0] : 16'd0), 4'd0,
+		(candidate ? exc_fmt : 4'd0), (candidate ? exc_vec : 8'd0),
+		256'd0,
+		urp, usp_q,
+		frame, ir, (candidate ? sr_saved : sr),
+		(candidate ? exc_addr : dbg_a7), (candidate ? exc_spc : pc_i)
+	};
+end else begin : g_no_debug_exceptions
+	assign debug_exception_valid = 1'b0;
+	assign debug_exception = 512'd0;
+end endgenerate
 
 assign debug_status2 = {
 	aer_fa,                      // [127:96] address whose access faulted

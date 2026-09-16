@@ -20,7 +20,7 @@ SRC="$RTL/ap040_tg68k_compat.v $RTL/ap040_core.v $RTL/ap040_bus16_adapter.v \
      $RTL/ap040_walker_cdc.v $RTL/primitives/dpram.v"
 
 echo "== assembling test programs =="
-for t in t_integer t_exceptions t_mmu t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop; do
+for t in t_integer t_exceptions t_mmu t_movem_restart t_atcprobe t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop; do
 	$VASM -Fbin -m68040 -no-opt -o "$WORK/$t.bin" "asm/$t.s" >/dev/null
 	python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
 done
@@ -85,8 +85,10 @@ run cache_snoop_x_ce4_accw "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_whole
 run cache_snoop_x_ce4_accs "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_settle
 negrun cache_snoop_x_neg_accw   "$WORK/tb_snoop_x.vvp"     +inj_acc_whole
 negrun cache_snoop_x_ce4_neg_lkw "$WORK/tb_snoop_x_ce4.vvp" +inj_look_whole
-for t in integer exceptions mmu bitfield_mmu bitfield_cache moves_fc cache fpu; do
+for t in integer exceptions mmu movem_restart atcprobe bitfield_mmu bitfield_cache moves_fc cache fpu; do
 	run "$t" "$WORK/tb_prog.vvp" "+prog=$WORK/t_$t.hex"
 done
+
+if ! sh ./run_fpu_frames.sh; then fail=1; fi
 
 if [ $fail -eq 0 ]; then echo "AP68040: ALL TESTS PASSED"; else echo "AP68040: FAILURES"; exit 1; fi

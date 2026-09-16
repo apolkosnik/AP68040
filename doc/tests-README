@@ -132,11 +132,11 @@ Implementation status and remaining gaps (milestones B-H complete):
     tb_ap040_bus16_gap proves both halves of reads and writes are accepted
     exactly once under that level-acknowledge contract
   - interrupts are always autovectored (the wrapper ties ipl_autovector=1)
-  - format $7 frames carry SSW and the initial FA, with an unused zero EA
-    and zeroed writeback slots; faults use pure instruction restart with EA
-    register rollback. MOVEM restart across a page fault is covered by
-    t_mmu.s (the CM continuation bit is never set, which handlers treat as
-    a plain restart)
+  - format $7 frames carry SSW and the initial FA. EA normally mirrors FA
+    (line-aligned for MOVE16); a MOVEM operand fault sets CM and saves its
+    original EA. RTE consumes CM/EA for indexed and PC-relative restart.
+    WB3 validity stays clear because the restart model repeats the store.
+    t_mmu.s and t_movem_restart.s cover fault/restart and frame handling
   - caches are write-through with invalidate-on-write, so CPUSH equals
     CINV and no copyback/push state exists; CINV/CPUSH invalidate the
     whole selected cache regardless of scope (architecturally safe);
@@ -153,7 +153,9 @@ Implementation status and remaining gaps (milestones B-H complete):
     verifies I/D isolation, disabled-fill suppression and maintenance clear
   - misaligned accesses restart the whole transfer. A second-page ATC
     fault reports the original transfer address/size and sets SSW.MA;
-    invalid translations are not cached in the ATC (each access re-walks)
+    failed searches install nonresident ATC entries until invalidation or
+    replacement. t_atcprobe.s covers invalid/protected/PTEST-failed entries,
+    instruction/data isolation, 8K pages and PFLUSH/PTEST invalidation
   - FPU (milestone H): ap040_fpu.v implements FPCR/FPSR/FPIAR, B/W/L/S/
     D/X movement and conversion, FABS/FNEG/FTST/FCMP, and hardware
     FADD/FSUB/FMUL/FDIV/FSQRT. It supports FPCR rounding/precision,
@@ -398,7 +400,9 @@ Fixed (t_mmu 48-59 plus updated 19/38/39, each negative-control proven):
     writeback and RTEs will see the write repeated by the restart --
     the same behaviour WinUAE produces.
 
-Documented deviations (unchanged, deliberately):
+Historical deviations recorded in this audit (superseded in the current
+working tree: failed-search caching and MOVEM CM/EA are now implemented;
+WB3 validity above is now deliberately clear under the restart model):
   - Invalid translations are NOT cached in the ATC.  Real 040 silicon
     caches the invalid entry and requires the handler to PFLUSH; this
     implementation re-walks instead, which is strictly more forgiving

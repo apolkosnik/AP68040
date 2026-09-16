@@ -17,7 +17,9 @@ module ap040_tg68k_compat
 	parameter AP040_HAS_MMU      = 1,
 	parameter AP040_HAS_FPU      = 1,
 	parameter AP040_ENABLE_CACHE = 1,
-	parameter AP040_FAST_SIM     = 0
+	parameter AP040_FAST_SIM     = 0,
+	parameter AP040_DEBUG_EXCEPTIONS = 0,
+	parameter [7:0] AP040_FPU_REVISION = 8'h41
 )
 (
 	input         clk,
@@ -86,7 +88,9 @@ module ap040_tg68k_compat
 	output        debug_fault,
 	output        debug_halted,
 	output [255:0] debug_status,
-	output [127:0] debug_status2
+	output [127:0] debug_status2,
+	output         debug_exception_valid,
+	output [511:0] debug_exception
 );
 
 // core to MMU
@@ -157,8 +161,10 @@ wire  [2:0] pf_fcw;
 ap040_core #(
 	.AP040_HAS_MMU(AP040_HAS_MMU),
 	.AP040_HAS_FPU(AP040_HAS_FPU),
+	.AP040_FPU_REVISION(AP040_FPU_REVISION),
 	.AP040_ENABLE_CACHE(AP040_ENABLE_CACHE),
-	.AP040_FAST_SIM(AP040_FAST_SIM)
+	.AP040_FAST_SIM(AP040_FAST_SIM),
+	.AP040_DEBUG_EXCEPTIONS(AP040_DEBUG_EXCEPTIONS)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -212,7 +218,9 @@ ap040_core #(
 	.debug_fault(debug_fault),
 	.debug_halted(debug_halted),
 	.debug_status(debug_status),
-	.debug_status2(debug_status2)
+	.debug_status2(debug_status2),
+	.debug_exception_valid(debug_exception_valid),
+	.debug_exception(debug_exception)
 );
 
 ap040_mmu mmu (

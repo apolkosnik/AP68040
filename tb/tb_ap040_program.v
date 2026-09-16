@@ -17,7 +17,7 @@
 
 `timescale 1ns/1ps
 
-module tb_ap040_program;
+module tb_ap040_program #(parameter [7:0] FPU_REVISION = 8'h41);
 
 reg clk = 0;
 reg nreset = 0;
@@ -61,6 +61,15 @@ wire        fberr = fberr_armed && nreset && (busstate == 2'b00) &&
 wire        berr = berr_d | fberr;
 
 wire        clkena_in = (busstate == 2'b01) | mem_ready | berr;
+
+// A revision-$40 UNIMP has no CMDREG3B field. In particular it must not
+// inherit one when replacing a previously restored BUSY frame.
+always @(posedge clk) begin
+	if (nreset && clkena_in && FPU_REVISION == 8'h40 &&
+	    dut.core.fpu_frestore_unimp && !dut.core.fp_restore_busy &&
+	    dut.core.fp_restore_cmd3 !== 16'd0)
+		$fatal(1, "revision-$40 UNIMP restore retained CMDREG3B");
+end
 
 reg   [2:0] ipl_lvl;
 reg  [15:0] ipl_delay = 0;   // $F148: delayed level-2 IPL countdown
@@ -136,7 +145,8 @@ end
 `define AP040_TB_CACHE 1
 `endif
 
-ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE)) dut
+ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
+                    .AP040_FPU_REVISION(FPU_REVISION)) dut
 (
 	.clk(clk),
 	.tick_in(1'b1),        // no P2 tick grid here: the core runs every clock

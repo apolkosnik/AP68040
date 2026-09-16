@@ -617,6 +617,39 @@ rtg_walk_done:
 	chkl	d0,8,147
 	subq.w	#1,(cnt_aerr).l	; later sections count faults absolutely
 
+	; the EA INDEX register inside a loaded list.  MC68040UM 8.4.6.5 on the
+	; SSW's CM bit: "the MOVEM operation can write over the memory location
+	; or REGISTERS used to calculate the effective address", so the 68040
+	; saves the calculated EA and RTE restarts MOVEM from it for indirect
+	; with index (mode 110) and the PC-relative modes, rather than repeating
+	; the calculation.  This core restarts the instruction whole, which is
+	; the same thing only if no register the EA depends on has been
+	; committed -- the base register is already held back for exactly this
+	; reason, and the index register needs the same treatment.
+	move.l	#5,(expect_tm).l	; supervisor data read
+	move.l	#$00007000,(expect_fa).l
+	move.l	#$441C,(fix_addr).l
+	move.l	#$7003,(fix_val).l
+	move.l	#$D0D00001,($6FF8).l	; d1's image: the index, loaded first
+	move.l	#$D0D00002,($6FFC).l	; d2's image, last valid long
+	move.l	#$D0D00003,($7000).l	; d3's image, first faulting long
+	move.l	#0,($441C).l		; page 7 invalid again
+	pflusha
+	lea	($6FF8).l,a0
+	move.w	(cnt_aerr).l,d4		; the running total is section-relative
+	moveq	#0,d1			; the index starts at zero
+	moveq	#0,d2
+	moveq	#0,d3
+	movem.l	(0,a0,d1.l),d1-d3
+	chkl	d1,$D0D00001,151
+	chkl	d2,$D0D00002,152
+	chkl	d3,$D0D00003,153
+	move.w	(cnt_aerr).l,d0
+	sub.w	d4,d0
+	and.l	#$FFFF,d0
+	chkl	d0,1,154		; exactly one fault, and one restart
+	subq.w	#1,(cnt_aerr).l		; leave the total as the later sections expect
+
 ;----------------------------------------------------------------- 8K pages
 	moveq	#0,d0
 	movec	d0,tc		; MMU off while rebuilding tables
@@ -1440,7 +1473,10 @@ h_aerr:
 	beq.s	haerr_eaok
 	bra	hfail
 haerr_eachk:
-	cmp.l	(expect_fa).l,d0	; (informational: CM/CT are never set)
+	move.w	$18(sp),d1
+	btst	#12,d1		; CM saves the original MOVEM EA, not FA
+	bne.s	haerr_eaok
+	cmp.l	(expect_fa).l,d0
 	bne	hfail
 haerr_eaok:
 	move.l	$20(sp),d0	; fault address (frame offset $14)

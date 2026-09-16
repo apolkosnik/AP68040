@@ -507,6 +507,8 @@ function [1:0] wrong_way;
 	end
 endfunction
 wire [93:0] real_row = dut.ctag_ram.mem[dut.a_row];
+// T12 drives the collided row itself; declare before the trace uses it.
+reg        perm_en  = 1'b0;
 // +trace_wb: every writeback attempt while the permuted row is armed, with
 // what allowed or blocked it.  The claim that the writeback protection is
 // what saves T12 needs this, not an inference from the source.
@@ -519,8 +521,6 @@ always @(posedge clk) if (nreset && perm_en && dut.cst == 3'd5 &&
 	         dut.tag_we ? "WROTE" : "blocked");
 end
 wire  [1:0] pway     = wrong_way(real_row, dut.a_tag);
-// T12 drives the collided row itself; see that test for why.
-reg        perm_en  = 1'b0;
 reg [93:0] perm_row = 94'd0;
 always @(*) begin
 	dut.ctag_ram.poison_en  = 1'b1;

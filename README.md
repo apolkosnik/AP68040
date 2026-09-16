@@ -78,6 +78,19 @@ Three groups of ports are optional and can be tied off:
   flat simulation environments.
 - **`mmu_*`, `cacr_out`, `vbr_out`, `debug_*`** — observation only.
 
+`AP040_FPU_REVISION` selects the FPU state-frame ABI at elaboration time:
+`8'h41` (default) or `8'h40` for older non-Turbo NeXT software. Revision
+`0x40` uses a 44-byte unimplemented-instruction frame; `0x41` uses 52 bytes.
+NULL frames remain four zero bytes; IDLE and 100-byte BUSY frames carry the
+selected revision. FRESTORE rejects non-null frames from another revision.
+This selects serialization/layout, not an alternative arithmetic datapath.
+
+BUSY FRESTORE with `CU_SAVEPC=0xfe` resumes supported arithmetic commands
+in opclass 0/2 using the frame's ETEMP and FPTEMP, including their extended
+exponent bits. Completion uses the existing background-FPU interlock and
+deferred arithmetic-exception handling. Other resume opclasses and
+software-only opcodes are not newly implemented by this path.
+
 `dpram` is a plain inferred true-dual-port RAM. Replace it with a vendor
 macro (altsyncram, XPM) if your flow needs one; the ports are
 `clock, address_a, data_a, wren_a, q_a, address_b, data_b, wren_b, q_b` with
@@ -91,11 +104,25 @@ advertises a valid WB3 in its access-error frame. A host OS that completes
 valid writeback slots itself — NetBSD's `trap.c` does — would otherwise
 double-apply the store of an RMW instruction.
 
+MOVEM operand faults set SSW.CM and stack the original effective address.
+RTE uses that address for indexed/PC-relative modes and replays the transfer
+list without rereading a memory-indirect pointer that MOVEM may have changed.
+Base/index load deferral remains in place. CT and WB2/WB1 are not implemented.
+
+Failed MMU searches install nonresident ATC entries, as on a 68040. Repairing
+a descriptor alone does not make it accessible: software must invalidate the
+old entry (PFLUSH or PTEST), or wait for replacement. PTEST reports a table
+bus error with MMUSR.B and also caches the failed translation.
+
 ## Testing
 
 ```
 cd tb && ./run_tests.sh          # needs iverilog and vasmm68k_mot (vbcc)
 ```
+
+`sh tb/run_fpu_frames.sh` independently checks both FPU revisions' headers,
+payloads, pointer adjustments, frame round-trips, invalid-frame rejection
+and BUSY-command resumption under all three bus-handshake phases.
 
 Everything under `tb/` runs against the core alone, with no host-project
 sources, so a failure is the CPU's rather than an integration artifact. The

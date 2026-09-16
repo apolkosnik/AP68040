@@ -121,14 +121,14 @@ endfunction
 //---------------------------------------------------------------------------
 
 // The entry payload (tag, PA, attributes) lives in ONE bram.vhd dpram:
-// 32 rows of {bank, set}, 4 ways of 45 bits per row.  A flop array here
+// 32 rows of {bank, set}, 4 ways of 46 bits per row.  A flop array here
 // costs ~5.7K registers plus the 4-way mux fabric (the single largest
 // ALM sink in the design); the M10K row costs a one-clock lookup pipe
 // on ENABLED translation only -- TC.E=0 and TTR hits stay combinational
 // and pay nothing, which is the common Amiga configuration.  Validity
 // and the round-robin pointers stay in flops so PFLUSHA, warm-reset
 // preservation and the lookup guard remain single-cycle.
-localparam EW   = 45;            // {tag[16:0], pa[19:0], attr[7:0]}
+localparam EW   = 46;            // {resident, tag[16:0], pa[19:0], attr[7:0]}
 localparam ROWW = 4*EW;
 
 reg         atc_v    [0:127];
@@ -183,6 +183,7 @@ wire hit3 = lk_fresh && atc_v[{l_row, 2'd3}] && (a_w3[44:28] == l_tag);
 wire atc_hit = hit0 | hit1 | hit2 | hit3;
 
 wire [EW-1:0] h_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
+wire        h_r    = h_ent[45];
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
 wire        h_s    = h_attr[4];
@@ -217,9 +218,9 @@ wire        pt_ttr_w = pt_ttr_a ? pt_ttra[2] : pt_ttrb[2];
 
 wire ttr_fault = ttr_hit && c_write && ttr_w;
 wire atc_fault = tc_e && !ttr_hit && atc_hit &&
-                 ((c_write && h_w) || (!a_super && h_s));
+                 (!h_r || (c_write && h_w) || (!a_super && h_s));
 // write to a clean page runs a table search to set the M bit
-wire atc_mmiss = atc_hit && c_write && !h_m && !h_w;
+wire atc_mmiss = atc_hit && h_r && c_write && !h_m && !h_w;
 
 // lk_fresh gates atc_hit, so a walk is only started once the piped row
 // has been judged against the live request
@@ -259,6 +260,7 @@ reg        w_super, w_write, w_user;
 reg [31:0] w_desc_addr;
 reg [31:0] w_desc;
 reg        w_wp;
+reg        w_buserr;            // failed-search MMUSR B status (PTEST only)
 reg [31:0] w_req_addr, w_req_wdat;
 reg        w_req_wr;
 reg        w_active;
@@ -295,7 +297,10 @@ wire [1:0] f_way = fhit0 ? 2'd0 : fhit1 ? 2'd1 : fhit2 ? 2'd2 : fhit3 ? 2'd3
 wire [19:0] f_pa_new   = tc_p ? {w_desc[31:13], 1'b0} : w_desc[31:12];
 wire  [7:0] f_attr_new = {w_desc[10], w_desc[9:8], w_desc[7], w_desc[6:5],
                           w_desc[4], (w_wp | w_desc[2])};
-wire [EW-1:0] f_ent_new = {f_tag, f_pa_new, f_attr_new};
+// A failed 68040 search installs a VALID but nonresident entry. Future
+// accesses fault on that entry without walking again until it is flushed.
+wire [EW-1:0] f_ent_new = (wst == W_FLT) ? {1'b0, f_tag, 28'd0} :
+                                        {1'b1, f_tag, f_pa_new, f_attr_new};
 wire [ROWW-1:0] fill_wrow = {
 	(f_way == 2'd3) ? f_ent_new : f_w3,
 	(f_way == 2'd2) ? f_ent_new : f_w2,
@@ -304,7 +309,8 @@ wire [ROWW-1:0] fill_wrow = {
 // the fill writes in the SAME cycle W_FILL commits the way choice:
 // a registered strobe would land one cycle later, after the round
 // robin pointer has already advanced under f_way's feet
-assign fill_we = (wst == W_FILL) && !w_active && ce;
+assign fill_we = (((wst == W_FILL || wst == W_DFLT) && !w_active) ||
+                  wst == W_FLT) && ce && nreset;
 
 dpram #(5, ROWW) atc_ram
 (
@@ -401,7 +407,7 @@ always @(posedge clk) begin
 		wst <= W_IDLE;
 		w_issued <= 0; w_pt <= 0;
 		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0;
-		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0;
+		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0; w_buserr <= 0;
 		w_req_addr <= 0; w_req_wdat <= 0; w_req_wr <= 0;
 		w_active <= 0; f_bank <= 0;
 		c_flt <= 0;
@@ -419,19 +425,18 @@ always @(posedge clk) begin
 		pt_done <= 0;
 		pf_done <= 0;
 		if (w_active && !w_issued) w_issued <= 1;
+		if (fill_we) begin
+			atc_v[{fill_row, f_way}] <= 1;
+			if (!f_way_hit) atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
+		end
 
 		if (walk_err) begin
 			// A physical bus error while fetching or updating a descriptor is
-			// reported as an unsuccessful table search.  Do not fill the ATC.
-			// A probing PTEST reports it in the MMUSR B bit.
+			// reported as an unsuccessful table search and cached as
+			// nonresident. A probing PTEST also reports its MMUSR B bit.
 			w_active <= 0;
-			if (w_pt) begin
-				pt_mmusr <= 32'h0000_0800;
-				pt_done <= 1;
-				w_pt <= 0;
-				wst <= W_IDLE;
-			end
-			else wst <= W_FLT;
+			w_buserr <= 1;
+			wst <= W_FLT;
 		end
 		else case (wst)
 			W_IDLE: begin
@@ -481,6 +486,7 @@ always @(posedge clk) begin
 					w_user  <= !a_super;
 					w_write <= c_write;
 					w_wp    <= 0;
+					w_buserr <= 0;
 					f_bank  <= c_instr;
 					wrd({(a_super ? srp[31:9] : urp[31:9]), 9'd0} +
 					    {23'd0, c_addr[31:25], 2'b00});
@@ -536,6 +542,7 @@ always @(posedge clk) begin
 
 			// PTEST proper, after its pre-flush sweep
 			W_PTGO: begin
+					w_buserr <= 0;
 					w_pt    <= 1;
 					w_la    <= pt_addr;
 					w_super <= pt_fc[2];
@@ -694,10 +701,6 @@ always @(posedge clk) begin
 					if (walk_ack) w_active <= 0;
 				end
 				else if (w_pt) begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					// PTEST reports the PAGE FRAME, not the translated
 					// address of the probed LA.  In 8K mode that means
 					// bit 12 is CLEAR: the frame is 8K-aligned, and the
@@ -720,22 +723,21 @@ always @(posedge clk) begin
 					wst <= W_IDLE;
 				end
 				else begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					wst <= W_IDLE;   // the held request now hits and forwards
 				end
 			end
 
 			W_FLT: begin
 				if (w_pt) begin
-					pt_mmusr <= 32'd0;   // not resident
+					pt_mmusr <= w_buserr ? 32'h0000_0800 : 32'd0;
 					pt_done <= 1;
 					w_pt <= 0;
+					wst <= W_IDLE;
 				end
-				else c_flt <= 1;
-				wst <= W_IDLE;
+				else begin
+					c_flt <= 1;
+					wst <= W_DROP;
+				end
 			end
 
 			default: wst <= W_IDLE;
