@@ -26,6 +26,12 @@ for t in t_integer t_exceptions t_mmu t_movem_restart t_atcprobe t_bitfield_mmu 
 done
 
 echo "== compiling benches =="
+iverilog -g2012 -I "$RTL" -s tb_ap040_regfile -o "$WORK/tb_regfile.vvp" \
+	tb_ap040_regfile.v $RTL/ap040_regfile.v
+iverilog -g2012 -I "$RTL" -s tb_ap040_alu_arithmetic -o "$WORK/tb_alu_arithmetic.vvp" \
+	tb_ap040_alu_arithmetic.v $RTL/ap040_alu.v
+iverilog -g2012 -I "$RTL" -s tb_ap040_fpu_normalize -o "$WORK/tb_fpu_normalize.vvp" \
+	tb_ap040_fpu_normalize.v $RTL/ap040_fpu.v $RTL/ap040_regfile.v $RTL/primitives/dpram.v
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_prog.vvp"      tb_ap040_program.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_reset.vvp"     tb_ap040_reset.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_dblflt.vvp"    tb_ap040_double_fault.v $SRC
@@ -72,6 +78,11 @@ negrun() {
 	fi
 }
 run reset        "$WORK/tb_reset.vvp"
+run regfile       "$WORK/tb_regfile.vvp"
+run regfile_poison "$WORK/tb_regfile.vvp" +poison
+negrun regfile_bypass_control "$WORK/tb_regfile.vvp" +poison +disable_bypass
+run alu_arithmetic "$WORK/tb_alu_arithmetic.vvp"
+run fpu_normalize "$WORK/tb_fpu_normalize.vvp"
 run double_fault "$WORK/tb_dblflt.vvp"
 run walker_cdc   "$WORK/tb_walker.vvp"
 run bus16_gap    "$WORK/tb_bus16.vvp"

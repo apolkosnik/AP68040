@@ -55,31 +55,26 @@ function res_zero;
 	end
 endfunction
 
-// shared adder/subtractor with carry out per size
-wire [32:0] add_full  = {1'b0, bm} + {1'b0, am};
-wire [32:0] addx_full = {1'b0, bm} + {1'b0, am} + {32'd0, f_x};
-wire [32:0] sub_full  = {1'b0, bm} - {1'b0, am};
-wire [32:0] subx_full = {1'b0, bm} - {1'b0, am} - {32'd0, f_x};
+// Select extend before arithmetic: ADD/ADDX share an adder, and
+// SUB/SUBX/CMP share a subtractor. Ordinary operations ignore incoming X.
+wire add_extend = (op == `AP040_ALU_ADDX) && f_x;
+wire sub_extend = (op == `AP040_ALU_SUBX) && f_x;
+wire [32:0] add_full = {1'b0, bm} + {1'b0, am} + {32'd0, add_extend};
+wire [32:0] sub_full = {1'b0, bm} - {1'b0, am} - {32'd0, sub_extend};
 
 // carry out of the sized MSB position for byte/word needs the sized bit
 wire add_c  = (size == `AP040_SZ_B) ? add_full[8]  : (size == `AP040_SZ_W) ? add_full[16]  : add_full[32];
-wire addx_c = (size == `AP040_SZ_B) ? addx_full[8] : (size == `AP040_SZ_W) ? addx_full[16] : addx_full[32];
 wire sub_c  = (size == `AP040_SZ_B) ? sub_full[8]  : (size == `AP040_SZ_W) ? sub_full[16]  : sub_full[32];
-wire subx_c = (size == `AP040_SZ_B) ? subx_full[8] : (size == `AP040_SZ_W) ? subx_full[16] : subx_full[32];
 
 // explicit size selects: res_msb reads `size` from inside the function
 // body, which iverilog leaves out of a continuous assignment's sensitivity
 // (functions reading module state are only safe from the main @* block,
 // which reads szmask directly and so re-evaluates on every size change)
 wire add_r_msb  = (size == `AP040_SZ_B) ? add_full[7]  : (size == `AP040_SZ_W) ? add_full[15]  : add_full[31];
-wire addx_r_msb = (size == `AP040_SZ_B) ? addx_full[7] : (size == `AP040_SZ_W) ? addx_full[15] : addx_full[31];
 wire sub_r_msb  = (size == `AP040_SZ_B) ? sub_full[7]  : (size == `AP040_SZ_W) ? sub_full[15]  : sub_full[31];
-wire subx_r_msb = (size == `AP040_SZ_B) ? subx_full[7] : (size == `AP040_SZ_W) ? subx_full[15] : subx_full[31];
 
 wire add_v  = (a_msb == b_msb) && (add_r_msb  != a_msb);
-wire addx_v = (a_msb == b_msb) && (addx_r_msb != a_msb);
 wire sub_v  = (a_msb != b_msb) && (sub_r_msb  == a_msb);
-wire subx_v = (a_msb != b_msb) && (subx_r_msb == a_msb);
 
 // BCD helpers (byte only). The decimal corrections are applied to the
 // whole byte so a +/-6 low-nibble adjust ripples binary into the high
@@ -147,8 +142,8 @@ always @* begin
 		end
 
 		`AP040_ALU_ADDX: begin
-			result = addx_full[31:0] & szmask;
-			flags_out = {addx_c, addx_r_msb, f_z & res_zero(addx_full[31:0]), addx_v, addx_c};
+			result = add_full[31:0] & szmask;
+			flags_out = {add_c, add_r_msb, f_z & res_zero(add_full[31:0]), add_v, add_c};
 		end
 
 		`AP040_ALU_SUB: begin
@@ -157,8 +152,8 @@ always @* begin
 		end
 
 		`AP040_ALU_SUBX: begin
-			result = subx_full[31:0] & szmask;
-			flags_out = {subx_c, subx_r_msb, f_z & res_zero(subx_full[31:0]), subx_v, subx_c};
+			result = sub_full[31:0] & szmask;
+			flags_out = {sub_c, sub_r_msb, f_z & res_zero(sub_full[31:0]), sub_v, sub_c};
 		end
 
 		`AP040_ALU_CMP: begin

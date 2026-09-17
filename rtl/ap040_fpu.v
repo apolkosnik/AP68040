@@ -317,6 +317,16 @@ reg   [4:0] sh_ret;           // staged shifter return state
 reg   [1:0] r_pr;             // rounding precision latched for F_UNFL
 reg signed [17:0] e_w;        // working exponent (wrap safe)
 
+// These states already run in separate cycles. Select their input before
+// normalization so source, restored destination and add/subtract result
+// share one leading-zero encoder and one 67-bit left shifter. Operand
+// normalization supplies zero GRS; result normalization preserves it.
+wire [63:0] norm_m = (fst == F_RESTORE_N) ? b_m :
+                     (fst == F_NORM2) ? acc_hi[63:0] : a_m;
+wire [6:0] norm_lz = clz64(norm_m);
+wire [66:0] norm_shifted =
+    {norm_m, ((fst == F_NORM2) ? grs : 3'd0)} << norm_lz;
+
 // integer store bookkeeping
 reg        pk_neg;
 reg  [1:0] pk_isz;            // 0 byte, 1 word, 2 long
@@ -1309,29 +1319,25 @@ always @(posedge clk) begin
 				fst <= F_RESTORE_N;
 			end
 
-			F_RESTORE_N: begin : restore_norm
-				reg [6:0] lz;
+			F_RESTORE_N: begin
 				// Use signed working exponents for true extended denormals.
 				// The normal instruction path still traps on these operands.
-				lz = clz64(b_m);
 				if (b_t == T_NUM) begin
-					b_m <= b_m << lz;
-					b_e <= b_e - {10'd0, lz};
+					b_m <= norm_shifted[66:3];
+					b_e <= b_e - {10'd0, norm_lz};
 				end
 				fst <= F_NORM;
 			end
 
-			F_NORM: begin : f_norm
-				reg [6:0] lz;
-				lz = clz64(a_m);
+			F_NORM: begin
 				if (a_t != T_NUM) fst <= F_EXEC;
 				else if (a_m == 64'd0) begin
 					a_t <= T_ZERO; a_e <= 0;
 					fst <= F_EXEC;
 				end
 				else begin
-					a_m <= a_m << lz;
-					a_e <= a_e - {10'd0, lz};
+					a_m <= norm_shifted[66:3];
+					a_e <= a_e - {10'd0, norm_lz};
 					fst <= F_EXEC;
 				end
 			end
@@ -1719,26 +1725,21 @@ always @(posedge clk) begin
 				end
 			end
 
-			F_NORM2: begin : f_norm2
-				reg [6:0]  lz;
-				reg [66:0] v;
-				lz = clz64(acc_hi[63:0]);
-				v = {acc_hi[63:0], grs};
+			F_NORM2: begin
 				if (acc_hi[63:0] == 64'd0 && grs == 3'd0) begin
 					a_t <= T_ZERO;
 					fst <= F_WB;
 				end
-				else if (lz == 7'd64) begin
+				else if (norm_lz == 7'd64) begin
 					a_m <= {grs, 61'd0};
 					grs <= 0;
 					e_w <= e_w - 18'sd64;
 					fst <= F_ROUND;
 				end
 				else begin
-					v = v << lz;
-					a_m <= v[66:3];
-					grs <= v[2:0];
-					e_w <= e_w - {11'd0, lz};
+					a_m <= norm_shifted[66:3];
+					grs <= norm_shifted[2:0];
+					e_w <= e_w - {11'd0, norm_lz};
 					fst <= F_ROUND;
 				end
 			end

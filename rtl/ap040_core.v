@@ -644,6 +644,14 @@ reg        wb_bar;
 // ~990 ALMs on a device that then did not fit.  One mux per field here,
 // and mem_addr/mem_wdata see two sources instead of seventy-four.
 reg        m_go;
+// Exception entry rides carriers too, for the reason the memory issue does:
+// the task body is not just register writes -- it flushes the fetch queue,
+// conditionally drops mem_req and clears the lock -- and it was expanded at
+// 53 call sites.
+reg        e_go;
+reg  [7:0] e_vec_c;
+reg  [3:0] e_fmt_c;
+reg [31:0] e_spc_c, e_addr_c;
 reg [31:0] m_addr_c;
 reg  [1:0] m_size_c;
 reg        m_wr_c;
@@ -1646,49 +1654,12 @@ task exc;
 	input [31:0] spc;
 	input [31:0] addr;
 	begin
-		exc_vec <= vec; exc_spc <= spc; exc_addr <= addr;
-		// Format predicates are SET here only at the sites whose constant
-		// fmt matches (a statically false `if` is no write), and CLEARED
-		// once at S_EXC5, the end of every frame push.  Clearing them at
-		// every exc() site instead put all three on the global exception
-		// enable, which is the core's critical routing cone.
-		if (fmt == 4'd1) exc_f1 <= 1;
-		if (fmt == 4'd2) exc_f2 <= 1;
-		if (fmt == 4'd3) exc_f3 <= 1;
-		exc_is_irq <= 0; exc_pass2 <= 0;
-		// A T0 trace does NOT survive an exception on the 68040.  This
-		// used to arm one for illegal/privilege/A-line/F-line, reading
-		// WinUAE's Exception_cpu_oldpc as if every exception ran through
-		// it.  Only the INTERNAL exceptions do -- gencpu emits
-		// exception_cpu() solely for divide-by-zero, CHK, TRAPV, TRAP #n
-		// and the RTE format error -- and on a 68040 that path then forces
-		// t0 = false for exactly those vectors, while everything else
-		// (op_illg's vector 4 included) goes through plain Exception(),
-		// whose exception_check_trace clears T0 outright.  So no exception
-		// leaves a T0 trace pending.  Hardware agrees: cputest basic/all
-		// and fbasic/all both reported "Got unexpected trace exception"
-		// after the ILLEGAL that terminates every test, on plain integer
-		// instructions as well as FP ones.
-		//
-		// The texc machinery itself stays: it still delivers a trace that
-		// a simultaneous INTERRUPT preempted (see fetch_next and go_pc),
-		// which is a different and real case.
-		// Exception stack and vector accesses are always supervisor-data
-		// references.  In particular, do not let a faulting MOVES retain its
-		// SFC/DFC override into exception processing.
-		fc_ovr_v <= 0;
-		flow_t0_pend <= 0;
-		// Exception processing owns the memory port from here: the fetch
-		// queue is abandoned and cannot re-arm until the handler's
-		// prefetch runs.  A queue fetch already on the bus is left to
-		// finish -- dropping a request the cache has accepted would lose
-		// its acknowledge -- and its data is discarded by epf_kill.
-		epf_flush;
-		if (!epf_pend) mem_req <= 0;
-		// A faulted/aborted locked sequence ends here: the 040 drops LOCK
-		// on the fault, and a stale lk_cyc would throttle the handler's
-		// fetch queue (fetch_next is not on the exception entry path).
-		lk_cyc <= 0;
+		e_go = 1; e_vec_c = vec; e_fmt_c = fmt;
+		e_spc_c = spc; e_addr_c = addr;
+		// Stays here, not in the shared block: nine call sites assign state
+		// after exc() to defer entry (S_POST_EXC, S_MDL_RDR, S_RTE_FIN2,
+		// S_RET1, S_STOPPED), and moving this below the case let it win over
+		// them -- worth 49 cycles on t_exceptions, which is how it was found.
 		state <= S_EXC0;
 	end
 endtask
@@ -2014,6 +1985,11 @@ always @(posedge clk) begin
 	epf_fillw   = 2'd0;
 	wb_bar      = 0;
 	m_go        = 0;
+	e_go        = 0;
+	e_vec_c     = 8'd0;
+	e_fmt_c     = 4'd0;
+	e_spc_c     = 32'd0;
+	e_addr_c    = 32'd0;
 	m_addr_c    = 32'd0;
 	m_size_c    = 2'd0;
 	m_wr_c      = 1'b0;
@@ -6338,6 +6314,53 @@ always @(posedge clk) begin
 		// S_MRD/S_MWR then only wait for the acknowledge; otherwise they
 		// issue it themselves as before.  epf_issue keeps the fetch engine
 		// below off the port in the same cycle.
+		// exception entry, expanded once (see the e_go carriers)
+		if (e_go) begin
+		exc_vec <= e_vec_c; exc_spc <= e_spc_c; exc_addr <= e_addr_c;
+		// Format predicates are SET here only at the sites whose constant
+		// fmt matches (a statically false `if` is no write), and CLEARED
+		// once at S_EXC5, the end of every frame push.  Clearing them at
+		// every exc() site instead put all three on the global exception
+		// enable, which is the core's critical routing cone.
+		if (e_fmt_c == 4'd1) exc_f1 <= 1;
+		if (e_fmt_c == 4'd2) exc_f2 <= 1;
+		if (e_fmt_c == 4'd3) exc_f3 <= 1;
+		exc_is_irq <= 0; exc_pass2 <= 0;
+		// A T0 trace does NOT survive an exception on the 68040.  This
+		// used to arm one for illegal/privilege/A-line/F-line, reading
+		// WinUAE's Exception_cpu_oldpc as if every exception ran through
+		// it.  Only the INTERNAL exceptions do -- gencpu emits
+		// exception_cpu() solely for divide-by-zero, CHK, TRAPV, TRAP #n
+		// and the RTE format error -- and on a 68040 that path then forces
+		// t0 = false for exactly those vectors, while everything else
+		// (op_illg's vector 4 included) goes through plain Exception(),
+		// whose exception_check_trace clears T0 outright.  So no exception
+		// leaves a T0 trace pending.  Hardware agrees: cputest basic/all
+		// and fbasic/all both reported "Got unexpected trace exception"
+		// after the ILLEGAL that terminates every test, on plain integer
+		// instructions as well as FP ones.
+		//
+		// The texc machinery itself stays: it still delivers a trace that
+		// a simultaneous INTERRUPT preempted (see fetch_next and go_pc),
+		// which is a different and real case.
+		// Exception stack and vector accesses are always supervisor-data
+		// references.  In particular, do not let a faulting MOVES retain its
+		// SFC/DFC override into exception processing.
+		fc_ovr_v <= 0;
+		flow_t0_pend <= 0;
+		// Exception processing owns the memory port from here: the fetch
+		// queue is abandoned and cannot re-arm until the handler's
+		// prefetch runs.  A queue fetch already on the bus is left to
+		// finish -- dropping a request the cache has accepted would lose
+		// its acknowledge -- and its data is discarded by epf_kill.
+		epf_flush;
+		if (!epf_pend) mem_req <= 0;
+		// A faulted/aborted locked sequence ends here: the 040 drops LOCK
+		// on the fault, and a stale lk_cyc would throttle the handler's
+		// fetch queue (fetch_next is not on the exception entry path).
+		lk_cyc <= 0;
+			end
+
 		if (m_go) begin
 			m_addr_r <= m_addr_c; m_size <= m_size_c;
 			m_wr <= m_wr_c; m_wdat <= m_wdat_c;

@@ -124,6 +124,20 @@ cd tb && ./run_tests.sh          # needs iverilog and vasmm68k_mot (vbcc)
 payloads, pointer adjustments, frame round-trips, invalid-frame rejection
 and BUSY-command resumption under all three bus-handshake phases.
 
+The main runner also checks the shared arithmetic datapaths directly:
+`tb_ap040_alu_arithmetic.v` exhausts byte ADD/ADDX/SUB/SUBX/CMP operands and
+X/Z combinations, then checks word/long boundaries and seeded random inputs
+against an independent arithmetic/CCR oracle. `tb_ap040_fpu_normalize.v`
+checks all three normalization states, every leading-zero count, GRS bits,
+operand tags, exponent wrap and clock-enable holding against a serial-shift
+reference. These tests do not require guest software.
+
+`tb_ap040_regfile.v` compares the integer register file with a flip-flop
+reference through consecutive writes, clock-enable stalls, reset and all
+three stack-pointer banks. A second leg poisons the pending RAM word to
+check bypass isolation; disabling that bypass must fail the negative control.
+This does not replace MLAB timing analysis or hardware boot testing.
+
 Everything under `tb/` runs against the core alone, with no host-project
 sources, so a failure is the CPU's rather than an integration artifact. The
 suite covers the integer ISA, the exception and trace model, the MMU
