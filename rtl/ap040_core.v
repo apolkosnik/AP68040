@@ -68,6 +68,7 @@ module ap040_core
 	output     [31:0] dtt1_out,
 	output reg        pt_req,
 	output reg        pt_write,
+	output reg        pt_access,  // internal write check: obey TC, unlike PTEST
 	output reg [31:0] pt_addr,
 	output      [2:0] pt_fc,
 	input             pt_done,
@@ -81,6 +82,13 @@ module ap040_core
 	output reg        cinv_ic,
 	output reg        cinv_dc,
 	input             cinv_done,
+	// The data cache is still draining a posted store: it has been
+	// acknowledged to this core but has NOT reached memory.  NOP is the
+	// 68040's bus-synchronization instruction (M68040UM 7.7), so it must
+	// not complete while this is high -- software clears a device, NOPs,
+	// and returns expecting the clear to have landed.  Tied low where the
+	// cache is compiled out, and low always without posting.
+	input             store_busy,
 
 	input       [2:0] ipl,
 	input             ipl_autovector,
@@ -140,6 +148,16 @@ reg [31:0] itt0, itt1, dtt0, dtt1;
 reg [31:0] mmusr;
 reg [31:0] urp, srp;
 reg [15:0] ir;
+// CCR computed by an instruction whose destination is MEMORY, held until
+// that write is acknowledged.  Committing it at S_EXEC and then issuing the
+// write meant a write fault stacked an SR the instruction had already
+// modified: RTE restored it and the retry re-read its own output.  NEGX and
+// ROXL consume X, so they came back $FFFFFFFE and $0001 instead of
+// $FFFFFFFF and $0000.  Whole-instruction retry needs the pre-instruction
+// CCR to still be there, so the commit waits for the write, and exception
+// entry discards it.
+reg        fl_pend;
+reg  [4:0] fl_pend_v;
 // FPGA power-up distinguishes the first (cold) reset from later RSTI
 // assertions.  The 68040 preserves MMU register contents on reset except for
 // the E bits in TC and the four TTRs.
@@ -157,7 +175,9 @@ assign itt0_out = itt0;
 assign itt1_out = itt1;
 assign dtt0_out = dtt0;
 assign dtt1_out = dtt1;
-assign pt_fc    = dfc;
+// Operand checks use data space in the operand's privilege context. DFC
+// belongs to the PTEST instruction, and may name an unrelated address space.
+assign pt_fc    = pt_access ? {fc_ovr_v ? fc_ovr[2] : sr_s, 2'b01} : dfc;
 assign pf_fc    = dfc;
 
 // interrupt input synchronization (active low pins, must be stable for two
@@ -505,6 +525,7 @@ localparam S_BF_M2     = 8'd130;
 localparam S_BF_M3     = 8'd131;
 localparam S_BF_M4     = 8'd132;
 localparam S_CINV2     = 8'd133;
+localparam S_NOP_SYNC  = 8'd194;   // NOP waiting for the posted write buffer
 localparam S_CHK2_A    = 8'd134;
 localparam S_CHK2_B    = 8'd135;
 localparam S_CHK2_C    = 8'd136;
@@ -564,6 +585,12 @@ localparam S_FREST_BD  = 8'd189;
 localparam S_MOVEM_FIN = 8'd191;   // commit a held MOVEM index register
 localparam S_RTE_SSW   = 8'd192;   // format-7 continuation status
 localparam S_RTE_EA    = 8'd193;   // CM's saved MOVEM effective address
+localparam S_WPROBE    = 8'd195;
+localparam S_WPROBE_FAULT = 8'd196;
+localparam S_CAS2_P1   = 8'd197;
+localparam S_CAS2_P2   = 8'd198;
+localparam S_CAS2_RD1  = 8'd199;
+localparam S_BF_WCHECK = 8'd200;
 
 // exec kinds
 localparam EK_ALU     = 4'd0;
@@ -598,6 +625,7 @@ localparam RK_RTD = 2'd2;
 //---------------------------------------------------------------------------
 
 reg  [7:0] r_imm_ret, r_ea_ret, r_m_ret;
+reg  [7:0] wp_ret;
 reg  [2:0] m_bidx;                // byte index of a split transfer
 reg [31:0] m_acc;                 // assembled bytes of a split transfer
 reg  [1:0] imm_n;
@@ -1602,6 +1630,26 @@ function cross_of;
 	end
 endfunction
 
+// Check the whole transfer before any constituent write becomes visible.
+// The MMU's PTEST port supplies permissions without performing an operand
+// access. On failure the saved transfer context builds an ordinary access
+// error; no speculative write or reversed write order is needed.
+task check_write;
+	input [31:0] a;
+	input [1:0] size;
+	input [31:0] d;
+	input [7:0] fault_ret;
+	input [7:0] ret;
+	begin
+		m_addr_r <= a; m_size <= size; m_wdat <= d;
+		r_m_ret <= fault_ret;
+		pt_addr <= a; pt_write <= 1; pt_access <= 1;
+		wp_ret <= ret;
+		epf_issue = 1;
+		state <= S_WPROBE;
+	end
+endtask
+
 // The transfer is issued from the CALLING state whenever the port is
 // free: no queue fetch outstanding, no state claimed the port this cycle,
 // no request or acknowledge on the wires (the adapter's ack is a one-cycle
@@ -1667,6 +1715,13 @@ endtask
 // access error entry: capture the fault shape from the outstanding request
 task aerr_start;
 	begin
+		// The instruction is ABORTED, so flags it computed but has not
+		// committed must not become architectural.  This path jumps
+		// straight to S_AERR0 and never reaches the e_go carrier, and the
+		// frame's own stack writes go through S_MWR -- whose acknowledge
+		// would otherwise commit them into the handler's live CCR while
+		// the stacked SR correctly holds the pre-instruction value.
+		fl_pend  <= 0;
 		aer_bus  <= berr && !mem_flt;   // physical bus error, not an ATC fault
 		// FA is the initial byte of the original transfer, even when a
 		// page-crossing access has been split and a later byte faults.
@@ -2086,6 +2141,7 @@ always @(posedge clk) begin
 		t_a <= 0; t_b <= 0; srop_kind <= 0; srop_sr <= 0;
 		mvc_dir <= 0; fc_ovr_v <= 0; fc_ovr <= 0;
 		lk_cyc <= 0; aer_lk <= 0; aer_m16 <= 0; aer_tt <= 0; aer_wd <= 0;
+		fl_pend <= 0; fl_pend_v <= 0;
 		m16_form <= 0; m16_dst_rn <= 0; m16_src <= 0; m16_dst <= 0;
 		m16_an <= 0; m16_idx <= 0; m16_rd_done <= 0;
 		for (li = 0; li < 4; li = li + 1) m16buf[li] <= 0;
@@ -2101,7 +2157,7 @@ always @(posedge clk) begin
 		aer_sz <= 0; aer_tm <= 0; aer_idx <= 0; aer_bus <= 0; aer_ma <= 0;
 		u0_v <= 0; u1_v <= 0;
 		u0_reg <= 0; u1_reg <= 0; u0_old <= 0; u1_old <= 0;
-		pt_req <= 0; pt_write <= 0; pt_addr <= 0;
+		pt_req <= 0; pt_write <= 0; pt_addr <= 0; pt_access <= 0; wp_ret <= 0;
 		pf_req <= 0; pf_mode <= 0; pf_addr <= 0;
 		cinv_req <= 0; cinv_ic <= 0; cinv_dc <= 0;
 		tr_t1 <= 0; tr_t0 <= 0; t0_force <= 0;
@@ -2326,7 +2382,16 @@ always @(posedge clk) begin
 				end
 				else if (d_ack) begin
 					m_issued <= 0;
-					if (m_bidx + 3'd1 == m_nbytes) state <= r_m_ret;
+					if (m_bidx + 3'd1 == m_nbytes) begin
+						// the split transfer is complete, so the flags it
+						// computed are now safe -- as in S_MWR.  A crossing
+						// write never reaches that state's acknowledge, so
+						// without this fl_pend outlived the instruction and
+						// anything reading CCR before the next memory write
+						// saw stale flags.
+						if (fl_pend) begin sr[4:0] <= fl_pend_v; fl_pend <= 0; end
+						state <= r_m_ret;
+					end
 					else m_bidx <= m_bidx + 3'd1;
 				end
 			end
@@ -2421,7 +2486,7 @@ always @(posedge clk) begin
 				end
 				else if (!m_issued && m_cross) begin
 					m_bidx <= 0;
-					state <= S_MWR_B;
+					check_write(m_addr_r, m_size, m_wdat, r_m_ret, S_MWR_B);
 				end
 				else if (!m_issued) begin
 					mem_req <= 1; mem_write <= 1; mem_instr <= 0;
@@ -2436,6 +2501,11 @@ always @(posedge clk) begin
 					else aerr_start;
 				end
 				else if (d_ack) begin
+					// The write landed, so the flags it computed are safe to
+					// commit now (fl_pend).  Before fetch_next, so a trace or
+					// interrupt taken at this boundary stacks the completed
+					// instruction's CCR.
+					if (fl_pend) begin sr[4:0] <= fl_pend_v; fl_pend <= 0; end
 					// a store that ends its instruction dispatches the
 					// successor from here rather than through S_NEXT
 					if (r_m_ret == S_NEXT) fetch_next;
@@ -2742,7 +2812,15 @@ always @(posedge clk) begin
 					end
 
 					default: begin // EK_ALU
-						if (p_flags) sr[4:0] <= alu_fl;
+						// a memory destination commits its flags when the
+						// write lands (fl_pend), not here
+						if (p_flags) begin
+							if (!p_wbsup && p_dst == DK_MEM) begin
+								fl_pend   <= 1;
+								fl_pend_v <= alu_fl;
+							end
+							else sr[4:0] <= alu_fl;
+						end
 						if (p_wbsup) fetch_next;
 						else case (p_dst)
 							DK_MEM: mwr(dst_addr, p_dsize, alu_res, S_NEXT);
@@ -2767,25 +2845,39 @@ always @(posedge clk) begin
 			//--------------------------------------------------------- shifts
 			S_SHIFT: begin
 				if (sh_cnt == 6'd0) begin
-					sr[4] <= sh_fl[4];
-					sr[3] <= (op_size == `AP040_SZ_B) ? sh_val[7] :
-					         (op_size == `AP040_SZ_W) ? sh_val[15] : sh_val[31];
-					sr[2] <= ((sh_val & ((op_size == `AP040_SZ_B) ? 32'hFF :
-					          (op_size == `AP040_SZ_W) ? 32'hFFFF : 32'hFFFFFFFF)) == 0);
-					sr[1] <= sh_vacc;
-					// zero count: C=0 for shifts/rotates, C=X for ROXx
-					sr[0] <= sh_any ? sh_fl[0] : (sh_rox ? sh_fl[4] : 1'b0);
+					// S_SHIFT_WB writes memory unless the destination is a
+					// register, and ROXL/ROXR consume X: defer as EK_ALU does
+					if (p_dst != DK_REG) begin
+						fl_pend <= 1;
+						fl_pend_v <= {sh_fl[4],
+						              (op_size == `AP040_SZ_B) ? sh_val[7] :
+						              (op_size == `AP040_SZ_W) ? sh_val[15] : sh_val[31],
+						              ((sh_val & ((op_size == `AP040_SZ_B) ? 32'hFF :
+						               (op_size == `AP040_SZ_W) ? 32'hFFFF : 32'hFFFFFFFF)) == 0),
+						              sh_vacc,
+						              sh_any ? sh_fl[0] : (sh_rox ? sh_fl[4] : 1'b0)};
+					end
+					else begin
+						sr[4] <= sh_fl[4];
+						sr[3] <= (op_size == `AP040_SZ_B) ? sh_val[7] :
+						         (op_size == `AP040_SZ_W) ? sh_val[15] : sh_val[31];
+						sr[2] <= ((sh_val & ((op_size == `AP040_SZ_B) ? 32'hFF :
+						          (op_size == `AP040_SZ_W) ? 32'hFFFF : 32'hFFFFFFFF)) == 0);
+						sr[1] <= sh_vacc;
+						// zero count: C=0 for shifts/rotates, C=X for ROXx
+						sr[0] <= sh_any ? sh_fl[0] : (sh_rox ? sh_fl[4] : 1'b0);
+					end
 					state <= S_SHIFT_WB;
 				end
 				else begin
 					// single-cycle barrel: the ALU composed the whole count,
 					// commit value and flags directly
 					sh_val <= alu_res;
-					sr[4] <= alu_fl[4];
-					sr[3] <= alu_fl[3];
-					sr[2] <= alu_fl[2];
-					sr[1] <= alu_fl[1];
-					sr[0] <= alu_fl[0];
+					if (p_dst != DK_REG) begin
+						fl_pend   <= 1;
+						fl_pend_v <= alu_fl[4:0];
+					end
+					else sr[4:0] <= alu_fl[4:0];
 					state <= S_SHIFT_WB;
 				end
 			end
@@ -2970,7 +3062,14 @@ always @(posedge clk) begin
 				end
 			end
 
+			// Defence in depth for the same rule: several sites enter
+			// exception processing by assigning state directly rather than
+			// through exc()/e_go (the boundary interrupt and trace paths,
+			// the FPU and RTE entries).  An instruction that completed has
+			// already committed its flags, so this only ever discards those
+			// of one that did not.
 			S_EXC0: begin
+				fl_pend <= 0;
 				if (fpu_bg) state <= S_EXC0;   // FSAVE-quiescent exception
 				// An abandoned queue fetch may still be on the bus under the
 				// pre-exception function code.  Exception processing owns the
@@ -3664,8 +3763,56 @@ always @(posedge clk) begin
 			end
 
 			//------------------------------------------------- PTEST / PFLUSH
+			S_WPROBE: begin
+				// Retire any outstanding fetch, then keep the CPU port idle
+				// for the entire probe. The walker also waits for posted
+				// stores in the compatibility wrapper.
+				epf_issue = 1;
+				if (!pt_req) begin
+					if (!epf_pend && !mem_req && !pt_done) pt_req <= 1;
+				end
+				else if (pt_done) begin
+					pt_req <= 0;
+					if (!pt_mmusr[0] || pt_mmusr[11] || pt_mmusr[2] ||
+					    (!pt_fc[2] && pt_mmusr[7])) begin
+						// Set up fault metadata only after the last fetch has
+						// retired; never change its live request underneath it.
+						mem_addr <= pt_addr; mem_size <= m_size;
+						mem_write <= 1; mem_instr <= 0; mem_wdata <= m_wdat;
+						fc_r <= fc_ovr_v ? fc_ovr :
+						        (sr_s ? `AP040_FC_SUPER_DATA : `AP040_FC_USER_DATA);
+						pt_access <= 0;
+						state <= S_WPROBE_FAULT;
+					end
+					else if (m_cross && ((pt_addr & ~m_pgmask) ==
+					                            (m_addr_r & ~m_pgmask))) begin
+						// A split operand can touch two independently protected
+						// pages. Check both, in address order, before byte zero.
+						pt_addr <= m_addr_r + {29'd0, m_nbytes} - 32'd1;
+					end
+					else begin
+						pt_access <= 0;
+						state <= wp_ret;
+					end
+				end
+			end
+
+			S_WPROBE_FAULT: begin
+				if (in_exc) fatal_halt;
+				else begin
+					aerr_start;
+					// A failed translation check is an ATC fault, including
+					// a bus error during its table search. No operand bus
+					// cycle was issued, so mem_flt itself is not asserted.
+					aer_bus <= 0;
+					aer_ma <= m_cross && ((mem_addr & ~m_pgmask) !=
+					                                  (m_addr_r & ~m_pgmask));
+				end
+			end
+
 			S_PTEST1: begin
 				epf_flush;      // PTEST replaces the matching ATC entry
+				pt_access <= 0;
 				pt_addr <= rf_rdata_a;
 				pt_write <= ~ir[5];
 				state <= S_PTEST2;
@@ -3701,6 +3848,13 @@ always @(posedge clk) begin
 				cinv_req <= 0;
 				fetch_next;
 			end
+
+			// NOP holds here until the posted store buffer is empty.  The
+			// fetch queue keeps running underneath, so the wait costs only
+			// the drain itself, and an interrupt is taken at the boundary
+			// AFTER it -- which is the point: the write it was waiting for
+			// has landed by then.
+			S_NOP_SYNC: if (!store_busy) fetch_next;
 
 			//----------------------------------------------------- CHK2/CMP2
 			S_CHK2_A: begin
@@ -3771,8 +3925,17 @@ always @(posedge clk) begin
 			S_CAS2_1: begin
 				t_a <= rf_rdata_a;
 				t_b <= rf_rdata_b;
-				mrd(rf_rdata_a, op_size, S_CAS2_2);
+				// A locked RMW requires write permission on every page,
+				// including when a comparison will fail. Check both operands
+				// before either read or write, preserving the normal order.
+				if (AP040_HAS_MMU && (tc[15] || dtt0[15] || dtt1[15]))
+					state <= S_CAS2_P1;
+				else mrd(rf_rdata_a, op_size, S_CAS2_2);
 			end
+
+			S_CAS2_P1: check_write(t_a, op_size, 32'd0, S_CAS2_2, S_CAS2_P2);
+			S_CAS2_P2: check_write(t_b, op_size, 32'd0, S_CAS2_3, S_CAS2_RD1);
+			S_CAS2_RD1: mrd(t_a, op_size, S_CAS2_2);
 
 			S_CAS2_2: begin
 				bf_w1 <= m_val;                  // first memory operand
@@ -5070,8 +5233,19 @@ always @(posedge clk) begin
 				nw40 = ({bf_w1, bf_w2} & head) | (bf_t40 >> bf_bib);
 				bf_w1 <= nw40[39:8];
 				bf_w2 <= nw40[7:0];
-				state <= S_BF_WR1;
+				// Three/five-byte fields have a separate trailing write.
+				// Checking only a split first transfer would miss a fault
+				// in that final byte and retry BFCHG over changed memory.
+				if (tc[15] && (bf_span == 3'd3 || bf_span == 3'd5) &&
+				    (((bf_addr & m_pgmask) + {29'd0, bf_span}) >
+				     (m_pgmask + 32'd1))) state <= S_BF_WCHECK;
+				else state <= S_BF_WR1;
 			end
+
+			S_BF_WCHECK:
+				check_write(bf_addr + {29'd0, bf_span} - 32'd1, `AP040_SZ_B,
+				            {24'd0, (bf_span == 3'd3) ? bf_w1[15:8] : bf_w2},
+				            S_NEXT, S_BF_WR1);
 
 			S_BF_WR1: begin
 				case (bf_span)
@@ -5663,7 +5837,16 @@ always @(posedge clk) begin
 											if (!sr_s) go_priv;
 											else begin rst_cnt <= 8'd127; state <= S_RESET_HOLD; end
 										end
-										6'b110001: fetch_next;   // NOP
+										// NOP synchronizes the bus (M68040UM 7.7):
+										// it may not finish while a posted store
+										// is still on its way to memory, or the
+										// clear-device/NOP/RTE idiom returns with
+										// the device still asserting and the
+										// interrupt is taken a second time.  Free
+										// when nothing is pending, which is the
+										// usual case.
+										6'b110001: if (store_busy) state <= S_NOP_SYNC;
+										           else fetch_next;   // NOP
 										6'b110010: begin // STOP
 											if (!sr_s) go_priv;
 											else immf(2'd1, S_STOP_LD);
@@ -6326,6 +6509,10 @@ always @(posedge clk) begin
 		if (e_fmt_c == 4'd2) exc_f2 <= 1;
 		if (e_fmt_c == 4'd3) exc_f3 <= 1;
 		exc_is_irq <= 0; exc_pass2 <= 0;
+		// Flags an aborted instruction had computed but not committed are
+		// discarded: the frame must carry the PRE-instruction CCR, because
+		// the instruction is retried whole (fl_pend).
+		fl_pend <= 0;
 		// A T0 trace does NOT survive an exception on the 68040.  This
 		// used to arm one for illegal/privilege/A-line/F-line, reading
 		// WinUAE's Exception_cpu_oldpc as if every exception ran through

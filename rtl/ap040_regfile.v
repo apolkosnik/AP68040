@@ -60,17 +60,18 @@ module ap040_regfile
 // to zero, so a 15-bit "written" vector carries that instead: an entry reads
 // as zero until it has been written once.
 //
-// READ DURING WRITE.  "no_rw_check" allows unspecified RAM output during a
-// read/write collision; it does not prevent collisions.  Integer-register
-// collisions are ordinary (612 cycles in t_integer alone).  The first MLAB
-// version used this attribute without isolating the collision.  With flops a read
+// READ DURING WRITE.  The first version of this carried "no_rw_check" from
+// the FP file, which asserts the design never reads and writes one address in
+// the same cycle.  That is true of FP0-FP7 and emphatically false here: an
+// instruction writing Dn while the next reads Dn is ordinary, and counting it
+// found 612 such cycles in t_integer alone.  With flip-flops that read
 // returns the OLD value; an MLAB writes with an internal pulse, so an
 // asynchronous read of the written address can return the NEW one part way
 // through the cycle.  Simulation cannot show the difference -- it models the
-// array exactly -- and the core did not boot.
+// array exactly -- and the core did not boot (eb158fb71).
 //
-// So the write is held one cycle and the read bypasses it.  The RAM is never
-// consulted for an address whose write is still pending, which makes the
+// So the write is held one cycle and the read bypasses it.  The RAM's output
+// is never USED for an address whose write is in flight, which makes the
 // result independent of what the primitive does with a simultaneous access:
 //
 //   cycle N    write issued, held in pend_*; RAM untouched; a read of that
@@ -79,9 +80,32 @@ module ap040_regfile
 //              answered from pend_wdata, not the RAM being written
 //   cycle N+2  the RAM holds it
 //
-// Keep no_rw_check now that the pending-write bypass isolates both read
-// ports.  With "MLAB" alone, Quartus 17 rejects these asynchronous RAMs for
-// unsupported read-during-write behavior and implements both banks as flops.
+// THE HOLD IS NOT OPTIONAL, AND NOT ONLY FOR THE BYPASS.  On 2026-09-17 this
+// was "corrected" (06d90f6fb) to write the RAM on the issue edge from the
+// core's wdata and keep pend_* only as the bypass copy -- identical in
+// simulation, and the board went to a yellow screen before Workbench.  The
+// timing report says why: TimeQuest lists the RAM cells (dpram_ilo1) as
+// non-unate clock edges and "assumes pos-unate behavior" -- the MLAB inverts
+// its clock internally for the write, so the data path INTO the RAM's write
+// registers really has half a cycle, and the analyzer times it to the full
+// one.  From pend_* that path is a register-to-register hop and the half
+// cycle is trivial; from the ALU cone it is not, and the setup slack in the
+// report (+0.149) said nothing about it.  Keep the RAM's write inputs
+// registered here.  The 738 "reads in the commit cycle" that motivated the
+// change were reads of a settled word: cycle N+2 is fine on hardware, cycle
+// N+1 is what the bypass covers.
+//
+// no_rw_check STAYS, and with the bypass it is honest.  The attribute does
+// not promise the accesses never coincide; it says the read data is
+// undefined when they do, and asks the fitter not to spend logic defending
+// against it.  The bypass discards exactly that datum, so the undefined value
+// cannot reach the datapath.  Dropping the attribute instead was tried and is
+// worse in both directions: without it Quartus will not infer an MLAB here at
+// all -- the fit reported ALMs used for memory 0.0, both mirrored banks in
+// flip-flops, 1,172 registers and 673 ALMs against the plain array's 576 and
+// 459 -- so the file cost 214 ALMs and still had no memory in it.  The defect
+// was never the attribute on its own; it was the attribute with nothing
+// masking the datum it leaves undefined.
 (* ramstyle = "MLAB, no_rw_check" *) reg [31:0] bank_a [0:15];
 (* ramstyle = "MLAB, no_rw_check" *) reg [31:0] bank_b [0:15];
 reg [14:0] rf_written;

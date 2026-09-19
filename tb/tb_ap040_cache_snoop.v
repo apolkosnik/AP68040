@@ -50,6 +50,12 @@ reg ce_run = 1;          // when 0, ce is forced low (frozen window)
 // bench task already waits on (c_ack && ce), so the sweeps below, which
 // step snoops by FAST cycles, then cover every phase of the enable.
 parameter CE_DIV = 1;
+// POST_OK 1 posts every store: the core is acknowledged on capture and the
+// write drains behind it.  Every bench task waits on (c_ack && ce), so with
+// posting the task returns while the drain is still on the bus; the tests
+// that look at memory afterwards (expect_read, the write-through checks)
+// therefore exercise exactly the ordering the drain has to keep.
+parameter POST_OK = 0;
 reg [1:0] ce_ph = 0;
 always @(posedge clk) ce_ph <= (ce_ph == CE_DIV - 1) ? 2'd0 : ce_ph + 2'd1;
 wire ce = ce_run && (CE_DIV == 1 || ce_ph == 2'd0);
@@ -100,8 +106,17 @@ wire ce = ce_run && (CE_DIV == 1 || ce_ph == 2'd0);
 //                     that appears only when this AND a lookup term are
 //                     blinded shows the two overlap on that sequence; it does
 //                     not show the lookup term independently necessary.
+// +inj_dma_snoop: drop the snoop's invalidate for exactly as long as a
+// posted store is pending -- the failure T15 exists to catch, "the chipset
+// wrote memory and the CPU never learned of it because it was busy
+// draining a write of its own".  T15 must FAIL under this; if it does not,
+// it is not testing what it claims to.  The rest of the suite is not
+// disturbed, because outside a pending store sb_v is low and the
+// invalidate is untouched.
+reg inj_dma_snoop = 0;
 reg inj_acc_settle = 0, inj_acc_whole = 0, inj_look_whole = 0, inj_fillguard = 0;
 initial begin
+	inj_dma_snoop  = $test$plusargs("inj_dma_snoop");
 	inj_acc_settle = $test$plusargs("inj_acc_settle");
 	inj_acc_whole  = $test$plusargs("inj_acc_whole");
 	inj_look_whole = $test$plusargs("inj_look_whole");
@@ -115,6 +130,8 @@ reg ce_d = 0;
 always @(posedge clk) ce_d <= ce;
 always @(ce_d)
 	if (inj_acc_settle) begin if (ce_d) force dut.snoop_look_row_acc = 1'b0; else release dut.snoop_look_row_acc; end
+always @(dut.sb_v)
+	if (inj_dma_snoop) begin if (dut.sb_v) force dut.snoop_wr = 1'b0; else release dut.snoop_wr; end
 always @(dut.rd_accept)
 	if (inj_acc_whole) begin if (dut.rd_accept) force dut.snoop_look_row_acc = 1'b0; else release dut.snoop_look_row_acc; end
 always @(dut.cst)
@@ -162,6 +179,8 @@ ap040_cache dut
 	.c_req(c_req), .c_write(c_write), .c_instr(c_instr),
 	.c_size(c_size), .c_addr(c_addr), .c_wdata(c_wdata),
 	.c_fc(3'd5), .c_nocache(c_nocache),
+	.c_post_ok(POST_OK[0]),
+	.sb_busy(),
 	.c_ack(c_ack), .c_rdata(c_rdata),
 	.m_req(m_req), .m_write(m_write), .m_instr(m_instr),
 	.m_size(m_size), .m_addr(m_addr), .m_wdata(m_wdata),
@@ -358,6 +377,43 @@ endtask
 // access proves that access was served from a line
 integer mreads = 0;
 always @(posedge clk) if (m_ack && ce && !m_write) mreads = mreads + 1;
+integer mwrites = 0;
+always @(posedge clk) if (m_ack && ce && m_write) mwrites = mwrites + 1;
+// +trace: one line per enable edge (and per snoop) with the state the
+// tests reason about.  Off by default; it is how a wrong-line hit gets
+// read without a waveform.
+reg trace_on = 0;
+initial trace_on = $test$plusargs("trace");
+always @(posedge clk) if (trace_on && (ce || s_stb))
+	$display("TR t=%0t ce=%b cst=%0d sb_v=%b | c_req=%b w=%b nc=%b a=%h ack=%b rd=%h | look_hit=%b v=%b hw=%0d lsn=%b r_way=%0d r_row=%h | m_req=%b m_w=%b m_a=%h m_ack=%b | tag_we=%b cd_we=%b inv=%b idx=%h s_stb=%b s_a=%h",
+	         $time, ce, dut.cst, dut.sb_v, c_req, c_write, c_nocache, c_addr, c_ack, c_rdata,
+	         dut.look_hit, dut.tag_q[91:88], dut.hit_way, dut.look_snooped, dut.r_way, dut.r_row,
+	         dut.m_req, dut.m_write, dut.m_addr, m_ack, dut.tag_we, dut.cd_we, dut.inv_we, dut.inv_idx, s_stb, s_addr);
+
+// The drain owns the master side by itself (ap040_cache.v, "THE DRAIN IS
+// NOT A STATE").  While sb_v is set nothing else may be on the bus, and
+// the FSM may sit in C_PASS with it only for the store's own merge cycle.
+// A fill under the drain would read memory the store has not reached; a
+// second store would either overtake the first or steal its acknowledge.
+reg pass_seen = 0;
+always @(posedge clk) if (ce) begin
+	if (dut.sb_v && dut.m_req && !dut.m_write) begin
+		$display("FAIL invariant: a read issued on the master side under a draining store (addr %h)", dut.m_addr);
+		errors = errors + 1;
+	end
+	if (dut.sb_v && (dut.m_addr !== dut.sb_addr || dut.m_wdata !== dut.sb_wdata)) begin
+		$display("FAIL invariant: master side not the buffered store while it drains");
+		errors = errors + 1;
+	end
+	if (dut.cst == 3'd4 && dut.sb_v) begin
+		$display("FAIL invariant: C_FILL entered under a draining store");
+		errors = errors + 1;
+	end
+	if (dut.cst == 3'd6 && dut.sb_v && !dut.pass_first) begin
+		$display("FAIL invariant: C_PASS held under a draining store beyond its merge cycle");
+		errors = errors + 1;
+	end
+end
 task cpu_write_sz;
 	input [31:0] a;
 	input  [1:0] sz;
@@ -507,8 +563,6 @@ function [1:0] wrong_way;
 	end
 endfunction
 wire [93:0] real_row = dut.ctag_ram.mem[dut.a_row];
-// T12 drives the collided row itself; declare before the trace uses it.
-reg        perm_en  = 1'b0;
 // +trace_wb: every writeback attempt while the permuted row is armed, with
 // what allowed or blocked it.  The claim that the writeback protection is
 // what saves T12 needs this, not an inference from the source.
@@ -521,6 +575,8 @@ always @(posedge clk) if (nreset && perm_en && dut.cst == 3'd5 &&
 	         dut.tag_we ? "WROTE" : "blocked");
 end
 wire  [1:0] pway     = wrong_way(real_row, dut.a_tag);
+// T12 drives the collided row itself; see that test for why.
+reg        perm_en  = 1'b0;
 reg [93:0] perm_row = 94'd0;
 always @(*) begin
 	dut.ctag_ram.poison_en  = 1'b1;
@@ -543,6 +599,49 @@ end
 // lookup that acts on a don't-care row returns the wrong way's word, and
 // expect_read catches it.  That tests the protection, not its spelling.
 `endif
+// A posted store is acknowledged before it reaches memory.  A test that
+// then changes memory "behind the cache" means AFTER the store is visible
+// there, so it waits for the drain first -- otherwise the store drains over
+// the change and the cache correctly returns the store, failing the test's
+// own assumption rather than the cache.
+// A chipset/DMA write, as one modelled action: the backing memory changes
+// and the snoop follows it.  Every test above instead sets mem[] by hand at
+// a moment of its own choosing and pulses snoop separately -- always with
+// the CPU quiescent -- so a DMA write landing while a POSTED CPU store has
+// not yet reached memory was never exercised.  That window is open in the
+// shipped image (POST_STORES = 1), which is why this is worth testing
+// whatever happens to the store queue.
+//
+// skew delays the snoop behind the memory write the way the real path does:
+// the chipset write lands in the controller, and the wrapper's CDC
+// (chip_snoop_tgl -> two flops -> s_stb) delivers the invalidate a few
+// cycles later.  skew 0 is the simultaneous case.
+task dma_write;
+	input [31:0] a;
+	input [31:0] d;
+	input integer skew;
+	integer k;
+	begin
+		mem[a[15:2]] = d;
+		for (k = 0; k < skew; k = k + 1) @(negedge clk);
+		snoop(a);
+	end
+endtask
+
+task wait_drain;
+	integer guard;
+	begin
+		guard = 0;
+		while (dut.sb_v && guard < 400) begin
+			@(posedge clk);
+			guard = guard + 1;
+		end
+		if (guard >= 400) begin
+			$display("FAIL: posted store never drained");
+			errors = errors + 1;
+		end
+	end
+endtask
 task expect_read;
 	input [31:0] a;
 	input [31:0] v;
@@ -560,6 +659,7 @@ endtask
 
 integer i, off;
 integer guard5;
+integer hit_cycles;
 integer mr0;
 reg [31:0] d;
 reg [31:0] d2;
@@ -1001,6 +1101,7 @@ initial begin
 					snoop(32'h0000_F200);
 				end
 			join
+			wait_drain;
 			mem[32'h7204>>2] = 32'h6F6F_0000 + (i << 8) + off;
 			expect_read(32'h0000_7204, 32'h6F6F_0000 + (i << 8) + off, 11);
 		end
@@ -1019,6 +1120,222 @@ initial begin
 			expect_read(32'h0000_7304, 32'h7A7A_0000 + (i << 8) + off, 11);
 			if (mreads != mr0) begin
 				$display("FAIL test 11e (latency %0d, snoop at %0d): an unrelated snoop stopped the merge", i, off);
+				errors = errors + 1;
+			end
+		end
+	end
+	mem_lat = 2'd2;
+
+	//------------------------------------------------------------------
+	// T14: the drain is not a state.  With posting, a store is
+	// acknowledged at capture and drains by itself; the cache must keep
+	// serving HITS under it, and hold exactly the accesses that need the
+	// master side -- a miss, a bypass, the next store -- until the write
+	// has landed, so nothing can overtake it.  Each part runs at every
+	// memory latency, and the invariant monitors above watch the bus
+	// throughout.  Without posting nothing here can be observed (the store
+	// returns after its own drain) and the section is skipped, not faked.
+	if (POST_OK[0]) begin
+		for (i = 0; i < 4; i = i + 1) begin
+			mem_lat = i;
+			// (a) a hit under the drain is served while the store is still
+			// on the bus: it must take exactly the cycles a plain hit takes,
+			// touch no memory, and the drain must still land.  (Whether the
+			// drain is still running at the acknowledge depends on the
+			// latency; the hit's own latency does not, and that is the
+			// claim.)
+			expect_read(32'h0000_7400, mem[32'h7400>>2], 14);   // warm it
+			@(negedge clk);
+			c_req = 1; c_write = 0; c_size = 2'b10; c_addr = 32'h0000_7400;
+			hit_cycles = 0;
+			while (!(c_ack && ce) && hit_cycles < 200) begin
+				@(posedge clk); hit_cycles = hit_cycles + 1;
+			end
+			@(negedge clk); c_req = 0;
+			while (!ce) @(posedge clk);
+			@(posedge clk);
+			cpu_write(32'h0000_7500, 32'hA14A_0000 + i);        // returns at capture
+			mr0 = mreads;
+			@(negedge clk);
+			c_req = 1; c_write = 0; c_size = 2'b10; c_addr = 32'h0000_7400;
+			guard5 = 0;
+			while (!(c_ack && ce) && guard5 < 200) begin
+				@(posedge clk); guard5 = guard5 + 1;
+			end
+			if (guard5 >= 200) begin
+				$display("FAIL test 14a (latency %0d): hit under the drain never acknowledged", i);
+				errors = errors + 1;
+			end
+			else begin
+				if (guard5 != hit_cycles) begin
+					$display("FAIL test 14a (latency %0d): the hit under the drain took %0d cycles, a plain hit %0d", i, guard5, hit_cycles);
+					errors = errors + 1;
+				end
+				if (c_rdata !== mem[32'h7400>>2]) begin
+					$display("FAIL test 14a (latency %0d): hit under the drain read %h expected %h", i, c_rdata, mem[32'h7400>>2]);
+					errors = errors + 1;
+				end
+			end
+			@(negedge clk); c_req = 0;
+			while (!ce) @(posedge clk);
+			@(posedge clk);
+			if (mreads != mr0) begin
+				$display("FAIL test 14a (latency %0d): the hit went to memory", i);
+				errors = errors + 1;
+			end
+			wait_drain;
+			if (mem[32'h7500>>2] !== 32'hA14A_0000 + i) begin
+				$display("FAIL test 14a (latency %0d): the store never landed (%h)", i, mem[32'h7500>>2]);
+				errors = errors + 1;
+			end
+			// (b) a miss under the drain waits for it and then refills from
+			// memory that already holds the store: store to a line that is
+			// NOT resident (no allocate on a write miss), read it back at
+			// once, and require the stored value.  Also a miss on another
+			// line, which must simply complete.
+			cpu_write(32'h0000_7604, 32'hB14B_0000 + i);
+			expect_read(32'h0000_7604, 32'hB14B_0000 + i, 14);
+			cpu_write(32'h0000_7704, 32'hC14C_0000 + i);
+			expect_read(32'h0000_7800, mem[32'h7800>>2], 14);
+			wait_drain;
+			if (mem[32'h7704>>2] !== 32'hC14C_0000 + i) begin
+				$display("FAIL test 14b (latency %0d): the second store never landed", i);
+				errors = errors + 1;
+			end
+			// (c) back-to-back stores stay in order and neither is lost: the
+			// second is captured only after the first has drained.
+			mr0 = mwrites;
+			cpu_write(32'h0000_7900, 32'hD14D_0000 + i);
+			cpu_write(32'h0000_7904, 32'hE14E_0000 + i);
+			if (mwrites < mr0 + 1) begin
+				$display("FAIL test 14c (latency %0d): the second store was accepted before the first drained", i);
+				errors = errors + 1;
+			end
+			wait_drain;
+			if (mem[32'h7900>>2] !== 32'hD14D_0000 + i || mem[32'h7904>>2] !== 32'hE14E_0000 + i) begin
+				$display("FAIL test 14c (latency %0d): stores out of order or lost (%h %h)", i, mem[32'h7900>>2], mem[32'h7904>>2]);
+				errors = errors + 1;
+			end
+			// (d) a cache-inhibited read under the drain waits for it (the
+			// invariant monitor catches an early one) and returns memory.
+			cpu_write(32'h0000_7A00, 32'hF14F_0000 + i);
+			mem[32'h7A04>>2] = 32'h0A0A_0000 + i;
+			@(negedge clk);
+			c_req = 1; c_write = 0; c_size = 2'b10; c_addr = 32'h0000_7A04; c_nocache = 1;
+			guard5 = 0;
+			while (!(c_ack && ce) && guard5 < 200) begin
+				@(posedge clk); guard5 = guard5 + 1;
+			end
+			if (guard5 >= 200 || c_rdata !== 32'h0A0A_0000 + i) begin
+				$display("FAIL test 14d (latency %0d): bypass under the drain got %h", i, c_rdata);
+				errors = errors + 1;
+			end
+			@(negedge clk); c_req = 0; c_nocache = 0;
+			while (!ce) @(posedge clk);
+			@(posedge clk);
+			wait_drain;
+			// (e) a snoop on the store's own set while it drains kills the
+			// merged line; the read after the drain must refetch and see
+			// the store, which memory now holds.  Swept across the drain.
+			for (off = 0; off < 6; off = off + 1) begin
+				expect_read(32'h0000_7B00, mem[32'h7B00>>2], 14);
+				cpu_write(32'h0000_7B04, 32'h1B1B_0000 + (i << 8) + off);
+				repeat (off) @(negedge clk);
+				snoop(32'h0000_FB00);
+				wait_drain;
+				expect_read(32'h0000_7B04, 32'h1B1B_0000 + (i << 8) + off, 14);
+			end
+			// (f) a miss held in C_LOOK under the drain, snooped while it
+			// waits: the refill must still complete and return memory.
+			for (off = 0; off < 6; off = off + 1) begin
+				mem[32'h7C00>>2] = 32'h2C2C_0000 + (i << 8) + off;
+				snoop(32'h0000_7C00);             // make sure it is not resident
+				cpu_write(32'h0000_7D00, 32'h3D3D_0000 + (i << 8) + off);
+				fork
+					expect_read(32'h0000_7C00, 32'h2C2C_0000 + (i << 8) + off, 14);
+					begin
+						repeat (off) @(negedge clk);
+						snoop(32'h0000_7C00);
+					end
+				join
+				wait_drain;
+			end
+		end
+		mem_lat = 2'd2;
+	end
+
+	//------------------------------------------------------------------
+	// T15: a chipset write against a CPU store that has not reached
+	// memory.  The snoop tests above run with the CPU quiescent; this one
+	// opens the window posting creates and drives a DMA write into it,
+	// swept across the whole drain at every memory latency.
+	//
+	// The invariant is NOT who wins.  Two bus masters writing the same
+	// address race by nature and either order is legal, so a test that
+	// demanded one would be asserting a policy the hardware never
+	// promised.  What the machine must never do is end up INCONSISTENT:
+	// whatever the CPU reads afterwards has to be what memory holds.  A
+	// cache that kept the copy it merged at capture while memory held the
+	// DMA's word would serve its own stale value indefinitely, and no
+	// existing test could see it.
+	//------------------------------------------------------------------
+	for (i = 0; i < 4; i = i + 1) begin
+		mem_lat = i;
+		for (off = 0; off < 10; off = off + 1) begin
+			// (a) same address: the CPU's store and the DMA's write
+			// collide.  Afterwards the CPU's view and memory must agree,
+			// and the value must be one of the two that were written --
+			// never a third.
+			expect_read(32'h0000_8000, mem[32'h8000>>2], 15);
+			cpu_write(32'h0000_8000, 32'hC0C0_0000 + (i << 8) + off);
+			dma_write(32'h0000_8000, 32'hD0D0_0000 + (i << 8) + off, off);
+			wait_drain;
+			cpu_read(32'h0000_8000, d);
+			if (d !== mem[32'h8000>>2]) begin
+				$display("FAIL test 15a (latency %0d, skew %0d): CPU reads %h, memory holds %h",
+				         i, off, d, mem[32'h8000>>2]);
+				errors = errors + 1;
+			end
+			if (d !== 32'hC0C0_0000 + (i << 8) + off &&
+			    d !== 32'hD0D0_0000 + (i << 8) + off) begin
+				$display("FAIL test 15a (latency %0d, skew %0d): CPU reads %h, neither the store %h nor the DMA %h",
+				         i, off, d, 32'hC0C0_0000 + (i << 8) + off, 32'hD0D0_0000 + (i << 8) + off);
+				errors = errors + 1;
+			end
+
+			// (b) the same LINE, a different longword: the store merges a
+			// whole longword into the line and the snoop clears the set,
+			// so neither write may take the other's word with it.  Both
+			// must stand, and the CPU must see both.
+			expect_read(32'h0000_8100, mem[32'h8100>>2], 15);
+			cpu_write(32'h0000_8104, 32'hC1C1_0000 + (i << 8) + off);
+			dma_write(32'h0000_8100, 32'hD1D1_0000 + (i << 8) + off, off);
+			wait_drain;
+			if (mem[32'h8100>>2] !== 32'hD1D1_0000 + (i << 8) + off) begin
+				$display("FAIL test 15b (latency %0d, skew %0d): the DMA word was lost, memory holds %h",
+				         i, off, mem[32'h8100>>2]);
+				errors = errors + 1;
+			end
+			if (mem[32'h8104>>2] !== 32'hC1C1_0000 + (i << 8) + off) begin
+				$display("FAIL test 15b (latency %0d, skew %0d): the store was lost, memory holds %h",
+				         i, off, mem[32'h8104>>2]);
+				errors = errors + 1;
+			end
+			expect_read(32'h0000_8100, 32'hD1D1_0000 + (i << 8) + off, 15);
+			expect_read(32'h0000_8104, 32'hC1C1_0000 + (i << 8) + off, 15);
+
+			// (c) a DMA write to ANOTHER line while a store is in flight.
+			// A miss is held behind the drain, so the refill happens after
+			// the store lands: the hold must not let the read be satisfied
+			// from a line the snoop has already killed.
+			expect_read(32'h0000_8200, mem[32'h8200>>2], 15);
+			cpu_write(32'h0000_8300, 32'hC2C2_0000 + (i << 8) + off);
+			dma_write(32'h0000_8200, 32'hD2D2_0000 + (i << 8) + off, off);
+			wait_drain;
+			expect_read(32'h0000_8200, 32'hD2D2_0000 + (i << 8) + off, 15);
+			if (mem[32'h8300>>2] !== 32'hC2C2_0000 + (i << 8) + off) begin
+				$display("FAIL test 15c (latency %0d, skew %0d): the store was lost, memory holds %h",
+				         i, off, mem[32'h8300>>2]);
 				errors = errors + 1;
 			end
 		end

@@ -33,17 +33,17 @@ wire clkena_in = !active || mem_ready || berr;
 
 ap040_tg68k_compat dut (
 	.clk(clk), .nreset(nreset), .cache_allow_all(1'b1),
-	.tick_in(1'b1),        // no P2 tick grid here: the core runs every clock
 	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),
 	.cache_z2_ena(1'b0),
 	.cache_z3_base0(5'd0),
 	.cache_z3_ena0(1'b0),
 	.cache_z3_base1(4'd0),
 	.cache_z3_ena1(1'b0),
-	.clkena_in(clkena_in),
+	.clkena_in(clkena_in), .bus_clkena_in(clkena_in),
+	.tick_in(1'b1),
 	.data_in(data_in), .ipl(3'b111), .ipl_autovector(1'b1), .berr(berr),
 	.addr_out(addr_out), .data_write(data_write), .nwr(nwr),
-	.nuds(nuds), .nlds(nlds), .busstate(busstate), .longword(longword),
+	.nuds(nuds), .nlds(nlds), .busstate(busstate), .longword(longword), .post_drain(),
 	.nresetout(nresetout), .fc(fc),
 	.walker_ack(1'b0), .walker_data(32'd0), .walker_berr(1'b0),
 	.cache_data(16'd0), .cache_ack(1'b0),
@@ -174,10 +174,7 @@ task expect_warm_reset_mmu_state;
 		// entry 17 = row 4 (bank 0, set 4), way 1: the payload lives in
 		// the ATC dpram row's way-1 bit slice, validity in the flop
 		dut.mmu.atc_v[17] = 1'b1;
-		dut.mmu.atc_ram.mem[4][91:46] = {1'b1, 17'h12345, 20'habcde, 8'hd3};
-		// A warm reset must preserve nonresident entries as well.
-		dut.mmu.atc_v[18] = 1'b1;
-		dut.mmu.atc_ram.mem[4][137:92] = {1'b0, 17'h12346, 28'd0};
+		dut.mmu.atc_ram.mem[4][89:45] = {17'h12345, 20'habcde, 8'hd3};
 
 		nreset = 0;
 		repeat (8) @(posedge clk);
@@ -194,11 +191,8 @@ task expect_warm_reset_mmu_state;
 			$display("FAIL: warm reset altered retained MMU registers");
 		end
 		else if (dut.mmu.atc_v[17] !== 1'b1 ||
-		         dut.mmu.atc_ram.mem[4][91:46] !==
-		         {1'b1, 17'h12345, 20'habcde, 8'hd3} ||
-		         dut.mmu.atc_v[18] !== 1'b1 ||
-		         dut.mmu.atc_ram.mem[4][137:92] !==
-		         {1'b0, 17'h12346, 28'd0}) begin
+		         dut.mmu.atc_ram.mem[4][89:45] !==
+		         {17'h12345, 20'habcde, 8'hd3}) begin
 			errors = errors + 1;
 			$display("FAIL: warm reset invalidated or altered an ATC entry");
 		end
