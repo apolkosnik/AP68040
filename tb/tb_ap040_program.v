@@ -17,7 +17,9 @@
 
 `timescale 1ns/1ps
 
-module tb_ap040_program #(parameter [7:0] FPU_REVISION = 8'h41);
+module tb_ap040_program;
+// --param POST_STORES=1 posts every store; 0 is the CPU's own default
+parameter POST_STORES = 0;
 
 reg clk = 0;
 reg nreset = 0;
@@ -60,16 +62,19 @@ wire        fberr = fberr_armed && nreset && (busstate == 2'b00) &&
 
 wire        berr = berr_d | fberr;
 
-wire        clkena_in = (busstate == 2'b01) | mem_ready | berr;
-
-// A revision-$40 UNIMP has no CMDREG3B field. In particular it must not
-// inherit one when replacing a previously restored BUSY frame.
-always @(posedge clk) begin
-	if (nreset && clkena_in && FPU_REVISION == 8'h40 &&
-	    dut.core.fpu_frestore_unimp && !dut.core.fp_restore_busy &&
-	    dut.core.fp_restore_cmd3 !== 16'd0)
-		$fatal(1, "revision-$40 UNIMP restore retained CMDREG3B");
-end
+// The BUS side's enable, and the shape this bench always had: advance only
+// when the bus is idle or has answered.
+wire        bus_clkena = (busstate == 2'b01) | mem_ready | berr;
+// The CORE side.  Production splits these (cpu_wrapper: core_enable adds
+// post_drain to bus_enable) so the core keeps running while a posted store
+// drains -- that is the whole point of posting.  Driving both sides from
+// the bus enable, as this bench did, FREEZES the core for the drain and
+// hides every ordering question posting opens: NOP returning before its
+// write lands, cache maintenance completing over a pending store.  Both
+// were real defects in the shipped design and this bench could not see
+// either.  Mirror production instead.
+wire        post_drain;
+wire        clkena_in = bus_clkena | post_drain;
 
 reg   [2:0] ipl_lvl;
 reg  [15:0] ipl_delay = 0;   // $F148: delayed level-2 IPL countdown
@@ -146,10 +151,9 @@ end
 `endif
 
 ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
-                    .AP040_FPU_REVISION(FPU_REVISION)) dut
+                     .AP040_POST_STORES(POST_STORES)) dut
 (
 	.clk(clk),
-	.tick_in(1'b1),        // no P2 tick grid here: the core runs every clock
 	.nreset(nreset),
 	.cache_allow_all(1'b1),
 	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),
@@ -158,7 +162,8 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
 	.cache_z3_ena0(1'b0),
 	.cache_z3_base1(4'd0),
 	.cache_z3_ena1(1'b0),
-	.clkena_in(clkena_in),
+	.clkena_in(clkena_in), .bus_clkena_in(bus_clkena),
+	.tick_in(1'b1),
 	.data_in(data_in),
 	.ipl(~ipl_lvl),
 	.ipl_autovector(1'b1),
@@ -170,7 +175,7 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
 	.nuds(nuds),
 	.nlds(nlds),
 	.busstate(busstate),
-	.longword(longword),
+	.longword(longword), .post_drain(post_drain),
 	.nresetout(nresetout),
 	.fc(fc),
 
@@ -227,6 +232,7 @@ integer result;          // 0 running, 1 pass, 2 fail
 
 assign data_in = (phase == 2 && lvl_hold) ? lvl_data : mem[addr_out[15:1]];
 reg [1023:0] prog_file;
+integer prog_fd;
 reg [1023:0] dump_file;
 
 function [2:0] latency;
@@ -519,6 +525,20 @@ always @(posedge clk) begin
 				$display("FAIL: exception handler fetch used FC=%0d, expected 6", fc);
 				result = 2;
 			end
+			// A write on the bus while the cache holds a posted store is
+			// that store DRAINING -- the cache issues nothing else on the
+			// master side meanwhile -- and it must carry the function code it
+			// was issued with, not the exception's: a user-mode store
+			// acknowledged just before a TRAP drains as FC 1 while the core is
+			// already pushing the frame (which queues behind it, in order).
+			else if (busstate == 2'b11 && dut.g_cache.cache.sb_v) begin
+				if (fc !== dut.g_cache.cache.sb_fc) begin
+					errors = errors + 1;
+					$display("FAIL: posted store drained with FC=%0d, was issued with %0d",
+					         fc, dut.g_cache.cache.sb_fc);
+					result = 2;
+				end
+			end
 			else if ((busstate == 2'b10 || busstate == 2'b11) && fc !== 3'd5) begin
 				errors = errors + 1;
 				$display("FAIL: exception/reset data cycle used FC=%0d, expected 5", fc);
@@ -653,6 +673,24 @@ always @(posedge clk) if (nreset && mem_ready && busstate == 2'b11 &&
 integer prof_cnt [0:255];
 integer prof_stall [0:255];
 integer prof_on = 0;
+// +prof, cache side: lookups and hits per side of ap040_cache, so a
+// straight-line fetch stream that misses shows as a hit rate rather than
+// as an inference from stall counts.  Index 1 = instruction, 0 = data.
+integer prof_look [0:1];
+integer prof_hit  [0:1];
+initial begin prof_look[0] = 0; prof_look[1] = 0; prof_hit[0] = 0; prof_hit[1] = 0; end
+// Why an instruction request did NOT get a lookup: the bypass terms of
+// ap040_cache, counted per accepted-or-bypassed request, plus where the
+// cache FSM spends its cycles.  A straight-line stream with 0 lookups
+// needs a reason, not an inference.
+integer prof_ireq, prof_ibyp, prof_ib_nocache, prof_ib_ena, prof_ib_fits, prof_ib_busy;
+integer prof_cst [0:7];
+// (pi is declared further down; binding is in source order, so no loop here)
+initial begin
+	prof_ireq = 0; prof_ibyp = 0; prof_ib_nocache = 0; prof_ib_ena = 0; prof_ib_fits = 0; prof_ib_busy = 0;
+	prof_cst[0] = 0; prof_cst[1] = 0; prof_cst[2] = 0; prof_cst[3] = 0;
+	prof_cst[4] = 0; prof_cst[5] = 0; prof_cst[6] = 0; prof_cst[7] = 0;
+end
 
 // +memlat: request-to-acknowledge latency for the core's memory port,
 // split by operation class.  S_MRD costs ~7.6 cycles on a CACHED load
@@ -720,6 +758,33 @@ always @(posedge clk) if (prof_on && nreset) begin
 		prof_stall[dut.core.state] = prof_stall[dut.core.state] + 1;
 end
 
+// The cache only exists in the g_cache branch; a cache-off build has no
+// hierarchy to probe and must still compile.
+generate if (`AP040_TB_CACHE != 0) begin : g_prof_cache
+	always @(posedge clk) if (prof_on && nreset) begin
+		// C_LOOK (3'd1) with ce: the compare cycle of one accepted lookup
+		if (dut.g_cache.cache.ce && dut.g_cache.cache.cst == 3'd1) begin
+			prof_look[dut.g_cache.cache.c_instr] = prof_look[dut.g_cache.cache.c_instr] + 1;
+			if (dut.g_cache.cache.look_hit)
+				prof_hit[dut.g_cache.cache.c_instr] = prof_hit[dut.g_cache.cache.c_instr] + 1;
+		end
+		prof_cst[dut.g_cache.cache.cst] = prof_cst[dut.g_cache.cache.cst] + 1;
+		// count each instruction request once, on the cycle it is first
+		// seen in C_IDLE (acceptance or bypass decision happens there)
+		if (dut.g_cache.cache.ce && dut.g_cache.cache.cst == 3'd0 &&
+		    dut.g_cache.cache.c_req && dut.g_cache.cache.c_instr && !dut.g_cache.cache.ack_r) begin
+			prof_ireq = prof_ireq + 1;
+			if (dut.g_cache.cache.bypass) begin
+				prof_ibyp = prof_ibyp + 1;
+				if (dut.g_cache.cache.c_nocache)  prof_ib_nocache = prof_ib_nocache + 1;
+				if (!dut.g_cache.cache.ena)       prof_ib_ena     = prof_ib_ena + 1;
+				if (!dut.g_cache.cache.fits_long) prof_ib_fits    = prof_ib_fits + 1;
+			end
+			else if (!dut.g_cache.cache.rd_accept) prof_ib_busy = prof_ib_busy + 1;
+		end
+	end
+end endgenerate
+
 task memlat_dump;
 	input integer ph;
 	integer c, b;
@@ -761,6 +826,16 @@ task prof_dump;
 		fetch_immf = prof_cnt[8'd3] + prof_cnt[8'd8];
 		$display("PROF   S_FETCH+S_IMMF occupancy: %0d / %0d = %0d%%",
 		         fetch_immf, total, (fetch_immf * 100) / total);
+		$display("PROF   cache I: %0d lookups, %0d hits (%0d%%)   D: %0d lookups, %0d hits (%0d%%)",
+		         prof_look[1], prof_hit[1], prof_look[1] ? (prof_hit[1] * 100) / prof_look[1] : 0,
+		         prof_look[0], prof_hit[0], prof_look[0] ? (prof_hit[0] * 100) / prof_look[0] : 0);
+		prof_look[0] = 0; prof_look[1] = 0; prof_hit[0] = 0; prof_hit[1] = 0;
+		$display("PROF   cache I requests: %0d, bypassed %0d (nocache %0d, cache-disabled %0d, misaligned %0d), not accepted while idle %0d",
+		         prof_ireq, prof_ibyp, prof_ib_nocache, prof_ib_ena, prof_ib_fits, prof_ib_busy);
+		$display("PROF   cache FSM cycles: IDLE %0d LOOK %0d FERR %0d WINV %0d FILL %0d TAGW %0d PASS %0d SWEEP %0d",
+		         prof_cst[0], prof_cst[1], prof_cst[2], prof_cst[3], prof_cst[4], prof_cst[5], prof_cst[6], prof_cst[7]);
+		prof_ireq = 0; prof_ibyp = 0; prof_ib_nocache = 0; prof_ib_ena = 0; prof_ib_fits = 0; prof_ib_busy = 0;
+		for (pi = 0; pi < 8; pi = pi + 1) prof_cst[pi] = 0;
 		for (pi = 0; pi < 256; pi = pi + 1) begin
 			prof_cnt[pi] = 0;
 			prof_stall[pi] = 0;
@@ -782,6 +857,18 @@ task run_phase;
 		fberr_armed = 0;
 
 		for (i = 0; i < 32768; i = i + 1) mem[i] = 16'h0000;
+		// A program that cannot be loaded leaves mem all zeros, and the
+		// core then executes $0000 from $400 until the cycle limit: the
+		// run prints FAIL lines but ALSO a complete, plausible +prof
+		// histogram, and $finish exits 0 regardless.  That output was
+		// once mistaken for a benchmark result.  $readmemh reports no
+		// status, so probe the file first and stop here if it is absent.
+		prog_fd = $fopen(prog_file, "r");
+		if (prog_fd == 0) begin
+			$display("FATAL: cannot open program image %0s -- nothing to test", prog_file);
+			$fatal(1);
+		end
+		$fclose(prog_fd);
 		$readmemh(prog_file, mem);
 		// interrupt-injection capability word: t_fpu's IRQ soak runs
 		// only where the bench can deliver IPL

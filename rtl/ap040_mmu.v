@@ -53,6 +53,7 @@ module ap040_mmu
 	// PTEST/PFLUSH sideband
 	input             pt_req,
 	input             pt_write,
+	input             pt_access,  // internal operand check, not a PTEST instruction
 	input      [31:0] pt_addr,
 	input       [2:0] pt_fc,
 	output reg        pt_done,
@@ -569,6 +570,14 @@ always @(posedge clk) begin
 						// reference; t_mmu 38 pins it.
 						pt_mmusr <= (pt_write && pt_ttr_w) ? 32'h0000_0800
 						                                   : 32'h0000_0003;
+						pt_done <= 1;
+						w_pt <= 0;
+						wst <= W_IDLE;
+					end
+					else if (pt_access && !tc_e) begin
+						// Ordinary accesses bypass translation with TC.E clear.
+						// Explicit PTEST still searches the tables in that mode.
+						pt_mmusr <= 32'h0000_0001;
 						pt_done <= 1;
 						w_pt <= 0;
 						wst <= W_IDLE;

@@ -2327,16 +2327,44 @@ module ap040_fp_regfile
 	output     [79:0] rdata_b
 );
 
+// READ DURING WRITE.  no_rw_check does not promise the accesses never
+// coincide -- it says the read data is undefined when they do, and asks the
+// fitter not to spend logic on it.  This file coincides constantly: counting
+// cycles where a read port sits on the register being written gives 1,329 in
+// t_fpu alone, 57 in t_fpu_resume, 6 in t_fpu_frames, the very first being a
+// write to FP0 with both read ports on FP0.
+//
+// The integer register file had the same shape and did not boot.  So the same
+// remedy: hold the write one enabled cycle and answer a read of the pending
+// address from pend_wdata, which discards exactly the datum the attribute
+// leaves undefined.  Reads are otherwise unchanged, and an MLAB is still
+// inferred because the attribute stays.  The hold also keeps the RAM's write
+// inputs registered, which matters on its own: see ap040_regfile for the
+// board result when the RAM was written straight from the datapath
+// (06d90f6fb, yellow screen) and the non-unate clock edge TimeQuest reports
+// for these cells.  Keep pend_* in front of the RAM.
 (* ramstyle = "MLAB, no_rw_check" *) reg [79:0] bank_a [0:7];
 (* ramstyle = "MLAB, no_rw_check" *) reg [79:0] bank_b [0:7];
 
-assign rdata_a = bank_a[raddr_a];
-assign rdata_b = bank_b[raddr_b];
+reg        pend_we;
+reg  [2:0] pend_waddr;
+reg [79:0] pend_wdata;
+
+wire hit_a = pend_we && (pend_waddr == raddr_a);
+wire hit_b = pend_we && (pend_waddr == raddr_b);
+assign rdata_a = hit_a ? pend_wdata : bank_a[raddr_a];
+assign rdata_b = hit_b ? pend_wdata : bank_b[raddr_b];
 
 always @(posedge clk) begin
-	if (ce && we) begin
-		bank_a[waddr] <= wdata;
-		bank_b[waddr] <= wdata;
+	if (ce) begin
+		// the write held from the previous enabled cycle
+		if (pend_we) begin
+			bank_a[pend_waddr] <= pend_wdata;
+			bank_b[pend_waddr] <= pend_wdata;
+		end
+		pend_we    <= we;
+		pend_waddr <= waddr;
+		pend_wdata <= wdata;
 	end
 end
 

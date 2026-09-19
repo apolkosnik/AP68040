@@ -1433,6 +1433,27 @@ nsclr4:	clr.l	(a0)+
 	move.l	($4600).l,d0
 	chkl	d0,$0000488B,212	; new pointer entry: resident + U
 
+	; 213/214: a PAGE-CROSSING write leaves no flags pending.  A crossing
+	; access is split into byte transfers (S_MWR_B) and never reaches the
+	; whole-transfer acknowledge, so a deferred CCR commit that only lives
+	; there outlives the instruction: the conditional below reads the flags
+	; of whatever ran BEFORE the ADD.  Only reachable with translation on --
+	; the split is gated on TC[15], which is why the corpus, running with
+	; tc=0, cannot see this at all.
+	moveq	#-1,d0			; a REGISTER op sets the CCR last, so what
+	tst.l	d0			; the branch reads can only come from the MOVE
+	move.l	#0,($DFFE).l		; crossing write: 8K pages here, so this
+					; straddles the $E000 boundary between two
+					; identity-mapped pages.  Value zero -> Z set
+	beq.s	mcz_ok
+	failt	213			; Z never reached the CCR: the split write's
+					; deferred flags were dropped
+mcz_ok:
+	; and the value itself is still right across the boundary
+	move.l	#$11223344,($DFFE).l
+	move.l	($DFFE).l,d0
+	chkl	d0,$11223344,214
+
 	; translation off first (the code window is a TTR), then the
 	; windows themselves
 	moveq	#0,d0
