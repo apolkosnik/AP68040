@@ -63,6 +63,30 @@ function res_zero;
 	end
 endfunction
 
+// n mod (nbits+1), the count of the ROX rotates. nbits+1 is 9, 17 or 33
+// and n is six bits, so this is at most three conditional subtracts of a
+// constant. Written as `n % (nbits + 1)` it infers an lpm_divide, and the
+// first standalone fit after milestone 74 found that divider on every one
+// of the 40 worst paths.
+function [5:0] mod_np1;
+	input [5:0] n;
+	reg   [5:0] t;
+	begin
+		case (size)
+			`AP040_SZ_B: begin
+				t = (n >= 6'd36) ? n - 6'd36 : n;
+				t = (t >= 6'd18) ? t - 6'd18 : t;
+				mod_np1 = (t >= 6'd9) ? t - 6'd9 : t;
+			end
+			`AP040_SZ_W: begin
+				t = (n >= 6'd34) ? n - 6'd34 : n;
+				mod_np1 = (t >= 6'd17) ? t - 6'd17 : t;
+			end
+			default: mod_np1 = (n >= 6'd33) ? n - 6'd33 : n;
+		endcase
+	end
+endfunction
+
 // shared adder/subtractor with carry out per size
 wire [32:0] add_full  = {1'b0, bm} + {1'b0, am};
 wire [32:0] addx_full = {1'b0, bm} + {1'b0, am} + {32'd0, f_x};
@@ -83,6 +107,15 @@ wire add_r_msb  = (size == `AP040_SZ_B) ? add_full[7]  : (size == `AP040_SZ_W) ?
 wire addx_r_msb = (size == `AP040_SZ_B) ? addx_full[7] : (size == `AP040_SZ_W) ? addx_full[15] : addx_full[31];
 wire sub_r_msb  = (size == `AP040_SZ_B) ? sub_full[7]  : (size == `AP040_SZ_W) ? sub_full[15]  : sub_full[31];
 wire subx_r_msb = (size == `AP040_SZ_B) ? subx_full[7] : (size == `AP040_SZ_W) ? subx_full[15] : subx_full[31];
+
+// Multiply operands: the low word of each, unsigned for MULU and sign-
+// extended for MULS. Commutative, so which is a and which is b does not
+// matter -- one of the few ALU ops here with no operand-order hazard.
+wire [31:0]        mulu_full = a[15:0] * b[15:0];
+wire signed [15:0] muls_a    = a[15:0];
+wire signed [15:0] muls_b    = b[15:0];
+wire signed [31:0] muls_prod = muls_a * muls_b;
+wire [31:0]        muls_full = muls_prod;
 
 wire add_v  = (a_msb == b_msb) && (add_r_msb  != a_msb);
 wire addx_v = (a_msb == b_msb) && (addx_r_msb != a_msb);
@@ -172,6 +205,26 @@ always @* begin
 		`AP040_ALU_CMP: begin
 			result = bm;   // destination unchanged
 			flags_out = {f_x, sub_r_msb, res_zero(sub_full[31:0]), sub_v, sub_c};
+		end
+
+		// MULU/MULS take the low words of both operands whatever `size`
+		// says, and always produce 32 bits -- so unlike every other op here
+		// the flags are read from bit 31 explicitly rather than through
+		// res_msb, which would follow `size`. Decode sets size to Long for
+		// these, so the two agree today; spelling it out keeps them agreeing
+		// if that ever changes.
+		//
+		// N and Z come from the full 32-bit product, V and C are cleared,
+		// and X is untouched -- the 68000 through 68040 all define it that
+		// way, and it is why a multiply cannot be used to set up an ADDX.
+		`AP040_ALU_MULU: begin
+			result = mulu_full;
+			flags_out = {f_x, mulu_full[31], (mulu_full == 32'd0), 1'b0, 1'b0};
+		end
+
+		`AP040_ALU_MULS: begin
+			result = muls_full;
+			flags_out = {f_x, muls_full[31], (muls_full == 32'd0), 1'b0, 1'b0};
 		end
 
 		`AP040_ALU_AND: begin
@@ -276,7 +329,7 @@ always @* begin
 			n  = shcnt;
 			r  = 32'd0; c = 1'b0; x2 = f_x; vf = 1'b0;
 			nm = n & (nbits - 6'd1);
-			nx = n % (nbits + 6'd1);
+			nx = mod_np1(n);
 			ne = (n > nbits) ? nbits : n;
 			cmask = (33'd2 << nbits) - 33'd1;
 			w = ({32'd0, f_x} << nbits) | {1'b0, bm};
@@ -330,6 +383,23 @@ always @* begin
 					c = x2;
 				end
 			endcase
+			// A REGISTER count can be zero and an immediate one cannot (0
+			// means 8), so this case only became reachable with milestone
+			// 87's register-count forms. Every closed form above already
+			// reduces to the identity at n == 0 -- r is bm, ASL's V is 0,
+			// and ROX's C and X are the unchanged X -- so only two things
+			// are wrong: the four shifts write the phantom carry to X, and
+			// the two plain rotates report bit 0 (or the MSB) as C when
+			// nothing wrapped. Two flag bits, not a result mux: the first
+			// draft forced r as well and put a 32-bit mux on the ALU's
+			// output path for nothing.
+			if (n == 6'd0) begin
+				case (op)
+				`AP040_ALU_ASL1, `AP040_ALU_LSL1, `AP040_ALU_ASR1, `AP040_ALU_LSR1: x2 = f_x;
+				`AP040_ALU_ROL1, `AP040_ALU_ROR1:                                   c  = 1'b0;
+				default: ;
+				endcase
+			end
 			result = r;
 			flags_out = {x2, res_msb(r), res_zero(r), vf, c};
 		end

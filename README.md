@@ -14,8 +14,11 @@ failures — the corpus records expectations no real MC68040 can satisfy; see
 
 ## What is here
 
-This tree currently holds **two** cores, mid-transition from one to the
-other -- see `AP040_IMPLEMENTATION_PLAN.md` for the full status and roadmap.
+This branch holds **two** cores: the sequential one that ships, and the
+pipelined one being built to replace it. `AP040_IMPLEMENTATION_PLAN.md` is
+the pipelined core's plan and milestone record; `doc/AP040_PIPELINE_CACHES.md`
+covers its caches, store buffer and card wrapper, and
+`doc/AP040_PIPELINE_RESTRUCTURING_PLAN.md` the throughput work that follows.
 
 ```
 rtl_old/                the WORKING reference core (what "Integrating it"
@@ -34,34 +37,56 @@ rtl_old/                the WORKING reference core (what "Integrating it"
   ap040_bus_timeout.v   bus watchdog
   ap040_walker_cdc.v    table-walk port clock crossing
   primitives/dpram.v    inferred true-dual-port RAM -- substitutable
-rtl/                    the IN-PROGRESS pipelined replacement (not yet wired
-                        into anything -- built and tested standalone)
-  ap040_pipe_core.v      top level: six-stage IF/ID/EA-calc/EA-fetch/EX/WB
-  ap040_inst_fetch.v     IF
-  ap040_decode.v         ID
-  ap040_ea_calc.v        EA-calc
-  ap040_ea_fetch.v       EA-fetch (register forwarding lives here)
-  ap040_execute.v        EX (condition checks, misprediction recovery)
-  ap040_writeback.v      WB
-  ap040_pipe_alu.v       ALU (forked from rtl_old/ap040_alu.v)
-  ap040_pipe_regfile.v   register file (forked from rtl_old/ap040_regfile.v)
-  ap040_pipe_defs.svh    shared defines, independent copy of ap040_defs.svh
+rtl/                    the PIPELINED core: MC68040-style IF/ID/EA-calc/
+                        EA-fetch/EX/WB, with the MMU, both caches and the FPU
+  ap040_pipe.qip            Quartus file list for the wrapper below
+  ap040_pipe_tg68k_compat.v top level: rtl_old's port set, same meaning
+  ap040_pipe_bus16.v        CPU + MMU + memory units on rtl_old's 16-bit adapter
+  ap040_pipe_cpu.v          the six stages, CCR/SR and exception entry
+  ap040_inst_fetch.v        IF
+  ap040_decode.v            ID
+  ap040_ea_calc.v           EA-calc
+  ap040_ea_fetch.v          EA-fetch: operand reads, forwarding, sequencers
+  ap040_execute.v           EX
+  ap040_writeback.v         WB
+  ap040_pipe_alu.v          ALU (forked from rtl_old/ap040_alu.v)
+  ap040_pipe_regfile.v      register file (forked from rtl_old/ap040_regfile.v)
+  ap040_pipe_fpu.v          F-line sequencer around rtl_old/ap040_fpu.v
+  ap040_pipe_irq.v          interrupt level sampling and hold
+  ap040_pipe_imu.v          instruction memory unit: prefetch, I-cache
+  ap040_pipe_dmu.v          data memory unit: D-cache (copyback), store buffer
+  ap040_pipe_mmu.v          ATCs, TTRs and table walker at both memory ports
+  ap040_pipe_membus.v       the two memory ports onto one bus transaction
+  ap040_pipe_cache_arr.v    the caches' tag and data arrays
+  ap040_pipe_ram.vhd        their block RAMs, as altsyncram (tb/sim_pipe_ram.v
+                            models them)
+  ap040_pipe_core.v         CPU + ap040_pipe_l1.v's local array: the milestone
+  ap040_pipe_l1.v           benches' pairing, not synthesized
+  ap040_pipe_sys.v          CPU + bus controller on a plain memory port
+  ap040_pipe_defs.svh       the pipeline's defines
 tb/                     self-contained test suites for BOTH cores (see Testing)
 doc/
 ```
 
-`rtl_old/` and `rtl/` are deliberately independent -- deleting either cannot
-affect the other (no shared includes, no shared module names).
+The pipelined core shares no module name with `rtl_old/`, but it is no
+longer independent of it: it runs `rtl_old/ap040_fpu.v` as its FPU engine
+(and so includes `rtl_old/ap040_defs.svh`), drives the 16-bit bus through
+`rtl_old/ap040_bus16_adapter.v`, and keeps its ATC rows in
+`rtl_old/primitives/dpram.v`. `rtl_old/` does not depend on `rtl/`.
+
+Both cores are developed in the Minimig-AGA tree, whose layout the source
+comments use: `rtl/ap040/` there is `rtl_old/` here, `rtl/ap040_pipe/` is
+`rtl/`, `tests/ap040/` and `tests/ap040/pipe/` are `tb/`, and
+`tests/ap040/sim_dpram.v` is `rtl_old/primitives/dpram.v`.
 
 ## Integrating it
 
-This section describes `rtl_old/` -- the working core. (`rtl/`'s pipelined
-replacement isn't ready to integrate anywhere yet; see
-`AP040_IMPLEMENTATION_PLAN.md`.)
+This section describes `rtl_old/` -- the working core. The pipelined core
+takes the same ports; see "The pipelined core" below.
 
 Add `rtl_old/ap040.qip` to a Quartus project, or hand the eleven
 `rtl_old/*.v` files plus `rtl_old/primitives/dpram.v` to any other flow —
-`ap040_defs.svh` must be on the include path (`-I rtl_old` for iverilog).
+`ap040_defs.svh` must be on the include path (`-I rtl_old`).
 
 The top level is `ap040_tg68k_compat`, which presents a TG68K-shaped port set
 so it can drop into a host that already speaks that interface:
@@ -137,12 +162,46 @@ a descriptor alone does not make it accessible: software must invalidate the
 old entry (PFLUSH or PTEST), or wait for replacement. PTEST reports a table
 bus error with MMUSR.B and also caches the failed translation.
 
+### The pipelined core
+
+`rtl/ap040_pipe_tg68k_compat.v` presents the same ports, parameters and
+meaning as `ap040_tg68k_compat`, so a host can take either core. Differences
+at those ports:
+
+- The core's enable is `tick_in`; `clkena_in` is not used. The memory side
+  (both memory units, the MMU and the bus controller) runs every clock.
+- `mmu_cache_inhibit` is held high: the core's own caches are the 68040's
+  two, and a cache below them would only add a coherency question.
+  `post_drain` is low: the store buffer is inside the core.
+- `cache_snoop_*` reaches both caches: chip RAM fetches can be cached,
+  unlike `rtl_old`, whose instruction cache is not snooped.
+
+For Quartus, add `rtl/ap040_pipe.qip` together with `rtl_old/ap040.qip` (for
+`ap040_fpu.v`, `ap040_bus16_adapter.v` and the include path) and a `dpram`
+(`rtl_old/primitives/dpram.v`, or a vendor macro). `ap040_pipe_ram.vhd`
+instantiates `altsyncram` directly, so other vendors need their own two
+RAMs with its ports.
+
+Status: the core is not on hardware yet. It fits on its own, the bus16 top
+at 25 ns: 40.49 MHz, 25,727 ALMs and 42 RAM blocks on a Cyclone V. The full
+Minimig-AGA build with it synthesizes but does not fit the DE10-Nano (43,149
+ALMs, 103%; the sequential core's build is at 94%). The Minimig tree
+replays 11 groups of the WinUAE corpus on it; the only failures are four
+BasicFPU slices, which are the generator's.
+
 ## Testing
 
 ```
-cd tb && ./run_tests.sh          # rtl_old (reference core): needs iverilog and vasmm68k_mot (vbcc)
-cd tb && ./run_pipe_tests.sh     # rtl (pipeline, in progress): needs only iverilog
+cd tb && ./run_tests.sh              # rtl_old: needs Verilator 5 and vasmm68k_mot (vbcc)
+cd tb && ./build_tests.sh            # the program images, dhry (vbcc's vc, vlink) included
+cd tb && ./run_pipe_verilator.py     # rtl: needs Verilator 5 and vasmm68k_mot
 ```
+
+Both suites run Verilator. The cores name signals before declaring them,
+which Icarus (13.0 included) rejects at elaboration; the Minimig tree has
+run only Verilator for some time. `run_pipe_verilator.py --ce-random
+--slow-l1` repeats the pipelined suite with a pseudo-random clock enable and
+0-3 extra cycles on every memory access; `--only NAME,...` selects benches.
 
 `sh tb/run_fpu_frames.sh` independently checks both FPU revisions' headers,
 payloads, pointer adjustments, frame round-trips, invalid-frame rejection
@@ -166,10 +225,12 @@ Everything under `tb/` runs against the core alone, with no host-project
 sources, so a failure is the CPU's rather than an integration artifact. The
 suite covers the integer ISA, the exception and trace model, the MMU
 (translation, TTRs, page-table walks, access faults, 4K and 8K pages), the
-caches, and the FPU -- against `rtl_old`. `run_pipe_tests.sh` covers whatever
-the pipeline has reached so far (see `AP040_IMPLEMENTATION_PLAN.md` for the
-milestone list); each `tb_ap040_pipe_*.v` bench pokes a tiny program directly
-into the fetch stage's ROM, so it needs no assembler.
+caches, and the FPU -- against `rtl_old`. `run_pipe_verilator.py` runs the
+pipelined core's 172 benches: one or more per milestone, each poking its own
+program into the fetch stage's array, plus differential benches that run
+`rtl_old` beside it, unit benches for the memory units and caches, and
+`tb_ap040_pipe_program`, which runs 26 of `tb/asm`'s self-checking programs
+and Dhrystone on the bus16 top.
 
 The Minimig-AGA tree adds further benches that co-simulate the core against a
 real Amiga chipset, an SDRAM controller and a DDR3 controller, and drives the

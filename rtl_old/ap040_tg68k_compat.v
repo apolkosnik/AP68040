@@ -113,6 +113,7 @@ wire [31:0] mem_addr;
 wire [31:0] mem_wdata;
 wire  [2:0] mem_fc;
 wire        mem_ack;
+wire        mem_if_cached;
 wire [31:0] mem_rdata;
 wire        mem_flt_mmu;
 // Core-side stall watchdog.  Every prior watchdog counts a DOWNSTREAM
@@ -190,6 +191,7 @@ ap040_core #(
 	.mem_wdata(mem_wdata),
 	.mem_fc(mem_fc),
 	.mem_ack(mem_ack),
+	.mem_if_cached(mem_if_cached),
 	.mem_rdata(mem_rdata),
 	.mem_flt(mem_flt),
 
@@ -399,6 +401,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),
+		.c_if_cached(mem_if_cached),
 		.c_rdata(mm_rdata),
 		.sb_busy(post_drain),
 
@@ -415,6 +418,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	);
 end
 else begin : g_nocache
+	assign mem_if_cached = 1'b0;
 	// no internal caches: the MMU talks straight to the bus adapter and
 	// CINV/CPUSH complete immediately (a 68040 whose caches never fill).
 	// The Minimig build uses this and relies on cpu_cache_new in the RAM

@@ -20,6 +20,9 @@
 module tb_ap040_program;
 // --param POST_STORES=1 posts every store; 0 is the CPU's own default
 parameter POST_STORES = 0;
+// FPU_REVISION selects the FPU state-frame ABI (run_fpu_frames.sh builds
+// both): 8'h41 is the CPU's own default, 8'h40 the older NeXT layout
+parameter [7:0] FPU_REVISION = 8'h41;
 
 reg clk = 0;
 reg nreset = 0;
@@ -75,6 +78,15 @@ wire        bus_clkena = (busstate == 2'b01) | mem_ready | berr;
 // either.  Mirror production instead.
 wire        post_drain;
 wire        clkena_in = bus_clkena | post_drain;
+
+// A revision-$40 UNIMP has no CMDREG3B field. In particular it must not
+// inherit one when replacing a previously restored BUSY frame.
+always @(posedge clk) begin
+	if (nreset && clkena_in && FPU_REVISION == 8'h40 &&
+	    dut.core.fpu_frestore_unimp && !dut.core.fp_restore_busy &&
+	    dut.core.fp_restore_cmd3 !== 16'd0)
+		$fatal(1, "revision-$40 UNIMP restore retained CMDREG3B");
+end
 
 reg   [2:0] ipl_lvl;
 reg  [15:0] ipl_delay = 0;   // $F148: delayed level-2 IPL countdown
@@ -151,7 +163,8 @@ end
 `endif
 
 ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
-                     .AP040_POST_STORES(POST_STORES)) dut
+                     .AP040_POST_STORES(POST_STORES),
+                     .AP040_FPU_REVISION(FPU_REVISION)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
@@ -872,7 +885,7 @@ task run_phase;
 		$readmemh(prog_file, mem);
 		// interrupt-injection capability word: t_fpu's IRQ soak runs
 		// only where the bench can deliver IPL
-		mem[16'hF160 >> 1] = 16'h0007;	// coarse + fine IPL + berr injection
+		mem[16'hF160 >> 1] = 16'h0027;	// coarse + fine IPL + berr injection; bit 5: IPLDLY calibrated to this core (test 136)
 
 		nreset = 0;
 		repeat (10) @(posedge clk);

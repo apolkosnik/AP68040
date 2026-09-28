@@ -3,10 +3,10 @@
 // state)                                                                   //
 //                                                                          //
 // tb_ap040_pipe_sup.v - VBR/SFC/DFC/CACR/USP/ISP/MSP, mode switching,      //
-// privilege violation                                                      //
+// privilege violation, a frame on the master stack                         //
 //                                                                          //
-// Four phases, chained (each depends on the previous one's state, proving   //
-// this is a coherent architectural sequence, not four isolated pokes):        //
+// Five phases, chained (each depends on the previous one's state, proving   //
+// this is a coherent architectural sequence, not five isolated pokes):        //
 //                                                                          //
 // Phase 1 (supervisor, S=1 from reset) -- MOVEC's WRITE direction sets every    //
 // one of VBR/SFC/DFC/CACR/USP/ISP/MSP to a distinct, checkable value (verified     //
@@ -37,6 +37,16 @@
 // to catch (a naive "read A7 via the currently active bank" implementation would                  //
 // have silently pushed onto USP instead).                                                          //
 //                                                                          //
+// Phase 5 (milestone 88, in the privilege handler, so supervisor mode) -- MOVE            //
+// #$3000,SR sets M, and a TRAP #1 then has to land its frame on the MASTER stack            //
+// (MSP, $60 from phase 1, decremented to $58) while ISP stays exactly where phase 4          //
+// left it ($68). Until this phase no bench in the suite took an exception with M set:          //
+// the frame's bank select (the M bit, read from the SR forward) was never observed              //
+// being anything but ISP, so a sequencer that ignored M entirely passed everything.              //
+// Milestone 88 latches that select at the verdict (exc_m_r); this phase is what a                //
+// mutation of the latch fails. The trap's entry must also PRESERVE M (only interrupts             //
+// clear it), checked on the live SR at the end.                                                    //
+//                                                                          //
 // Word layout (PC_RESET-relative), with each phase's register reuse noted --            //
 // D0-D6 all get distinct MOVEC source values in phase 1; phase 3/4's poison/target/          //
 // handler markers deliberately reuse those SAME registers with FRESH, DISTINCT               //
@@ -62,15 +72,23 @@
 //                                                                          //
 //  Privilege-violation handler @ byte $500 (word idx 128, well clear of both     //
 //  the program above and the vector table's own word-index range):               //
-//    MOVEQ #$99,D5      (marker: D5 must become $FFFFFF99 -- $99 sign-extends; was $60) //
-//    NOP (drain)                                                                    //
+//    128:     MOVEQ #$99,D5      (marker: D5 must become $FFFFFF99 -- $99 sign-extends; was $60) //
+//    129-130: MOVE.W #$3000,D0   (S=1, M=1)                                          //
+//    131:     MOVE D0,SR         (A7 now banks to MSP)                                //
+//    132:     TRAP #1            (frame on MSP: $60 -> $58; PC field = $50A; vector 33) //
+//    133:     MOVEQ #$66,D7      (poison C: D7 must STAY $40)                          //
+//    134:     NOP                                                                       //
+//                                                                          //
+//  TRAP #1 handler @ byte $600 (word idx 256):                              //
+//    MOVEQ #$55,D6      (marker: D6 must become $55; was $50)                //
+//    NOP (drain)                                                            //
 //--------------------------------------------------------------------------//
 
 `timescale 1ns/1ps
 
 module tb_ap040_pipe_sup;
 
-localparam PROG_WORDS      = 40;
+localparam PROG_WORDS      = 48;
 localparam [31:0] PC_RESET = 32'h0000_0400;
 
 reg clk = 0;
@@ -78,6 +96,20 @@ reg nreset = 0;
 reg ce = 1;
 
 always #5 clk = ~clk;
+
+`ifdef AP040_PIPE_CE_RANDOM
+// A pseudo-random clock enable (milestone 94). Every bench in this suite
+// tied ce high, and eight of the thirteen defects three rounds of external
+// review found lived behind that: a cycle with ce low is a cycle that did
+// not happen, and the core has to treat it that way. Driven on the falling
+// edge so it is stable across every rising one, and left high until reset
+// releases so the reset sequence itself is unchanged.
+reg [15:0] ce_lfsr = 16'hACE1;
+always @(negedge clk) if (nreset) begin
+	ce_lfsr <= {ce_lfsr[14:0], ce_lfsr[15] ^ ce_lfsr[13] ^ ce_lfsr[12] ^ ce_lfsr[10]};
+	ce      <= ce_lfsr[0];
+end
+`endif
 
 wire        dbg_if_valid,  dbg_id_valid,  dbg_eac_valid;
 wire        dbg_eaf_valid, dbg_ex_valid,  dbg_wb_valid;
@@ -93,6 +125,7 @@ ap040_pipe_core #(
 	.PROG_WORDS(PROG_WORDS)
 ) dut
 (
+	.irq_lvl (3'd0),   // no interrupt source in this bench
 	.clk (clk),
 	.nreset (nreset),
 	.ce  (ce),
@@ -137,15 +170,30 @@ initial begin
 	dut.u_l1.mem[29] = 16'h4E7B;  dut.u_l1.mem[30] = 16'h0801;  // MOVEC D0,VBR (D0=0)
 	dut.u_l1.mem[31] = 16'h7888;  // MOVEQ #$88,D4 (poison B: must not run)
 
-	// Privilege-violation handler @ word idx 128 (byte $500).
+	// Privilege-violation handler @ word idx 128 (byte $500), continuing
+	// into phase 5: set M, then trap onto the master stack.
 	dut.u_l1.mem[128] = 16'h7A99; // MOVEQ #$99,D5
-	dut.u_l1.mem[129] = 16'h4E71; // NOP (drain)
+	dut.u_l1.mem[129] = 16'h303C;  dut.u_l1.mem[130] = 16'h3000; // MOVE.W #$3000,D0
+	dut.u_l1.mem[131] = 16'h46C0; // MOVE D0,SR (S=1, M=1)
+	dut.u_l1.mem[132] = 16'h4E41; // TRAP #1
+	dut.u_l1.mem[133] = 16'h7E66; // MOVEQ #$66,D7 (poison C: must not run)
+	dut.u_l1.mem[134] = 16'h4E71; // NOP
 
-	// Vector table: vector 8 (privilege violation) -> $500. Word index
-	// computed the same PC_RESET-relative-wraparound way every exception
-	// test since milestone 14 has used -- see ap040_ea_fetch.v's header.
-	dut.u_l1.mem[3600] = 16'h0000;
-	dut.u_l1.mem[3601] = 16'h0500;
+	// TRAP #1 handler @ word idx 256 (byte $600).
+	dut.u_l1.mem[256] = 16'h7C55; // MOVEQ #$55,D6
+	dut.u_l1.mem[257] = 16'h4E71; // NOP (drain)
+
+	// Vector table at VBR = $40, which the program sets first (milestone 117):
+	// vector n at byte $40 + 4n, word index (($40 + 4n - $400) mod $2000) / 2
+	// = 3616 + 2n. This bench used to put its entries at 4n, the table at 0,
+	// and passed only because the core fetched vectors without VBR; with the
+	// entries at VBR they prove the base is used.
+	// Vector 8 (privilege violation) -> $500: byte $60.
+	dut.u_l1.mem[3632] = 16'h0000;
+	dut.u_l1.mem[3633] = 16'h0500;
+	// Vector 33 (TRAP #1) -> $600: byte $C4.
+	dut.u_l1.mem[3682] = 16'h0000;
+	dut.u_l1.mem[3683] = 16'h0600;
 end
 
 initial begin
@@ -154,33 +202,31 @@ initial begin
 	nreset = 1;
 	@(posedge clk);
 
-	repeat (PROG_WORDS + 100) @(posedge clk);
+	repeat ((PROG_WORDS + 100) * `AP040_PIPE_WAIT_SCALE) @(posedge clk);
 
 	// ---------------------------------------------- Phase 1: MOVEC writes
-	if (dut.vbr !== 32'h0000_0040) begin
+	if (dut.u_cpu.vbr !== 32'h0000_0040) begin
 		errors = errors + 1;
-		$display("FAIL: VBR = %h, expected 00000040", dut.vbr);
+		$display("FAIL: VBR = %h, expected 00000040", dut.u_cpu.vbr);
 	end
-	if (dut.cacr !== 32'h8000_8000) begin
+	if (dut.u_cpu.cacr !== 32'h8000_8000) begin
 		errors = errors + 1;
-		$display("FAIL: CACR = %h, expected 80008000 (0xFFFFFFFF masked & 32'h8000_8000)", dut.cacr);
+		$display("FAIL: CACR = %h, expected 80008000 (0xFFFFFFFF masked & 32'h8000_8000)", dut.u_cpu.cacr);
 	end
-	if (dut.sfc !== 3'd3) begin
+	if (dut.u_cpu.sfc !== 3'd3) begin
 		errors = errors + 1;
-		$display("FAIL: SFC = %0d, expected 3", dut.sfc);
+		$display("FAIL: SFC = %0d, expected 3", dut.u_cpu.sfc);
 	end
-	if (dut.dfc !== 3'd5) begin
+	if (dut.u_cpu.dfc !== 3'd5) begin
 		errors = errors + 1;
-		$display("FAIL: DFC = %0d, expected 5", dut.dfc);
+		$display("FAIL: DFC = %0d, expected 5", dut.u_cpu.dfc);
 	end
 	// ISP: written to $70 here, then decremented by phase 4's exception
 	// frame (-8) at the very end -- checked at its FINAL value below, not
 	// here, to avoid asserting a value this same test later legitimately
 	// changes.
-	if (dut.u_regfile.msp !== 32'h0000_0060) begin
-		errors = errors + 1;
-		$display("FAIL: MSP = %h, expected 00000060", dut.u_regfile.msp);
-	end
+	// MSP: written to $60 here, then decremented by phase 5's TRAP frame
+	// (-8) -- checked at its final value below, same reasoning as ISP.
 	// USP: written to $50 here, then decremented by phase 3's BSR push
 	// (-4) -- same "check the final value" reasoning as ISP above.
 
@@ -205,9 +251,9 @@ initial begin
 		errors = errors + 1;
 		$display("FAIL: D3 = %h, expected 00000077 (target A did not run -- BSR broken in user mode)", dbg_d3);
 	end
-	if (dut.u_regfile.usp !== 32'h0000_004C) begin
+	if (dut.u_cpu.u_regfile.usp !== 32'h0000_004C) begin
 		errors = errors + 1;
-		$display("FAIL: USP = %h, expected 0000004c (BSR's push, in user mode, must decrement USP by 4 from $50)", dut.u_regfile.usp);
+		$display("FAIL: USP = %h, expected 0000004c (BSR's push, in user mode, must decrement USP by 4 from $50)", dut.u_cpu.u_regfile.usp);
 	end
 	// The pushed return address, read directly out of the L1 array at
 	// USP-4 = $4C, same style every push-verifying test already uses.
@@ -233,20 +279,20 @@ initial begin
 	end
 	// VBR must be UNCHANGED by the faulted MOVEC (it never executes its
 	// real effect) -- still $40 from phase 1, not $00.
-	if (dut.vbr !== 32'h0000_0040) begin
+	if (dut.u_cpu.vbr !== 32'h0000_0040) begin
 		errors = errors + 1;
-		$display("FAIL: VBR = %h after the faulted MOVEC, expected 00000040 (unchanged -- the write must never have happened)", dut.vbr);
+		$display("FAIL: VBR = %h after the faulted MOVEC, expected 00000040 (unchanged -- the write must never have happened)", dut.u_cpu.vbr);
 	end
 	// The critical check this test exists for: the exception frame must
 	// land on the SUPERVISOR stack (ISP, $70->$68), NOT on USP -- which
 	// must stay EXACTLY where phase 3 left it, completely unperturbed.
-	if (dut.u_regfile.isp !== 32'h0000_0068) begin
+	if (dut.u_cpu.u_regfile.isp !== 32'h0000_0068) begin
 		errors = errors + 1;
-		$display("FAIL: ISP = %h, expected 00000068 (privilege-violation frame must decrement ISP by 8 from $70, even though the fault occurred IN USER MODE)", dut.u_regfile.isp);
+		$display("FAIL: ISP = %h, expected 00000068 (privilege-violation frame must decrement ISP by 8 from $70, even though the fault occurred IN USER MODE)", dut.u_cpu.u_regfile.isp);
 	end
-	if (dut.u_regfile.usp !== 32'h0000_004C) begin
+	if (dut.u_cpu.u_regfile.usp !== 32'h0000_004C) begin
 		errors = errors + 1;
-		$display("FAIL: USP = %h after the privilege violation, expected 0000004c (must be COMPLETELY unperturbed by an exception frame that has nothing to do with the user stack)", dut.u_regfile.usp);
+		$display("FAIL: USP = %h after the privilege violation, expected 0000004c (must be COMPLETELY unperturbed by an exception frame that has nothing to do with the user stack)", dut.u_cpu.u_regfile.usp);
 	end
 	// Frame @ ISP-8=$68 (word idx $0F4/$0F6): SR=$0000 (the OLD, pre-fault
 	// live SR -- S=0, everything else 0), PC=$0000043A (the faulting
@@ -268,6 +314,46 @@ initial begin
 	if (dbg_sr[13] !== 1'b1) begin
 		errors = errors + 1;
 		$display("FAIL: SR.S = %b after the privilege-violation handler entry, expected 1 (exceptions always enter supervisor mode)", dbg_sr[13]);
+	end
+
+	// ------------------------------------ Phase 5: a frame on the master stack
+	if (dbg_d6 !== 32'h0000_0055) begin
+		errors = errors + 1;
+		$display("FAIL: D6 = %h, expected 00000055 (TRAP #1 handler did not run)", dbg_d6);
+	end
+	if (dbg_d7 !== 32'h0000_0040) begin
+		errors = errors + 1;
+		$display("FAIL: D7 = %h, expected 00000040 (poison C ran -- TRAP #1 did not redirect)", dbg_d7);
+	end
+	// The check this phase exists for: with M set, the frame goes on MSP
+	// ($60 -> $58) and ISP is untouched (still $68 from phase 4). A
+	// sequencer that ignores M puts it at ISP-8 = $60 and leaves MSP alone.
+	if (dut.u_cpu.u_regfile.msp !== 32'h0000_0058) begin
+		errors = errors + 1;
+		$display("FAIL: MSP = %h, expected 00000058 (TRAP #1 with M=1 must decrement MSP by 8 from $60)", dut.u_cpu.u_regfile.msp);
+	end
+	if (dut.u_cpu.u_regfile.isp !== 32'h0000_0068) begin
+		errors = errors + 1;
+		$display("FAIL: ISP = %h after the TRAP #1 with M=1, expected 00000068 (the frame belongs on MSP, not ISP)", dut.u_cpu.u_regfile.isp);
+	end
+	// Frame @ MSP-8=$58 (word idx $E2C..$E2F): SR=$3000 (S=1, M=1 as set),
+	// PC=$0000050A (TRAP stacks the FOLLOWING instruction), FmtVec=$0084
+	// (format 0, vector 33 -> 33*4=$84).
+	if (dut.u_l1.mem[16'h0E2C] !== 16'h3000 || dut.u_l1.mem[16'h0E2D] !== 16'h0000) begin
+		errors = errors + 1;
+		$display("FAIL: trap frame word0 (SR:PChi) = %h%h, expected 30000000",
+		          dut.u_l1.mem[16'h0E2C], dut.u_l1.mem[16'h0E2D]);
+	end
+	if (dut.u_l1.mem[16'h0E2E] !== 16'h050A || dut.u_l1.mem[16'h0E2F] !== 16'h0084) begin
+		errors = errors + 1;
+		$display("FAIL: trap frame word1 (PClo:FmtVec) = %h%h, expected 050A0084",
+		          dut.u_l1.mem[16'h0E2E], dut.u_l1.mem[16'h0E2F]);
+	end
+	// A trap entry preserves M (only an interrupt clears it): the live SR
+	// in the TRAP handler must still have M=1, S=1.
+	if (dbg_sr[13:12] !== 2'b11) begin
+		errors = errors + 1;
+		$display("FAIL: SR[13:12] = %b after the TRAP #1 entry, expected 11 (S set, M preserved)", dbg_sr[13:12]);
 	end
 
 	if (errors == 0)

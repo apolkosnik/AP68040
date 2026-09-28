@@ -20,6 +20,20 @@ reg ce = 1;
 
 always #5 clk = ~clk;
 
+`ifdef AP040_PIPE_CE_RANDOM
+// A pseudo-random clock enable (milestone 94). Every bench in this suite
+// tied ce high, and eight of the thirteen defects three rounds of external
+// review found lived behind that: a cycle with ce low is a cycle that did
+// not happen, and the core has to treat it that way. Driven on the falling
+// edge so it is stable across every rising one, and left high until reset
+// releases so the reset sequence itself is unchanged.
+reg [15:0] ce_lfsr = 16'hACE1;
+always @(negedge clk) if (nreset) begin
+	ce_lfsr <= {ce_lfsr[14:0], ce_lfsr[15] ^ ce_lfsr[13] ^ ce_lfsr[12] ^ ce_lfsr[10]};
+	ce      <= ce_lfsr[0];
+end
+`endif
+
 wire        dbg_if_valid,  dbg_id_valid,  dbg_eac_valid;
 wire        dbg_eaf_valid, dbg_ex_valid,  dbg_wb_valid;
 wire [31:0] dbg_if_pc,     dbg_id_pc,     dbg_eac_pc;
@@ -30,6 +44,7 @@ ap040_pipe_core #(
 	.PROG_WORDS(PROG_WORDS)
 ) dut
 (
+	.irq_lvl (3'd0),   // no interrupt source in this bench
 	.clk (clk),
 	.nreset (nreset),
 	.ce  (ce),
@@ -102,11 +117,16 @@ always @(posedge clk) begin
 		end
 	end
 
-	p_if_valid  <= dbg_if_valid;  p_if_pc  <= dbg_if_pc;
-	p_id_valid  <= dbg_id_valid;  p_id_pc  <= dbg_id_pc;
-	p_eac_valid <= dbg_eac_valid; p_eac_pc <= dbg_eac_pc;
-	p_eaf_valid <= dbg_eaf_valid; p_eaf_pc <= dbg_eaf_pc;
-	p_ex_valid  <= dbg_ex_valid;  p_ex_pc  <= dbg_ex_pc;
+	// The snapshot is of the previous ENABLED edge, not the previous edge.
+	// Taken unconditionally it advanced on cycles the core did not, and
+	// every stage then looked one instruction out of step (milestone 94).
+	if (nreset && ce) begin
+		p_if_valid  <= dbg_if_valid;  p_if_pc  <= dbg_if_pc;
+		p_id_valid  <= dbg_id_valid;  p_id_pc  <= dbg_id_pc;
+		p_eac_valid <= dbg_eac_valid; p_eac_pc <= dbg_eac_pc;
+		p_eaf_valid <= dbg_eaf_valid; p_eaf_pc <= dbg_eaf_pc;
+		p_ex_valid  <= dbg_ex_valid;  p_ex_pc  <= dbg_ex_pc;
+	end
 end
 
 // PC sequencing check: IF must issue PC_RESET, PC_RESET+2, ... in order,
@@ -129,7 +149,7 @@ initial begin
 
 	// Long enough for all PROG_WORDS instructions to clear all 6 stages
 	// (PROG_WORDS + 6 cycles) plus margin.
-	repeat (PROG_WORDS + 20) @(posedge clk);
+	repeat ((PROG_WORDS + 20) * `AP040_PIPE_WAIT_SCALE) @(posedge clk);
 
 	if (expect_idx !== PROG_WORDS) begin
 		errors = errors + 1;

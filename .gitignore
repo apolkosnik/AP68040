@@ -3,3 +3,4 @@ tb/build/
 *.vvp
 *.hex
 *.bin
+__pycache__/

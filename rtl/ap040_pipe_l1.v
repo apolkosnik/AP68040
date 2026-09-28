@@ -16,7 +16,15 @@
 // interface is meant to be 32-bit-native (the original plan's section 1: a  //
 // clean 32-bit request/response internally, with any 16-bit-bus splitting   //
 // left to a future host adapter, not built into the core itself).           //
-// address_b addresses the HIGH word of a longword; the low word is          //
+// PORT B IS SIZED (milestone 86): it carries a byte address and a size,     //
+// and this module does every bit of placement -- right-aligned on the way   //
+// out, placed from the address on the way in, at any alignment. Until then  //
+// it returned "the 32 bits containing the address" and the CPU picked lanes //
+// out of that, which cannot express a Long at an odd address: those bytes   //
+// span THREE words, and no single 32-bit window holds them.                 //
+//                                                                          //
+// The old shape, for the record:                                            //
+// address_b addressed the HIGH word of a longword; the low word was         //
 // implicitly address_b+1, big-endian/high-word-first, the same word order   //
 // ap040_decode.v's Bcc.L gather and rtl_old's bus16 adapter both already     //
 // use. wren_b/data_b are wired for a future store instruction (MOVE.L       //
@@ -162,75 +170,260 @@
 
 `include "ap040_pipe_defs.svh"
 
+// Request/return handshake (milestone 80). Both ports are REQUESTED (en_a,
+// rd_b) and RETURN with a valid (rvalid_a, rvalid_b); the data and its valid
+// hold until the next accepted request on that port. Without
+// AP040_PIPE_L1_SLOW every read returns the cycle after its request and the
+// write buffer drains the cycle after a post -- the timing every stage was
+// built against. With it, a deterministic xorshift adds 0-3 cycles to each
+// read and 0-3 to each drain, so the same benches prove the requesters wait
+// for the return rather than assume it. Port A accepts a new request while
+// one is in flight (a redirect abandons the fetch); port B may not, and the
+// slow model says ERROR if it happens.
 module ap040_pipe_l1
 #(
 	parameter AW = 12,   // word address width -> 2**AW words of storage
-	parameter DW = 16    // word width
+	parameter DW = 16,   // word width
+	// Both ports take a 32-bit BYTE address (milestone 81); this module maps
+	// it to its own storage, which is a window of 2**AW words starting at
+	// PC_RESET.
+	parameter [31:0] PC_RESET = 32'h0000_0400
 )
 (
 	input                clock,
 	input                nreset,   // see header -- resets wbuf_valid only
-
-	input      [AW-1:0]  address_a,
+	// port A: instruction fetch, 16-bit reads, always even
+	input      [31:0]    address_a,
 	input      [DW-1:0]  data_a,
 	input                wren_a,
-	input                en_a,     // see header -- must match the requester's own stall
+	input                en_a,      // request; the requester holds address_a until rvalid_a
 	output reg [DW-1:0]  q_a,
-
-	// port B: 32-bit, addresses the HIGH word; low word is address_b+1 -- see
-	// header comment.
-	input      [AW-1:0]  address_b,
-	input       [31:0]   data_b,
+	output reg [DW-1:0]  q_a2,      // the word after q_a (phase 8)
+	output reg           rvalid_a,
+	// port B: sized data accesses at any alignment (milestone 86)
+	input      [31:0]    address_b,
+	input      [31:0]    data_b,    // right-aligned by size_b
 	input                wren_b,
-	output               wr_busy,   // see header -- hold wren_b/address_b/data_b while high
-	output reg  [31:0]   q_b
+	input       [1:0]    size_b,    // AP040_SZ_B/W/L
+	input                rd_b,
+	output               wr_busy,
+	output reg  [31:0]   q_b,       // right-aligned by size_b
+	output reg           rvalid_b
 );
 
 reg [DW-1:0] mem [0:(1<<AW)-1];
-
 integer i;
 initial for (i = 0; i < (1<<AW); i = i + 1) mem[i] = `AP040_OP_NOP;
 
-wire [AW-1:0] address_b_lo = address_b + {{(AW-1){1'b0}}, 1'b1};
+// The window map. Only the low AW+1 bits of the difference survive the shift
+// and the truncation, and a borrow only ever propagates upward, so this is a
+// narrow subtract and is written as one -- spelled as a 32-bit subtract it
+// sits after ap040_pipe_cpu.v's port-B mux and costs a nanosecond on the
+// critical spine (the fit after milestone 81 measured it).
+wire [AW:0] ia_full = address_a[AW:0] - PC_RESET[AW:0];
+wire [AW:0] ib_full = address_b[AW:0] - PC_RESET[AW:0];
+wire [AW-1:0] ia = ia_full[AW:1];
+wire [AW-1:0] ib = ib_full[AW:1];
+// PC_RESET is even, so the byte within the word is the address's own bit 0.
+wire          ob = address_b[0];
 
-// Posted write buffer -- see header.
+// One-entry write buffer (see header), now holding a sized value rather than
+// a lane mask.
 reg              wbuf_valid;
 reg [AW-1:0]     wbuf_addr;
+reg              wbuf_odd;
+reg  [1:0]       wbuf_size;
 reg [31:0]       wbuf_data;
+reg [1:0]        wbuf_hold;    // extra drain cycles left (slow model only)
+// Busy only while the buffered write is still being held: in the cycle it
+// drains, the next one is taken in its place (restructuring plan, phase 5),
+// so a run of stores is one per cycle.
+assign wr_busy = wbuf_valid && (wbuf_hold != 2'd0);
 
-wire [AW-1:0] wbuf_addr_lo = wbuf_addr + {{(AW-1){1'b0}}, 1'b1};
+// Latency model. In the normal build every extra count is zero and the
+// xorshift is optimised away.
+`ifdef AP040_PIPE_L1_SLOW
+reg [15:0] lfsr;
+wire [15:0] lfsr_next = {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
+wire [1:0] extra_a = lfsr[1:0];
+wire [1:0] extra_b = lfsr[5:4];
+wire [1:0] extra_w = lfsr[9:8];
+`else
+wire [1:0] extra_a = 2'd0;
+wire [1:0] extra_b = 2'd0;
+wire [1:0] extra_w = 2'd0;
+`endif
 
-assign wr_busy = wbuf_valid;
+// Port A: one request in flight; a new request restarts it.
+reg          a_busy;
+reg [1:0]    a_cnt;
+reg [AW-1:0] a_addr;
 
-// A read this cycle whose address matches the still-undrained buffered
-// write must see the buffered value, not stale mem[] content -- see header.
-wire wbuf_hits_read = wbuf_valid && (wbuf_addr == address_b);
+// Port B: one request in flight. A read never overtakes a buffered write --
+// it waits for the drain instead of forwarding round it (milestone 86). The
+// forward could only ever answer an exactly-matching access, and with sizes
+// and alignment in play "matching" stops being a comparison; draining first
+// gives the same answer for every overlap, and is what ap040_pipe_membus.v
+// does on the bus side, so the two memories now order accesses alike.
+reg          b_busy;
+reg [1:0]    b_cnt;
+reg [AW-1:0] b_addr;
+reg          b_odd;
+reg  [1:0]   b_size;
+
+function [31:0] read_at;
+	input [AW-1:0] a;
+	input          odd;
+	input   [1:0]  sz;
+	begin
+		case (sz)
+		`AP040_SZ_B: read_at = {24'd0, odd ? mem[a][7:0] : mem[a][15:8]};
+		`AP040_SZ_W: read_at = odd ? {16'd0, mem[a][7:0], mem[a + {{(AW-1){1'b0}}, 1'b1}][15:8]}
+		                           : {16'd0, mem[a]};
+		default:     read_at = odd ? {mem[a][7:0],
+		                              mem[a + {{(AW-1){1'b0}}, 1'b1}],
+		                              mem[a + {{(AW-2){1'b0}}, 2'b10}][15:8]}
+		                           : {mem[a], mem[a + {{(AW-1){1'b0}}, 1'b1}]};
+		endcase
+	end
+endfunction
+
+wire [AW-1:0] wb1 = wbuf_addr + {{(AW-1){1'b0}}, 1'b1};
+wire [AW-1:0] wb2 = wbuf_addr + {{(AW-2){1'b0}}, 2'b10};
+
+// Port A never reads a word a write has not yet put in the array (2026-09-25,
+// found by tb_ap040_pipe_program_local's t_integer 192). A store into the
+// instruction stream raises a refetch in the cycle the write is accepted,
+// and that refetch's read went to the array a cycle before the buffered write
+// did: it fetched the old instruction again. ap040_pipe_membus.v sends writes
+// before fetches, so the bus tops never could. A fetch whose words the
+// buffered write, or the one being accepted, covers now waits for the drain,
+// as port B's reads do; any other fetch goes ahead.
+function covers;
+	input [AW-1:0] wa;      // the write's first word
+	input          odd;
+	input    [1:0] sz;
+	input [AW-1:0] fa;      // the fetch's word; the one after it is read too
+	reg   [AW-1:0] d;
+	begin
+		d = fa - wa;
+		covers = (d == {AW{1'b0}}) ||                                           // fa itself
+		         (d == {AW{1'b1}}) ||                                           // fa+1 is wa
+		         ((d == {{(AW-1){1'b0}}, 1'b1}) && (sz == `AP040_SZ_L || (sz == `AP040_SZ_W && odd))) ||
+		         ((d == {{(AW-2){1'b0}}, 2'b10}) && (sz == `AP040_SZ_L) && odd);
+	end
+endfunction
+wire          wr_acc = wren_b && !wr_busy;
+wire          a_wait_new = (wbuf_valid && covers(wbuf_addr, wbuf_odd, wbuf_size, ia)) ||
+                           (wr_acc && covers(ib, ob, size_b, ia));
+wire          a_wait_old = (wbuf_valid && covers(wbuf_addr, wbuf_odd, wbuf_size, a_addr)) ||
+                           (wr_acc && covers(ib, ob, size_b, a_addr));
+
 
 always @(posedge clock) begin
+`ifdef AP040_PIPE_L1_SLOW
+	if (!nreset) lfsr <= 16'hACE1;
+	else if (en_a || rd_b || wren_b) lfsr <= lfsr_next;
+`endif
+
+	// ---- port A ----
 	if (en_a) begin
-		if (wren_a) mem[address_a] <= data_a;
-		q_a <= mem[address_a];
+		if (wren_a) mem[ia] <= data_a;
+		a_addr   <= ia;
+		a_cnt    <= extra_a;
+		a_busy   <= 1'b1;
+		rvalid_a <= 1'b0;
+	end else if (a_busy) begin
+		if (a_cnt == 2'd0) begin
+			if (!a_wait_old) begin
+				q_a      <= mem[a_addr];
+				q_a2     <= mem[a_addr + {{(AW-1){1'b0}}, 1'b1}];
+				rvalid_a <= 1'b1;
+				a_busy   <= 1'b0;
+			end
+		end else
+			a_cnt <= a_cnt - 2'd1;
+	end
+	if (en_a && extra_a == 2'd0 && !a_wait_new) begin
+		q_a      <= mem[ia];
+		q_a2     <= mem[ia + {{(AW-1){1'b0}}, 1'b1}];
+		rvalid_a <= 1'b1;
+		a_busy   <= 1'b0;
 	end
 
+	// ---- port B read ----
+	if (rd_b) begin
+`ifdef AP040_PIPE_L1_SLOW
+		if (b_busy) $display("ERROR: ap040_pipe_l1 port B read issued while one is in flight");
+`endif
+		b_addr   <= ib;
+		b_odd    <= ob;
+		b_size   <= size_b;
+		b_cnt    <= extra_b;
+		b_busy   <= 1'b1;
+		rvalid_b <= 1'b0;
+	end else if (b_busy && !wbuf_valid) begin
+		if (b_cnt == 2'd0) begin
+			q_b      <= read_at(b_addr, b_odd, b_size);
+			rvalid_b <= 1'b1;
+			b_busy   <= 1'b0;
+		end else
+			b_cnt <= b_cnt - 2'd1;
+	end
+	if (rd_b && extra_b == 2'd0 && !wbuf_valid) begin
+		q_b      <= read_at(ib, ob, size_b);
+		rvalid_b <= 1'b1;
+		b_busy   <= 1'b0;
+	end
+
+	// ---- port B write buffer ----
 	if (!nreset) begin
 		wbuf_valid <= 1'b0;
+		wbuf_hold  <= 2'd0;
 	end else begin
-		// Drain takes priority over accepting a new post: a write already
-		// posted must land before a new one can be buffered (only one
-		// entry deep -- see header, including the exact worst-case wait
-		// this ordering implies).
 		if (wbuf_valid) begin
-			mem[wbuf_addr]    <= wbuf_data[31:16];
-			mem[wbuf_addr_lo] <= wbuf_data[15:0];
-			wbuf_valid        <= 1'b0;
-		end else if (wren_b) begin
+			if (wbuf_hold == 2'd0) begin
+				case (wbuf_size)
+				`AP040_SZ_B: begin
+					if (wbuf_odd) mem[wbuf_addr][7:0]  <= wbuf_data[7:0];
+					else          mem[wbuf_addr][15:8] <= wbuf_data[7:0];
+				end
+				`AP040_SZ_W: begin
+					if (wbuf_odd) begin
+						mem[wbuf_addr][7:0] <= wbuf_data[15:8];
+						mem[wb1][15:8]      <= wbuf_data[7:0];
+					end else
+						mem[wbuf_addr] <= wbuf_data[15:0];
+				end
+				default: begin
+					if (wbuf_odd) begin
+						mem[wbuf_addr][7:0] <= wbuf_data[31:24];
+						mem[wb1]            <= wbuf_data[23:8];
+						mem[wb2][15:8]      <= wbuf_data[7:0];
+					end else begin
+						mem[wbuf_addr] <= wbuf_data[31:16];
+						mem[wb1]       <= wbuf_data[15:0];
+					end
+				end
+				endcase
+				wbuf_valid <= 1'b0;
+			end else
+				wbuf_hold <= wbuf_hold - 2'd1;
+		end
+		if (wren_b && !wr_busy) begin
 			wbuf_valid <= 1'b1;
-			wbuf_addr  <= address_b;
+			wbuf_addr  <= ib;
+			wbuf_odd   <= ob;
+			wbuf_size  <= size_b;
 			wbuf_data  <= data_b;
+			wbuf_hold  <= extra_w;
 		end
 	end
 
-	q_b <= wbuf_hits_read ? wbuf_data : {mem[address_b], mem[address_b_lo]};
+	if (!nreset) begin
+		a_busy <= 1'b0; rvalid_a <= 1'b0;
+		b_busy <= 1'b0; rvalid_b <= 1'b0;
+	end
 end
 
 endmodule

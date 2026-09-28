@@ -17,8 +17,8 @@
 //                                                                          //
 // The whole unit advances only when ce (clkena) is high. Table searches    //
 // are plain read/write cycles (not bus locked): this fabric has a single   //
-// CPU master. Invalid translations are not cached, so a descriptor fixed   //
-// by a handler takes effect even without a PFLUSH.                         //
+// CPU master. Failed searches install nonresident ATC entries; repairing   //
+// a descriptor requires PFLUSH/PTEST before that entry can be used again.  //
 //--------------------------------------------------------------------------//
 
 `include "ap040_defs.svh"
@@ -181,9 +181,47 @@ wire hit0 = lk_fresh && atc_v[{l_row, 2'd0}] && (a_w0[44:28] == l_tag);
 wire hit1 = lk_fresh && atc_v[{l_row, 2'd1}] && (a_w1[44:28] == l_tag);
 wire hit2 = lk_fresh && atc_v[{l_row, 2'd2}] && (a_w2[44:28] == l_tag);
 wire hit3 = lk_fresh && atc_v[{l_row, 2'd3}] && (a_w3[44:28] == l_tag);
-wire atc_hit = hit0 | hit1 | hit2 | hit3;
+wire pipe_hit = hit0 | hit1 | hit2 | hit3;
+wire [EW-1:0] pipe_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
 
-wire [EW-1:0] h_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
+// Retain the most recent hit in each address space (MacQuadra800 AP68040).
+// Repeated accesses to a page need not wait for another synchronous RAM
+// lookup. Copy the WHOLE entry: nonresident, protection, cache mode and M
+// still pass through the ordinary fault/walk decision below. These are
+// expendable copies of the ATC, not another independently managed TLB.
+// Capture only at a core tick, when the request can complete. Unlike the
+// RAM lookup pipe these registers belong to the SDC's tick-gated class.
+reg          u_valid [0:1];
+reg    [4:0] u_row   [0:1];
+reg   [16:0] u_tag   [0:1];
+reg [EW-1:0] u_ent   [0:1];
+reg   [31:0] u_tc;
+integer ui;
+wire u_clear = fill_we || sweep_on || pf_req || pt_req || (tc != u_tc);
+always @(posedge clk) begin
+	if (!nreset) begin
+		u_tc <= 0;
+		for (ui = 0; ui < 2; ui = ui + 1) u_valid[ui] <= 0;
+	end
+	else if (ce) begin
+		u_tc <= tc;
+		if (u_clear) begin
+			for (ui = 0; ui < 2; ui = ui + 1) u_valid[ui] <= 0;
+		end
+		else if (pipe_hit) begin
+			u_valid[l_row[4]] <= 1;
+			u_row[l_row[4]] <= l_row;
+			u_tag[l_row[4]] <= l_tag;
+			u_ent[l_row[4]] <= pipe_ent;
+		end
+	end
+end
+// Invalidate combinational use as well as the stored valid bit: a TC or
+// maintenance change must take effect before the next core tick.
+wire u_hit = nreset && !u_clear && u_valid[c_instr] &&
+             (u_row[c_instr] == a_row) && (u_tag[c_instr] == a_tag);
+wire atc_hit = u_hit || pipe_hit;
+wire [EW-1:0] h_ent = u_hit ? u_ent[c_instr] : pipe_ent;
 wire        h_r    = h_ent[45];
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
@@ -204,6 +242,14 @@ wire ttr_hit   = ttr_hit_a | ttr_hit_b;
 wire ttr_w     = ttr_hit_a ? ttra[2]   : ttrb[2];
 wire [1:0] ttr_cm = ttr_hit_a ? ttra[6:5] : ttrb[6:5];
 
+// MOVES to an alternate address space -- SFC/DFC $0, $3, $4 or $7 -- is
+// "immediately used as a physical address without translation" (MC68040UM
+// 3.2, Table 3-2): no ATC lookup, no table search, no protection, and so no
+// MMU fault; cache-inhibited here. MOVES to $2 or $6 is a data reference
+// in $1 or $5, translated as any data access, and goes on the bus as one.
+wire a_alt   = !c_instr && ((c_fc[1:0] == 2'b00) || (c_fc[1:0] == 2'b11));
+wire xl_skip = ttr_hit || a_alt;   // the address is already physical
+
 // PTEST uses DFC to select supervisor/user and instruction/data space.
 wire        pt_instr = (pt_fc[1:0] == 2'b10);
 wire [31:0] pt_ttra  = pt_instr ? itt0 : dtt0;
@@ -217,19 +263,19 @@ wire        pt_ttr_w = pt_ttr_a ? pt_ttra[2] : pt_ttrb[2];
 // translation decision
 //---------------------------------------------------------------------------
 
-wire ttr_fault = ttr_hit && c_write && ttr_w;
-wire atc_fault = tc_e && !ttr_hit && atc_hit &&
+wire ttr_fault = ttr_hit && !a_alt && c_write && ttr_w;
+wire atc_fault = tc_e && !xl_skip && atc_hit &&
                  (!h_r || (c_write && h_w) || (!a_super && h_s));
 // write to a clean page runs a table search to set the M bit
 wire atc_mmiss = atc_hit && h_r && c_write && !h_m && !h_w;
 
-// lk_fresh gates atc_hit, so a walk is only started once the piped row
-// has been judged against the live request
-wire need_walk = tc_e && !ttr_hit && lk_fresh && (!atc_hit || atc_mmiss) &&
+// A copied hit is already a translation verdict; a miss still waits for
+// the synchronous lookup before starting a table walk.
+wire need_walk = tc_e && !xl_skip && (lk_fresh || u_hit) && (!atc_hit || atc_mmiss) &&
                  !atc_fault;
 
 wire [31:0] pa_out =
-	ttr_hit ? c_addr :
+	xl_skip ? c_addr :
 	(tc_e && atc_hit) ? (tc_p ? {h_pa[19:1], c_addr[12], c_addr[11:0]}
 	                          : {h_pa, c_addr[11:0]})
 	: c_addr;
@@ -256,6 +302,11 @@ localparam W_DROP = 4'd11;
 reg  [3:0] wst;
 reg        w_issued;
 reg        w_pt;
+// Set with w_pt when the probe is the CORE's internal write-permission check
+// (pt_access) rather than an architectural PTEST.  It only suppresses the M
+// history bit: an internal check must not mark a page modified for a write
+// that may never happen, and a CAS2 whose comparison fails performs none.
+reg        w_acc;
 reg [31:0] w_la;
 reg        w_super, w_write, w_user;
 reg [31:0] w_desc_addr;
@@ -329,7 +380,7 @@ dpram #(5, ROWW) atc_ram
 
 // PTESTW has ordinary table-search history side effects only when the
 // probed write is permitted.  A failed probe still reports W/S in MMUSR.
-wire w_hist_m = w_write &&
+wire w_hist_m = w_write && !w_acc &&
                   (!w_pt || (!(w_wp || w_desc[2]) &&
                              !(w_user && w_desc[7])));
 wire w_denied = !w_pt && ((w_user && w_desc[7]) ||
@@ -343,7 +394,7 @@ wire w_denied = !w_pt && ((w_user && w_desc[7]) ||
 // is fresh: with a stale pipe need_walk/atc_fault are still low and the
 // request would otherwise pass untranslated.
 wire pass_ok = c_req && !c_flt && !need_walk && !ttr_fault && !atc_fault &&
-               (!tc_e || ttr_hit || lk_fresh) &&
+               (!tc_e || xl_skip || lk_fresh || u_hit) &&
                (wst == W_IDLE) && !w_active && !pf_req && !pt_req;
 
 assign m_req   = pass_ok;
@@ -352,7 +403,7 @@ assign m_instr = c_instr;
 assign m_size  = c_size;
 assign m_addr  = pa_out;
 assign m_wdata = c_wdata;
-assign m_fc    = c_fc;
+assign m_fc    = (!c_instr && (c_fc[1:0] == 2'b10)) ? {c_fc[2], 2'b01} : c_fc;
 
 // w_issued inserts a request-low cycle before each descriptor transaction.
 // Besides making the interface unambiguous for a level-handshake backend,
@@ -371,7 +422,7 @@ assign c_ack   = m_ack;
 assign c_rdata = m_rdata;
 
 assign phys_addr     = pa_out;
-assign cache_inhibit = ttr_hit ? ttr_cm[1]
+assign cache_inhibit = a_alt ? 1'b1 : ttr_hit ? ttr_cm[1]
                      : (tc_e && atc_hit) ? h_cm[1] : 1'b0;
 assign m_nocache     = cache_inhibit;
 
@@ -406,7 +457,7 @@ integer k;
 always @(posedge clk) begin
 	if (!nreset) begin
 		wst <= W_IDLE;
-		w_issued <= 0; w_pt <= 0;
+		w_issued <= 0; w_pt <= 0; w_acc <= 0;
 		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0;
 		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0; w_buserr <= 0;
 		w_req_addr <= 0; w_req_wdat <= 0; w_req_wr <= 0;
@@ -482,6 +533,7 @@ always @(posedge clk) begin
 				end
 				else if (c_req && !c_flt && need_walk) begin
 					w_pt    <= 0;
+					w_acc   <= 0;
 					w_la    <= c_addr;
 					w_super <= a_super;
 					w_user  <= !a_super;
@@ -549,6 +601,7 @@ always @(posedge clk) begin
 					w_super <= pt_fc[2];
 					w_user  <= !pt_fc[2];
 					w_write <= pt_write;
+					w_acc   <= pt_access;
 					w_wp    <= 0;
 					f_bank  <= pt_instr;
 					if (pt_ttr_hit) begin

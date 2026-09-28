@@ -33,7 +33,10 @@ module ap040_cache
 (
 	input             clk,
 	input             nreset,
-	input             ce,
+	// ce includes the RAM controller's completion crossing. Keep request
+	// capture predicates in the data mux instead of extending this late
+	// enable through the cache-state decode (as in ap040_fpu).
+	(* direct_enable = 1 *) input ce,
 
 	input             ie,          // CACR instruction cache enable
 	input             de,          // CACR data cache enable
@@ -58,6 +61,7 @@ module ap040_cache
 	// posting entirely, which is the behaviour without it.
 	input             c_post_ok,
 	output            c_ack,
+	output            c_if_cached, // acknowledged instruction came from this cache
 	output     [31:0] c_rdata,
 	// A posted store is draining: the master side is its own until the
 	// acknowledge.  The wrapper uses this to keep the core ticking through
@@ -468,6 +472,8 @@ assign m_fc    = sb_v ? sb_fc : c_fc;
 // core samples it.  Fills still acknowledge from C_TAGW through ack_r.
 wire look_ack = (cst == C_LOOK) && look_hit && !look_snooped && !snoop_look_row_look;
 assign c_ack   = pass_active ? (sb_v ? ack_r : m_ack) : (ack_r | look_ack);
+// Bypassed/disabled/CI/Minimig chip fetches must not seed branch retention.
+assign c_if_cached = c_ack && !pass_active && r_bank;
 assign sb_busy = sb_v;
 assign c_rdata = pass_active ? m_rdata
                              : (look_ack ? lw_extract(data_hit, r_size, r_off) : rdata_r);

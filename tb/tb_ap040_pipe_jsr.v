@@ -65,6 +65,20 @@ reg ce = 1;
 
 always #5 clk = ~clk;
 
+`ifdef AP040_PIPE_CE_RANDOM
+// A pseudo-random clock enable (milestone 94). Every bench in this suite
+// tied ce high, and eight of the thirteen defects three rounds of external
+// review found lived behind that: a cycle with ce low is a cycle that did
+// not happen, and the core has to treat it that way. Driven on the falling
+// edge so it is stable across every rising one, and left high until reset
+// releases so the reset sequence itself is unchanged.
+reg [15:0] ce_lfsr = 16'hACE1;
+always @(negedge clk) if (nreset) begin
+	ce_lfsr <= {ce_lfsr[14:0], ce_lfsr[15] ^ ce_lfsr[13] ^ ce_lfsr[12] ^ ce_lfsr[10]};
+	ce      <= ce_lfsr[0];
+end
+`endif
+
 wire        dbg_if_valid,  dbg_id_valid,  dbg_eac_valid;
 wire        dbg_eaf_valid, dbg_ex_valid,  dbg_wb_valid;
 wire [31:0] dbg_if_pc,     dbg_id_pc,     dbg_eac_pc;
@@ -78,6 +92,7 @@ ap040_pipe_core #(
 	.PROG_WORDS(PROG_WORDS)
 ) dut
 (
+	.irq_lvl (3'd0),   // no interrupt source in this bench
 	.clk (clk),
 	.nreset (nreset),
 	.ce  (ce),
@@ -116,11 +131,11 @@ initial begin
 
 	// See tb_ap040_pipe_move_mem.v's header for why the poke must land
 	// here, past the reset edge's own NBA region.
-	dut.u_regfile.areg[0] = 32'h0000_0406;
-	dut.u_regfile.areg[1] = 32'h0000_0400;
-	dut.u_regfile.isp     = 32'h0000_0600;
+	dut.u_cpu.u_regfile.areg[0] = 32'h0000_0406;
+	dut.u_cpu.u_regfile.areg[1] = 32'h0000_0400;
+	dut.u_cpu.u_regfile.isp     = 32'h0000_0600;
 
-	repeat (PROG_WORDS + 25) @(posedge clk);
+	repeat ((PROG_WORDS + 25) * `AP040_PIPE_WAIT_SCALE) @(posedge clk);
 
 	if (dbg_d1 !== 32'h0000_0000) begin
 		errors = errors + 1;
@@ -145,9 +160,9 @@ initial begin
 
 	// A7 must be decremented by exactly 4 per JSR -- read directly, same
 	// hierarchical-poke style used to seed it.
-	if (dut.u_regfile.isp !== 32'h0000_05F8) begin
+	if (dut.u_cpu.u_regfile.isp !== 32'h0000_05F8) begin
 		errors = errors + 1;
-		$display("FAIL: A7 (isp) = %h, expected 000005f8 (two JSRs, -4 each, from 00000600)", dut.u_regfile.isp);
+		$display("FAIL: A7 (isp) = %h, expected 000005f8 (two JSRs, -4 each, from 00000600)", dut.u_cpu.u_regfile.isp);
 	end
 
 	// Both pushes' return addresses, read directly out of the L1 array,

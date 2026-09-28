@@ -1,10 +1,6 @@
-# Milestone 8 (DBcc). Not yet referenced by any project-level .qip -- this
-# core is built and tested standalone (tb/run_pipe_tests.sh) until a later
-# milestone wires it into a real host. As of milestone 6 (folder
-# independence), rtl/ is fully self-contained: it forks its own ALU and
-# register file (ap040_pipe_alu.v/ap040_pipe_regfile.v) rather than reusing
-# rtl_old/'s, so both must be listed here -- neither comes from any other
-# .qip the way an earlier draft of this comment assumed.
+# The pipelined core, for the card (doc_AP040_PIPELINE_CACHES.md, stage F):
+# every file ap040_pipe_tg68k_compat.v is built from. The FSM core's adapter,
+# FPU engine and bram.vhd come from rtl/ap040/ap040.qip and files.qip.
 set_global_assignment -name SEARCH_PATH      [file join $::quartus(qip_path) . ]
 set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_inst_fetch.v ]
 set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_decode.v ]
@@ -14,4 +10,14 @@ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap0
 set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_writeback.v ]
 set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_alu.v ]
 set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_regfile.v ]
-set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_core.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_fpu.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_irq.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_cpu.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_membus.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_imu.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_dmu.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_mmu.v ]
+set_global_assignment -name VHDL_FILE        [file join $::quartus(qip_path) ap040_pipe_ram.vhd ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_cache_arr.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_bus16.v ]
+set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_pipe_tg68k_compat.v ]

@@ -69,6 +69,20 @@ reg ce = 1;
 
 always #5 clk = ~clk;
 
+`ifdef AP040_PIPE_CE_RANDOM
+// A pseudo-random clock enable (milestone 94). Every bench in this suite
+// tied ce high, and eight of the thirteen defects three rounds of external
+// review found lived behind that: a cycle with ce low is a cycle that did
+// not happen, and the core has to treat it that way. Driven on the falling
+// edge so it is stable across every rising one, and left high until reset
+// releases so the reset sequence itself is unchanged.
+reg [15:0] ce_lfsr = 16'hACE1;
+always @(negedge clk) if (nreset) begin
+	ce_lfsr <= {ce_lfsr[14:0], ce_lfsr[15] ^ ce_lfsr[13] ^ ce_lfsr[12] ^ ce_lfsr[10]};
+	ce      <= ce_lfsr[0];
+end
+`endif
+
 wire        dbg_if_valid,  dbg_id_valid,  dbg_eac_valid;
 wire        dbg_eaf_valid, dbg_ex_valid,  dbg_wb_valid;
 wire [31:0] dbg_if_pc,     dbg_id_pc,     dbg_eac_pc;
@@ -82,6 +96,7 @@ ap040_pipe_core #(
 	.PROG_WORDS(PROG_WORDS)
 ) dut
 (
+	.irq_lvl (3'd0),   // no interrupt source in this bench
 	.clk (clk),
 	.nreset (nreset),
 	.ce  (ce),
@@ -103,7 +118,14 @@ integer errors = 0;
 initial begin
 	#1;
 	// Mainline
-	dut.u_l1.mem[1] = 16'h0000;   // illegal (matches nothing)
+	// 4AFC is the architecturally defined ILLEGAL opcode. This was 0000
+	// ("matches nothing") until milestone 26, which is a fair description of
+	// an incomplete decoder but not of a 68040: 0000 is ORI.B #imm,D0, a
+	// perfectly real instruction, and it started decoding as one. 4AFC is
+	// illegal by definition rather than by omission, so it cannot be
+	// reclaimed by a later milestone. Still one word, so every stacked PC
+	// and frame value below is unchanged.
+	dut.u_l1.mem[1] = 16'h4AFC;   // ILLEGAL
 	dut.u_l1.mem[2] = 16'h7263;   // MOVEQ #99,D1 (poison A, must not run)
 	dut.u_l1.mem[3] = 16'h4E45;   // TRAP #5 (vector 37)
 	dut.u_l1.mem[4] = 16'h7658;   // MOVEQ #88,D3 (poison B, must not run)
@@ -132,10 +154,10 @@ initial begin
 
 	// See tb_ap040_pipe_move_mem.v's header for why the poke must land
 	// here, past the reset edge's own NBA region.
-	dut.u_regfile.areg[2] = 32'h0000_0406;  // A2: resume-mainline target for JMP
-	dut.u_regfile.isp     = 32'h0000_0600;  // A7
+	dut.u_cpu.u_regfile.areg[2] = 32'h0000_0406;  // A2: resume-mainline target for JMP
+	dut.u_cpu.u_regfile.isp     = 32'h0000_0600;  // A7
 
-	repeat (PROG_WORDS + 80) @(posedge clk);
+	repeat ((PROG_WORDS + 80) * `AP040_PIPE_WAIT_SCALE) @(posedge clk);
 
 	// -------------------------------------------------- Case A: illegal
 	if (dbg_d1 !== 32'h0000_0000) begin
@@ -188,9 +210,9 @@ initial begin
 	end
 
 	// A7 decremented by exactly 8 twice (two format-$0 frames), from $600.
-	if (dut.u_regfile.isp !== 32'h0000_05F0) begin
+	if (dut.u_cpu.u_regfile.isp !== 32'h0000_05F0) begin
 		errors = errors + 1;
-		$display("FAIL: A7 (isp) = %h, expected 000005f0 (two format-$0 frames, -8 each, from 00000600)", dut.u_regfile.isp);
+		$display("FAIL: A7 (isp) = %h, expected 000005f0 (two format-$0 frames, -8 each, from 00000600)", dut.u_cpu.u_regfile.isp);
 	end
 
 	if (dbg_ccr[3:0] !== 4'b0000) begin

@@ -28,8 +28,13 @@ IPLCAP	equ	$F160	; bench capability word: bit 0 = coarse IPL delivery
 			; IRQEXCCTL), bit 2 = bus-error injection (BERRCTL,
 			; FBERRCTL), bit 3 = the cache_allow window models
 			; production (cache_allow_all=0), bit 4 = the real
-			; fastchip/rtg block is instantiated.  Gated tests are
-			; bypassed, never faked.
+			; fastchip/rtg block is instantiated, bit 5 = IPLDLY's
+			; count lands inside the masking MOVE to SR of test 136
+			; (a calibration to the sequential core's cycle
+			; counts; the pipelined core retires that MOVE before
+			; the shortest delay reaches its input, so it checks
+			; the same rule as a bench invariant instead).  Gated
+			; tests are bypassed, never faked.
 
 hfa		equ	$3674	; fault address seen by h_buserr
 hfpc		equ	$3678	; and its stacked PC
@@ -693,6 +698,9 @@ irq_withdraw_loop:
 	; interrupt whose IPEND is set is taken at the next instruction
 	; boundary regardless of a mask raised in the meantime.  Time the
 	; request to arrive inside the MOVE to SR that masks it.
+	move.w	(IPLCAP).l,d0
+	btst	#5,d0			; the delay is calibrated (see IPLCAP)
+	beq.s	irq_hold_ok
 	move.w	#$2000,sr		; mask 0 while the request arrives
 	move.w	(cnt_int2).l,d5
 	move.w	#6,(IPLDLY).l

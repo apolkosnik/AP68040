@@ -18,6 +18,15 @@
 `define AP040_PIPE_DEFS_SVH
 
 // Internal transfer sizes
+// Function codes, for the bus port alone (milestone 81) -- the same values
+// rtl/ap040/ap040_defs.svh uses, since ap040_pipe_membus.v drives the same
+// external port rtl/ap040/ap040_core.v does.
+`define AP040_FC_USER_DATA   3'd1
+`define AP040_FC_USER_PROG   3'd2
+`define AP040_FC_SUPER_DATA  3'd5
+`define AP040_FC_SUPER_PROG  3'd6
+`define AP040_FC_CPU_SPACE   3'd7
+
 `define AP040_SZ_B        2'd0
 `define AP040_SZ_W        2'd1
 `define AP040_SZ_L        2'd2
@@ -44,13 +53,24 @@
 // illegal -- see its header). Order is arbitrary, chosen only to keep
 // USP/ISP/MSP contiguous with ap040_pipe_regfile.v's own aux_sel numbering
 // (0=USP/1=ISP/2=MSP) one bit-shift away.
-`define AP040_CREG_SFC     3'd0
-`define AP040_CREG_DFC     3'd1
-`define AP040_CREG_CACR    3'd2
-`define AP040_CREG_VBR     3'd3
-`define AP040_CREG_USP     3'd4
-`define AP040_CREG_ISP     3'd5
-`define AP040_CREG_MSP     3'd6
+`define AP040_CREG_SFC     4'd0
+`define AP040_CREG_DFC     4'd1
+`define AP040_CREG_CACR    4'd2
+`define AP040_CREG_VBR     4'd3
+`define AP040_CREG_USP     4'd4
+`define AP040_CREG_ISP     4'd5
+`define AP040_CREG_MSP     4'd6
+// The MMU registers (milestone 113), storage only: this core translates
+// nothing. Four bits now; USP/ISP/MSP keep 4/5/6 so aux_sel is still their
+// low two bits.
+`define AP040_CREG_TC      4'd7
+`define AP040_CREG_ITT0    4'd8
+`define AP040_CREG_ITT1    4'd9
+`define AP040_CREG_DTT0    4'd10
+`define AP040_CREG_DTT1    4'd11
+`define AP040_CREG_MMUSR   4'd12
+`define AP040_CREG_URP     4'd13
+`define AP040_CREG_SRP     4'd14
 
 // ALU operations. ap040_pipe_alu.v's case statement needs every entry to
 // compile even though only MOVE/ADD are driven by any decoder yet.
@@ -87,5 +107,21 @@
 `define AP040_ALU_BCHG    6'd30
 `define AP040_ALU_BCLR    6'd31
 `define AP040_ALU_BSET    6'd32
+// 16x16 -> 32 multiply (milestone 51). Combinational: one DSP block on
+// Cyclone V, comfortably inside a 40 MHz cycle, so unlike divide it needs no
+// sequencer. The operands are the LOW WORDS of a and b regardless of the
+// `size` port, and the result is always the full 32 bits.
+`define AP040_ALU_MULU    6'd33
+`define AP040_ALU_MULS    6'd34
+// PACK/UNPK Dx,Dy,#adj (milestone 113). Decode's name for the operation
+// only: ap040_ea_fetch.v computes the result and hands EX an ALU_MOVE, so
+// the ALU itself never sees either code.
+`define AP040_ALU_PACK    6'd35
+`define AP040_ALU_UNPK    6'd36
+// EXG and BTST Dn,#imm (milestone 115), decode's names again: EA-fetch
+// turns EXG into an ALU_MOVE plus a second-port write, and BTST-with-
+// immediate-data into an ordinary BTST with its operands swapped.
+`define AP040_ALU_EXG     6'd37
+`define AP040_ALU_BTSTR   6'd38
 
 `endif // AP040_PIPE_DEFS_SVH

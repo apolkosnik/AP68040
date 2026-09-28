@@ -17,7 +17,7 @@ mkdir -p build
 # its image was simply absent, and a +prog pointing at the
 # missing file produced a full, plausible profile of the core executing
 # zeros -- see the $fopen guard in tb_ap040_program.v.
-for t in t_integer t_exceptions t_mmu t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop bench_alu; do
+for t in t_integer t_fastpaths t_exceptions t_mmu t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop bench_alu; do
 	$VASM -Fbin -m68040 -no-opt -o build/$t.bin asm/$t.s
 	python3 bin2hex.py build/$t.bin build/$t.hex
 	echo "built build/$t.hex"

@@ -19,7 +19,7 @@
 // different (PC_RESET-relative, see ap040_ea_fetch.v's header) index --      //
 // there is no separate data-memory model to keep in sync.                    //
 //                                                                          //
-// A0 itself is poked directly (dut.u_regfile.areg[0]), not loaded by an      //
+// A0 itself is poked directly (dut.u_cpu.u_regfile.areg[0]), not loaded by an      //
 // instruction -- MOVEA/LEA don't exist yet (deferred, see                    //
 // AP040_IMPLEMENTATION_PLAN.md section 6). This means EX-forwarding INTO      //
 // the address computation (a producer instruction writing An immediately     //
@@ -51,6 +51,20 @@ reg ce = 1;
 
 always #5 clk = ~clk;
 
+`ifdef AP040_PIPE_CE_RANDOM
+// A pseudo-random clock enable (milestone 94). Every bench in this suite
+// tied ce high, and eight of the thirteen defects three rounds of external
+// review found lived behind that: a cycle with ce low is a cycle that did
+// not happen, and the core has to treat it that way. Driven on the falling
+// edge so it is stable across every rising one, and left high until reset
+// releases so the reset sequence itself is unchanged.
+reg [15:0] ce_lfsr = 16'hACE1;
+always @(negedge clk) if (nreset) begin
+	ce_lfsr <= {ce_lfsr[14:0], ce_lfsr[15] ^ ce_lfsr[13] ^ ce_lfsr[12] ^ ce_lfsr[10]};
+	ce      <= ce_lfsr[0];
+end
+`endif
+
 wire        dbg_if_valid,  dbg_id_valid,  dbg_eac_valid;
 wire        dbg_eaf_valid, dbg_ex_valid,  dbg_wb_valid;
 wire [31:0] dbg_if_pc,     dbg_id_pc,     dbg_eac_pc;
@@ -63,6 +77,7 @@ ap040_pipe_core #(
 	.PROG_WORDS(PROG_WORDS)
 ) dut
 (
+	.irq_lvl (3'd0),   // no interrupt source in this bench
 	.clk (clk),
 	.nreset (nreset),
 	.ce  (ce),
@@ -106,11 +121,11 @@ initial begin
 	// for one delta, gone by the next clock read) -- unlike ap040_pipe_l1.v's
 	// mem[], which has no reset logic at all, so the ROM pokes above never
 	// hit this race. Waiting one more edge sidesteps it entirely.
-	dut.u_regfile.areg[0] = 32'h0000_0600;   // word index $100, PC_RESET-relative
+	dut.u_cpu.u_regfile.areg[0] = 32'h0000_0600;   // word index $100, PC_RESET-relative
 
 	// One extra cycle over the usual "PROG_WORDS + 20" margin for the
 	// memory stall.
-	repeat (PROG_WORDS + 21) @(posedge clk);
+	repeat ((PROG_WORDS + 21) * `AP040_PIPE_WAIT_SCALE) @(posedge clk);
 
 	if (dbg_d0 !== 32'h1234_5678) begin
 		errors = errors + 1;

@@ -814,18 +814,22 @@ t48loop:
 	move.b	($8005).l,d0
 	chkl	d0,$91,54		; restart completed the set
 
-; MOVES to FC 0 keeps the raw FC in TM and reports TT=10
-	move.l	#0,(expect_tm).l
-	move.l	#$8006,(expect_fa).l
+; MOVES to FC 0 is an alternate address space (MC68040UM 3.2, Table 3-2):
+; the address is used as a physical one without translation, so the
+; write-protected page takes the write and nothing faults. (The access
+; error it can still take, a physical bus error, and the TT/TM it reports
+; are t_moves_alt.s's.)
+	move.w	(cnt_aerr).l,d2
 	move.l	#$00008007,($4420).l
 	pflusha
 	moveq	#0,d0
 	movec	d0,dfc
 	move.b	#$5C,d1
 	moves.b	d1,($8006).l
-	move.w	(last_ssw).l,d0
+	move.w	(cnt_aerr).l,d0
+	sub.w	d2,d0
 	and.l	#$FFFF,d0
-	chkl	d0,$0430,55		; ATC + byte + TT1, TM=0
+	chkl	d0,0,55			; no access error
 	moveq	#0,d0
 	move.b	($8006).l,d0
 	chkl	d0,$5C,56
@@ -1154,22 +1158,18 @@ stale_ok:
 	chkl	d0,1,174		; exactly one access error
 	move.l	#unexp,($18).l
 
-;----- MOVES alternate function codes select the ROOT by FC bit 2 (177-180)
-; An external audit read MC68040 UM 3.2.5 as requiring FC 0/3/4/7 MOVES to
-; BYPASS translation as physical accesses.  WinUAE -- the reference this
-; core is validated against, and the source of the cputest corpus -- does
-; not do that.  Its 68040 MOVES source read is:
-;     bool super = (regs.sfc & 4) != 0;
-;     res = mmu_get_user_byte(addr, super, false, sz_byte, false);
-; i.e. EVERY function code is translated, and only bit 2 picks the root.
-; ap040_mmu.v derives `a_super = c_fc[2]`, which is the same rule, so the
-; implementation already agrees with the oracle and the audit's item is a
-; manual-versus-reference disagreement.  This core has lost that bet in
-; the manual's favour before (the T0 change-of-flow list), so pin the
-; behaviour with a test that can actually tell the roots apart: URP and
-; SRP address DIFFERENT tables here, so a bypass -- or a super bit taken
-; from anything but FC2 -- lands the store in the wrong page.
-;   user  VA $C000 -> PA $C000     (URP tables)
+;----- MOVES function codes: the data spaces by their root, the alternate
+;----- spaces untranslated (177-180)
+; MC68040UM 3.2 (Table 3-2): MOVES to FC 1/5 is a user/supervisor data
+; access, translated through URP/SRP; FC 2/6 is converted to 1/5; FC 0, 3,
+; 4 and 7 are alternate address spaces, "immediately used as a physical
+; address without translation". Until 2026-09-25 this block pinned WinUAE's
+; rule instead -- every function code translated, FC bit 2 picking the
+; root (its MOVES read is mmu_get_user_byte(addr, (regs.sfc & 4) != 0,
+; ...)) -- over an audit that read 3.2 as the manual says; both cores now
+; follow the manual (caches stage A2). URP and SRP address DIFFERENT
+; tables, so each store can land in only one page:
+;   user  VA $C000 -> PA $C000     (URP tables; PA $E000 for 179-180)
 ;   super VA $C000 -> PA $E000     (SRP tables)
 ;   super VA $E000 -> PA $C000     (so PA $C000 is readable from here)
 	move.l	#$4800,d0
@@ -1196,19 +1196,31 @@ stale_ok:
 	move.l	($C000).l,d0		; super VA $C000 = PA $E000
 	chkl	d0,$55555555,178	; FC5 translated through SRP
 
-	moveq	#0,d0			; FC0: bit 2 clear -> USER, not a bypass
-	movec	d0,dfc
-	move.l	#$00000000,d1
-	moves.l	d1,($C000).l
-	move.l	($E000).l,d0
-	chkl	d0,0,179		; FC0 landed in the USER page
+	; Both roots now send VA $C000 to PA $E000: an alternate-space store
+	; to $C000 that were translated, through either, would land there.
+	move.l	#$0000E003,($4C18).l	; user entry 6: VA $C000 -> PA $E000
+	pflusha
+	move.l	#0,($E000).l		; PA $C000
+	move.l	#0,($C000).l		; PA $E000
 
-	moveq	#4,d0			; FC4: bit 2 set -> SUPERVISOR
+	moveq	#0,d0			; FC0: an alternate space
+	movec	d0,dfc
+	move.l	#$0F0F0F0F,d1
+	moves.l	d1,($C000).l
+	move.l	($E000).l,d0		; super VA $E000 = PA $C000
+	chkl	d0,$0F0F0F0F,179	; FC0 went to PA $C000, untranslated
+	move.l	($C000).l,d0		; super VA $C000 = PA $E000
+	chkl	d0,0,179		; ...and through neither root
+
+	moveq	#4,d0			; FC4: an alternate space, bit 2 set
 	movec	d0,dfc
 	move.l	#$44444444,d1
 	moves.l	d1,($C000).l
+	move.l	($E000).l,d0
+	chkl	d0,$44444444,180	; FC4 went to PA $C000, untranslated
 	move.l	($C000).l,d0
-	chkl	d0,$44444444,180	; FC4 landed in the SUPERVISOR page
+	chkl	d0,0,180		; ...and through neither root
+	move.l	#$0000C003,($4C18).l	; user entry 6 as it was
 
 	moveq	#5,d0
 	movec	d0,dfc			; leave DFC as the block found it

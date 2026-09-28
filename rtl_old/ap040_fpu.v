@@ -33,7 +33,11 @@ module ap040_fpu
 (
 	input             clk,
 	input             nreset,
-	input             ce,
+	// RAM completion reaches ce across the controller/CPU clock boundary.
+	// Keep that late signal on the register enable; folding the frame/FSM
+	// write predicates into it adds logic and routing to the short crossing.
+	// The predicates remain in the data mux, with identical cycle behavior.
+	(* direct_enable = 1 *) input ce,
 
 	// command port: pulse req with the fields valid; done pulses on
 	// completion, unimp pulses instead when the op is not in hardware
