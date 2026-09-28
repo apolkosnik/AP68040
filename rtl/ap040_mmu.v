@@ -17,8 +17,10 @@
 //                                                                          //
 // The whole unit advances only when ce (clkena) is high. Table searches    //
 // are plain read/write cycles (not bus locked): this fabric has a single   //
-// CPU master. Invalid translations are not cached, so a descriptor fixed   //
-// by a handler takes effect even without a PFLUSH.                         //
+// CPU master. A failed search installs a valid but NONRESIDENT entry, as   //
+// the 68040 does (MC68040UM 3-14): later accesses fault from the ATC       //
+// without walking again, and a descriptor fixed by a handler takes effect  //
+// only after a PFLUSH/PTEST of that entry or its replacement.              //
 //--------------------------------------------------------------------------//
 
 `include "ap040_defs.svh"
@@ -44,6 +46,9 @@ module ap040_mmu
 	input             c_instr,
 	input       [1:0] c_size,
 	input      [31:0] c_addr,
+	input      [31:0] c_hint_addr,  // next access, one cycle early (logical)
+	input      [31:0] c_ihint_addr, // the instruction side's hint (P175), always instruction space
+	input             c_hint_instr,
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
 	output            c_ack,
@@ -73,6 +78,14 @@ module ap040_mmu
 	output            m_instr,
 	output      [1:0] m_size,
 	output     [31:0] m_addr,
+	output     [31:0] m_hint_addr,  // hint bus, passed down (page offset only matters)
+	output            m_hint_instr,
+	output     [21:0] m_hint_ptag,  // the hint's physical tag, registered
+	output            m_hint_match, // the request is the registered hint
+	output            m_hint_wmatch,// ... and its page may be written now (see hq_wok)
+	output     [31:0] m_ihint_addr, // the instruction hint, passed down (P175)
+	output     [21:0] m_ihint_ptag, // its physical tag, registered
+	output            m_ihint_match,// the request is the registered instruction hint
 	output     [31:0] m_wdata,
 	output      [2:0] m_fc,
 	input             m_ack,
@@ -127,14 +140,14 @@ endfunction
 //---------------------------------------------------------------------------
 
 // The entry payload (tag, PA, attributes) lives in ONE bram.vhd dpram:
-// 32 rows of {bank, set}, 4 ways of 45 bits per row.  A flop array here
+// 32 rows of {bank, set}, 4 ways of 46 bits per row.  A flop array here
 // costs ~5.7K registers plus the 4-way mux fabric (the single largest
 // ALM sink in the design); the M10K row costs a one-clock lookup pipe
 // on ENABLED translation only -- TC.E=0 and TTR hits stay combinational
 // and pay nothing, which is the common Amiga configuration.  Validity
 // and the round-robin pointers stay in flops so PFLUSHA, warm-reset
 // preservation and the lookup guard remain single-cycle.
-localparam EW   = 45;            // {tag[16:0], pa[19:0], attr[7:0]}
+localparam EW   = 46;            // {resident, tag[16:0], pa[19:0], attr[7:0]}
 localparam ROWW = 4*EW;
 
 reg         atc_v    [0:127];
@@ -193,31 +206,35 @@ wire [EW-1:0] pipe_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
 // and on reset, so it can never disagree with the array it mirrors.  It
 // carries no state of its own: permissions, cache mode and the M bit come
 // from the copied entry and go through the same fault/walk decisions.
-reg          u_valid [0:1];   // one copy per space: instruction, data
-reg    [4:0] u_row   [0:1];
-reg   [16:0] u_tag   [0:1];
-reg [EW-1:0] u_ent   [0:1];
+// P200: four instruction copies too (a call from user code into the ROM's
+// FPU glue and its return kept replacing the single instruction copy, so
+// the return target's hint never translated)
+reg          u_valid [0:7];   // four data copies and four instruction copies, indexed by page set
+reg    [4:0] u_row   [0:7];
+reg   [16:0] u_tag   [0:7];
+reg [EW-1:0] u_ent   [0:7];
 reg   [31:0] u_tc;
 integer      ui;
 always @(posedge clk) begin
 	u_tc <= tc;
 	if (!nreset || fill_we || sweep_on || pf_req || (tc != u_tc)) begin
-		for (ui = 0; ui < 2; ui = ui + 1) u_valid[ui] <= 0;
+		for (ui = 0; ui < 8; ui = ui + 1) u_valid[ui] <= 0;
 	end
 	else if (pipe_hit) begin
-		u_valid[l_row[4]] <= 1;
-		u_row[l_row[4]]   <= l_row;
-		u_tag[l_row[4]]   <= l_tag;
-		u_ent[l_row[4]]   <= pipe_ent;
+		u_valid[{l_row[4],l_row[1:0]}] <= 1;
+		u_row[{l_row[4],l_row[1:0]}]   <= l_row;
+		u_tag[{l_row[4],l_row[1:0]}]   <= l_tag;
+		u_ent[{l_row[4],l_row[1:0]}]   <= pipe_ent;
 	end
 end
-wire u_hit = u_valid[c_instr] && (u_row[c_instr] == a_row) &&
-             (u_tag[c_instr] == a_tag);
-wire [EW-1:0] u_sel = u_ent[c_instr];
+wire u_hit = u_valid[{c_instr,a_row[1:0]}] && (u_row[{c_instr,a_row[1:0]}] == a_row) &&
+             (u_tag[{c_instr,a_row[1:0]}] == a_tag);
+wire [EW-1:0] u_sel = u_ent[{c_instr,a_row[1:0]}];
 
 wire atc_hit = u_hit | pipe_hit;
 
 wire [EW-1:0] h_ent = u_hit ? u_sel : pipe_ent;
+wire        h_r    = h_ent[45];
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
 wire        h_s    = h_attr[4];
@@ -252,9 +269,9 @@ wire        pt_ttr_w = pt_ttr_a ? pt_ttra[2] : pt_ttrb[2];
 
 wire ttr_fault = ttr_hit && c_write && ttr_w;
 wire atc_fault = tc_e && !ttr_hit && atc_hit &&
-                 ((c_write && h_w) || (!a_super && h_s));
+                 (!h_r || (c_write && h_w) || (!a_super && h_s));
 // write to a clean page runs a table search to set the M bit
-wire atc_mmiss = atc_hit && c_write && !h_m && !h_w;
+wire atc_mmiss = atc_hit && h_r && c_write && !h_m && !h_w;
 
 // lk_fresh gates atc_hit, so a walk is only started once the piped row
 // has been judged against the live request
@@ -294,6 +311,7 @@ reg        w_super, w_write, w_user;
 reg [31:0] w_desc_addr;
 reg [31:0] w_desc;
 reg        w_wp;
+reg        w_buserr;            // failed-search MMUSR B status (PTEST only)
 reg [31:0] w_req_addr, w_req_wdat;
 reg        w_req_wr;
 reg        w_active;
@@ -330,7 +348,10 @@ wire [1:0] f_way = fhit0 ? 2'd0 : fhit1 ? 2'd1 : fhit2 ? 2'd2 : fhit3 ? 2'd3
 wire [19:0] f_pa_new   = tc_p ? {w_desc[31:13], 1'b0} : w_desc[31:12];
 wire  [7:0] f_attr_new = {w_desc[10], w_desc[9:8], w_desc[7], w_desc[6:5],
                           w_desc[4], (w_wp | w_desc[2])};
-wire [EW-1:0] f_ent_new = {f_tag, f_pa_new, f_attr_new};
+// A failed 68040 search installs a VALID but nonresident entry. Future
+// accesses fault on that entry without walking again until it is flushed.
+wire [EW-1:0] f_ent_new = (wst == W_FLT) ? {1'b0, f_tag, 28'd0} :
+                                        {1'b1, f_tag, f_pa_new, f_attr_new};
 wire [ROWW-1:0] fill_wrow = {
 	(f_way == 2'd3) ? f_ent_new : f_w3,
 	(f_way == 2'd2) ? f_ent_new : f_w2,
@@ -339,7 +360,8 @@ wire [ROWW-1:0] fill_wrow = {
 // the fill writes in the SAME cycle W_FILL commits the way choice:
 // a registered strobe would land one cycle later, after the round
 // robin pointer has already advanced under f_way's feet
-assign fill_we = (wst == W_FILL) && !w_active && ce;
+assign fill_we = (((wst == W_FILL || wst == W_DFLT) && !w_active) ||
+                  wst == W_FLT) && ce && nreset;
 
 dpram #(5, ROWW) atc_ram
 (
@@ -439,7 +461,7 @@ always @(posedge clk) begin
 		wst <= W_IDLE;
 		w_issued <= 0; w_pt <= 0;
 		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0;
-		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0;
+		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0; w_buserr <= 0;
 		w_req_addr <= 0; w_req_wdat <= 0; w_req_wr <= 0;
 		w_active <= 0; f_bank <= 0;
 		c_flt <= 0;
@@ -457,19 +479,18 @@ always @(posedge clk) begin
 		pt_done <= 0;
 		pf_done <= 0;
 		if (w_active && !w_issued) w_issued <= 1;
+		if (fill_we) begin
+			atc_v[{fill_row, f_way}] <= 1;
+			if (!f_way_hit) atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
+		end
 
 		if (walk_err) begin
 			// A physical bus error while fetching or updating a descriptor is
-			// reported as an unsuccessful table search.  Do not fill the ATC.
-			// A probing PTEST reports it in the MMUSR B bit.
+			// reported as an unsuccessful table search and cached as
+			// nonresident. A probing PTEST also reports its MMUSR B bit.
 			w_active <= 0;
-			if (w_pt) begin
-				pt_mmusr <= 32'h0000_0800;
-				pt_done <= 1;
-				w_pt <= 0;
-				wst <= W_IDLE;
-			end
-			else wst <= W_FLT;
+			w_buserr <= 1;
+			wst <= W_FLT;
 		end
 		else case (wst)
 			W_IDLE: begin
@@ -519,6 +540,7 @@ always @(posedge clk) begin
 					w_user  <= !a_super;
 					w_write <= c_write;
 					w_wp    <= 0;
+					w_buserr <= 0;
 					f_bank  <= c_instr;
 					wrd({(a_super ? srp[31:9] : urp[31:9]), 9'd0} +
 					    {23'd0, c_addr[31:25], 2'b00});
@@ -572,6 +594,7 @@ always @(posedge clk) begin
 
 			// PTEST proper, after its pre-flush sweep
 			W_PTGO: begin
+					w_buserr <= 0;
 					w_pt    <= 1;
 					w_la    <= pt_addr;
 					w_super <= pt_fc[2];
@@ -730,10 +753,6 @@ always @(posedge clk) begin
 					if (walk_ack) w_active <= 0;
 				end
 				else if (w_pt) begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					// PTEST reports the PAGE FRAME, not the translated
 					// address of the probed LA.  In 8K mode that means
 					// bit 12 is CLEAR: the frame is 8K-aligned, and the
@@ -756,22 +775,21 @@ always @(posedge clk) begin
 					wst <= W_IDLE;
 				end
 				else begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					wst <= W_IDLE;   // the held request now hits and forwards
 				end
 			end
 
 			W_FLT: begin
 				if (w_pt) begin
-					pt_mmusr <= 32'd0;   // not resident
+					pt_mmusr <= w_buserr ? 32'h0000_0800 : 32'd0;
 					pt_done <= 1;
 					w_pt <= 0;
+					wst <= W_IDLE;
 				end
-				else c_flt <= 1;
-				wst <= W_IDLE;
+				else begin
+					c_flt <= 1;
+					wst <= W_DROP;
+				end
 			end
 
 			default: wst <= W_IDLE;
@@ -779,4 +797,122 @@ always @(posedge clk) begin
 	end
 end
 
+//---------------------------------------------------------------------------
+// hint-side translation
+//---------------------------------------------------------------------------
+// The core's address hint (one cycle ahead of the request) is translated
+// here through the same hit copy and TTRs and registered, so that the
+// cache can qualify a one-clock hit in the request cycle against a
+// registered physical tag instead of the live translation.  Registered
+// every clock from the live hint bus; m_hint_match asserts when the
+// request now presented is the address, space and supervisor state the
+// copy was made from and nothing that decides a translation has moved
+// since (the copy itself, TC, the TTRs, a walk, sweep or fill).
+wire [3:0]    hn_set = tc_p ? c_hint_addr[16:13] : c_hint_addr[15:12];
+wire [4:0]    hn_row = {c_hint_instr, hn_set};
+wire [16:0]   hn_tag = tc_p ? {a_super, c_hint_addr[31:17], 1'b0}
+                           : {a_super, c_hint_addr[31:16]};
+wire          uh_hit = u_valid[{c_hint_instr,hn_row[1:0]}] && (u_row[{c_hint_instr,hn_row[1:0]}] == hn_row) &&
+                       (u_tag[{c_hint_instr,hn_row[1:0]}] == hn_tag);
+// A held request repeats itself on the hint bus, so when the lookup pipe
+// resolves the request this cycle (the copy is being refilled from it)
+// the same entry translates the hint: without this every first access
+// to a page after a copy miss lost the one-clock hit (3 % of boot
+// dispatches).
+wire          hn_pipe = pipe_hit && (c_hint_addr == c_addr) && (c_hint_instr == c_instr);
+wire [EW-1:0] uh_ent = uh_hit ? u_ent[{c_hint_instr,hn_row[1:0]}] : pipe_ent;
+wire [19:0]   uh_pa  = uh_ent[27:8];
+wire [31:0]   hn_ttra = c_hint_instr ? itt0 : dtt0;
+wire [31:0]   hn_ttrb = c_hint_instr ? itt1 : dtt1;
+wire          hn_ttr_a = ttr_match(hn_ttra, c_hint_addr, a_super);
+wire          hn_ttr_b = ttr_match(hn_ttrb, c_hint_addr, a_super);
+wire          hn_ttr  = hn_ttr_a | hn_ttr_b;
+// The hint's cacheability and read protection, registered with its
+// translation, so the cache's one-clock acknowledge needs nothing from
+// the request's live translation (the ATC read, hit compare and pa mux
+// were 7 ns in front of the acknowledge, 2026-09-15): a cache-inhibited
+// or supervisor-only page never vouches, and the request then takes the
+// ordinary path (bypass, or the access error).
+wire  [1:0]   hn_ttr_cm = hn_ttr_a ? hn_ttra[6:5] : hn_ttrb[6:5];
+wire          hn_ci    = hn_ttr ? hn_ttr_cm[1] :
+                         (tc_e && (uh_hit || hn_pipe)) ? uh_ent[3] : 1'b0;
+wire          hn_sprot = tc_e && !hn_ttr && (uh_hit || hn_pipe) && !a_super && uh_ent[4];
+wire [31:0]   hn_pa   = hn_ttr ? c_hint_addr :
+                        (tc_e && (uh_hit || hn_pipe)) ? (tc_p ? {uh_pa[19:1], c_hint_addr[12], c_hint_addr[11:0]}
+                                                 : {uh_pa, c_hint_addr[11:0]})
+                        : c_hint_addr;
+wire          mmu_quiet = (wst == W_IDLE) && !w_active && !pf_req && !pt_req &&
+                          !sweep_on && !fill_we;
+wire          hn_ok    = (hn_ttr || !tc_e || uh_hit || hn_pipe) && mmu_quiet &&
+                         !hn_ci && !hn_sprot;
+// The hint's write side, registered with the rest: the page carries no
+// accumulated write protection (entry bit 0, or the TTR's W bit for a
+// transparent hint) and its modified bit is already set (entry bit 1: the
+// first write to a page walks to set M, and must).  A store whose request
+// is such a hint is acknowledged by the cache in its request cycle
+// (the one-clock posted store, 2026-09-19); every other store takes the
+// registered path, faults included.
+wire          hn_wp    = hn_ttr ? (hn_ttr_a ? hn_ttra[2] : hn_ttrb[2]) :
+                         (tc_e && (uh_hit || hn_pipe)) ? (uh_ent[0] || !uh_ent[1]) : 1'b0;
+wire          hn_wok   = hn_ok && !hn_wp;
+reg  [31:0]   hq_addr;
+reg           hq_instr, hq_super, hq_ok, hq_wok;
+reg  [21:0]   hq_ptag;
+reg [127:0]   ttr_q;
+always @(posedge clk) begin
+	hq_addr  <= c_hint_addr;
+	hq_instr <= c_hint_instr;
+	hq_super <= a_super;
+	hq_ptag  <= hn_pa[31:10];
+	hq_ok    <= nreset && hn_ok;
+	hq_wok   <= nreset && hn_wok;
+	ttr_q    <= {itt0, itt1, dtt0, dtt1};
+end
+assign m_hint_addr  = c_hint_addr;
+assign m_hint_instr = c_hint_instr;
+assign m_hint_ptag  = hq_ptag;
+assign m_hint_match = c_req && hq_ok && (hq_addr == c_addr) && (hq_instr == c_instr) &&
+                      (hq_super == a_super) && (tc == u_tc) &&
+                      (ttr_q == {itt0, itt1, dtt0, dtt1}) && mmu_quiet;
+assign m_hint_wmatch = m_hint_match && hq_wok;
+
+// P175: the instruction hint, translated the same way (instruction space,
+// the per-space copy's instruction entry, the ITTs) and registered.
+wire [3:0]    hi_set = tc_p ? c_ihint_addr[16:13] : c_ihint_addr[15:12];
+wire [4:0]    hi_row = {1'b1, hi_set};
+wire [16:0]   hi_tag = tc_p ? {a_super, c_ihint_addr[31:17], 1'b0}
+                           : {a_super, c_ihint_addr[31:16]};
+wire          ui_hit = u_valid[{1'b1,hi_row[1:0]}] && (u_row[{1'b1,hi_row[1:0]}] == hi_row) && (u_tag[{1'b1,hi_row[1:0]}] == hi_tag);
+wire          hi_pipe = pipe_hit && (c_ihint_addr == c_addr) && c_instr;
+wire [EW-1:0] ui_ent = ui_hit ? u_ent[{1'b1,hi_row[1:0]}] : pipe_ent;
+wire [19:0]   ui_pa  = ui_ent[27:8];
+wire          hi_ttr_a = ttr_match(itt0, c_ihint_addr, a_super);
+wire          hi_ttr_b = ttr_match(itt1, c_ihint_addr, a_super);
+wire          hi_ttr  = hi_ttr_a | hi_ttr_b;
+wire  [1:0]   hi_ttr_cm = hi_ttr_a ? itt0[6:5] : itt1[6:5];
+wire          hi_ci    = hi_ttr ? hi_ttr_cm[1] :
+                         (tc_e && (ui_hit || hi_pipe)) ? ui_ent[3] : 1'b0;
+wire          hi_sprot = tc_e && !hi_ttr && (ui_hit || hi_pipe) && !a_super && ui_ent[4];
+wire [31:0]   hi_pa   = hi_ttr ? c_ihint_addr :
+                        (tc_e && (ui_hit || hi_pipe)) ? (tc_p ? {ui_pa[19:1], c_ihint_addr[12], c_ihint_addr[11:0]}
+                                                 : {ui_pa, c_ihint_addr[11:0]})
+                        : c_ihint_addr;
+wire          hi_ok    = (hi_ttr || !tc_e || ui_hit || hi_pipe) && mmu_quiet &&
+                         !hi_ci && !hi_sprot;
+reg  [31:0]   hqi_addr;
+reg           hqi_super, hqi_ok;
+reg  [21:0]   hqi_ptag;
+always @(posedge clk) begin
+	hqi_addr  <= c_ihint_addr;
+	hqi_super <= a_super;
+	hqi_ptag  <= hi_pa[31:10];
+	hqi_ok    <= nreset && hi_ok;
+end
+assign m_ihint_addr  = c_ihint_addr;
+assign m_ihint_ptag  = hqi_ptag;
+assign m_ihint_match = c_req && c_instr && hqi_ok && (hqi_addr == c_addr) &&
+                       (hqi_super == a_super) && (tc == u_tc) &&
+                       (ttr_q == {itt0, itt1, dtt0, dtt1}) && mmu_quiet;
+
 endmodule
+

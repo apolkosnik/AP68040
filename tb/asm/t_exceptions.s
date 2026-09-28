@@ -697,10 +697,14 @@ irq_withdraw_loop:
 	; request to arrive inside the MOVE to SR that masks it.
 	move.w	#$2000,sr		; mask 0 while the request arrives
 	move.w	(cnt_int2).l,d5
-	; Five cycles lands inside MOVE-to-SR even when a resident next opcode is
-	; consumed at the preceding retirement boundary (one cycle earlier than
-	; the standalone S_FETCH path).
-	move.w	#5,(IPLDLY).l
+	; The request has to reach the registered level while the mask is
+	; still 0.  With the fetch queue on its own request channel (P171)
+	; MOVE-to-SR no longer waits for its immediate, so the NOP keeps the
+	; mask raise far enough out: four cycles lands inside MOVE-to-SR on
+	; both the shared-port and the split-channel cores (3-5 pass on
+	; P171, 3-7 on the shared port; 6+ arrive after the mask on P171).
+	move.w	#4,(IPLDLY).l
+	nop
 	move.w	#$2700,sr		; request qualifies inside this insn
 	nop
 	nop
@@ -812,11 +816,16 @@ t139_ok:
 	; FA = the fetch address, supervisor program space, ATC clear; RTE
 	; restarts the fetch, which then succeeds.  The target sits BEHIND
 	; the arming code so it can only ever be fetched through the
-	; branch's flush -- a demand fetch by construction.
+	; branch's flush -- a demand fetch by construction -- and in a
+	; different 64-byte sector from it: the branch-refill buffer keeps
+	; the last redirect's sector (the arming code's, entered by the
+	; bra.s), and a target resident there is served without a bus
+	; cycle, so the one-shot bus error would never be seen (P171).
 	bra.s	t141_arm
 t141_t:
 	nop			; restarted after the handler
 	bra.s	t141_chk
+	cnop	0,64
 t141_arm:
 	clr.w	(cnt_fberr).l
 	lea	t141_t(pc),a0

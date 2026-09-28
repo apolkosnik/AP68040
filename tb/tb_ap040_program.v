@@ -506,7 +506,11 @@ always @(posedge clk) begin
 		// Reset vectors, exception frames and exception vectors are
 		// supervisor-data cycles; the first handler opcode is supervisor
 		// program.  This also catches a leaked MOVES SFC/DFC override.
-		if (dut.core.in_exc) begin
+		// A posted store drains after its requester moved on: a user store
+		// issued just before a trap drains while the core is already in
+		// exception processing, with its own (user) FC.  Attribute those
+		// cycles to the store, not to the exception.
+		if (dut.core.in_exc && !dut.cache_posting) begin
 			if (busstate == 2'b00 && fc !== 3'd6) begin
 				errors = errors + 1;
 				$display("FAIL: exception handler fetch used FC=%0d, expected 6", fc);

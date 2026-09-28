@@ -17,7 +17,10 @@ module ap040_tg68k_compat
 	parameter AP040_HAS_MMU      = 1,
 	parameter AP040_HAS_FPU      = 1,
 	parameter AP040_ENABLE_CACHE = 1,
-	parameter AP040_FAST_SIM     = 0
+	parameter AP040_FAST_SIM     = 0,
+	// Post stores to on-board RAM (the MiSTer wrapper's behaviour).  A bench
+	// that bus-errors a RAM write to test the fault path sets it to 0.
+	parameter AP040_POST_STORES  = 1
 )
 (
 	input         clk,
@@ -94,9 +97,78 @@ wire        mem_write;
 wire        mem_instr;
 wire  [1:0] mem_size;
 wire [31:0] mem_addr;
+wire [31:0] mem_hint_addr, mm_hint_addr;
+wire        mem_hint_away, mem_fast_ready, mem_ack_q;
+wire        mem_hint_instr, mm_hint_instr, mm_hint_match, mm_hint_wmatch;
+wire [21:0] mm_hint_ptag;
+wire [31:0] mem_ihint_addr, mm_ihint_addr;   // the instruction hint bus (P175)
+wire [21:0] mm_ihint_ptag;
+wire        mm_ihint_match;
 wire [31:0] mem_wdata;
 wire  [2:0] mem_fc;
 wire        mem_ack;
+
+// ---- P171: two request channels from the core, one port into the MMU ----
+// The core keeps the fetch queue's requests (ifr_*) apart from its data
+// requests (mem_*), so a data request can be issued and hinted while a
+// fetch is outstanding.  One channel is presented to the MMU/cache at a
+// time; a presented request is never switched until it completes; when
+// both wait, the data request goes first (the CPU is stalled on it, the
+// fetch is speculative).  Acknowledge and fault return to the presented
+// channel only; the platform's berr belongs to it as well.
+wire        ifr_req, ifr_ack, ifr_flt, ifr_berr;
+wire [31:0] ifr_addr;
+wire  [1:0] ifr_size;
+wire  [2:0] ifr_fc;
+wire        core_req, core_write, core_instr;   // the data channel as the core drives it
+wire  [1:0] core_size;
+wire [31:0] core_addr, core_wdata;
+wire  [2:0] core_fc;
+wire        core_ack, core_flt, core_berr;
+reg         pres_v, pres_instr;
+// P184: a fetch in its first presented clock that the instruction hint
+// carried the clock before (row and word) is served by the instruction
+// mirrors (fast_ihit); the architectural banks stay on the data hint then,
+// so the data side's idle read is not lost to every one-clock fetch.  If
+// the fetch does not hit, the cache holds its registered lookup for that
+// clock and the banks follow the fetch from the next (pres_v).
+reg   [9:0] ihint_q;
+always @(posedge clk) ihint_q <= mem_ihint_addr[11:2];
+wire        ifetch_hinted_first = !pres_v && (ihint_q == ifr_addr[11:2]);
+wire        sel_instr = pres_v ? pres_instr : !core_req;
+// The MMU's W_DROP state (and the original core's exception entry) rely
+// on a request-low cycle after a fault before the next request is seen;
+// with two channels the other one would otherwise take the port in the
+// very next cycle and c_req would never fall.
+reg         flt_gap;
+assign mem_req   = !flt_gap && (sel_instr ? ifr_req  : core_req);
+assign mem_write = sel_instr ? 1'b0     : core_write;
+assign mem_instr = sel_instr;
+assign mem_size  = sel_instr ? ifr_size : core_size;
+assign mem_addr  = sel_instr ? ifr_addr : core_addr;
+assign mem_wdata = core_wdata;
+assign mem_fc    = sel_instr ? ifr_fc   : core_fc;
+wire        p_done = mem_ack | mem_flt | berr;
+assign core_ack = mem_ack && !sel_instr;
+assign ifr_ack  = mem_ack &&  sel_instr;
+// MMU faults and bus errors stay separate (the frame's ATC bit), each
+// delivered to the channel presented when it happened.
+assign core_flt  = mem_flt && !sel_instr;
+assign ifr_flt   = mem_flt &&  sel_instr;
+assign core_berr = berr    && !sel_instr;
+assign ifr_berr  = berr    &&  sel_instr;
+always @(posedge clk) begin
+	if (!nreset) begin pres_v <= 0; pres_instr <= 0; flt_gap <= 0; end
+	else begin
+		flt_gap <= p_done && (mem_flt | berr);
+		if (pres_v) begin
+			if (p_done) pres_v <= 0;
+		end
+		else if (mem_req && !p_done) begin
+			pres_v <= 1; pres_instr <= sel_instr;
+		end
+	end
+end
 wire [31:0] mem_rdata;
 wire        mem_flt_mmu;
 // Core-side stall watchdog.  Every prior watchdog counts a DOWNSTREAM
@@ -170,19 +242,27 @@ ap040_core #(
 	.nreset(nreset),
 	.ce(clkena_in),
 
-	.mem_req(mem_req),
-	.mem_write(mem_write),
-	.mem_instr(mem_instr),
-	.mem_size(mem_size),
-	.mem_addr(mem_addr),
-	.mem_wdata(mem_wdata),
-	.mem_fc(mem_fc),
-	.mem_ack(mem_ack),
+	.mem_req(core_req),
+	.mem_write(core_write),
+	.mem_instr(core_instr),
+	.mem_size(core_size),
+	.mem_addr(core_addr),
+	.mem_hint_addr(mem_hint_addr),
+	.mem_hint_instr(mem_hint_instr),
+	.mem_hint_away(mem_hint_away),
+	.mem_fast_ready(mem_fast_ready),
+	.mem_ack_q(mem_ack_q),
+	.mem_ihint_addr(mem_ihint_addr),
+	.mem_wdata(core_wdata),
+	.mem_fc(core_fc),
+	.mem_ack(core_ack),
+	.ifr_req(ifr_req), .ifr_addr(ifr_addr), .ifr_size(ifr_size), .ifr_fc(ifr_fc),
+	.ifr_ack(ifr_ack), .ifr_flt(ifr_flt), .ifr_berr(ifr_berr), .ifr_pres(sel_instr),
 	.mem_rdata(mem_rdata),
 	.mem_line_stb(mem_line_stb),
 	.mem_line_tag(mem_line_tag),
 	.mem_line_data(mem_line_data),
-	.mem_flt(mem_flt),
+	.mem_flt(core_flt),
 
 	.tc_out(w_tc),
 	.urp_out(w_urp),
@@ -209,7 +289,7 @@ ap040_core #(
 
 	.ipl(ipl),
 	.ipl_autovector(ipl_autovector),
-	.berr(berr),
+	.berr(core_berr),
 	.nmi_ack_toggle(nmi_ack_toggle),
 
 	.nresetout(nresetout),
@@ -241,6 +321,9 @@ ap040_mmu mmu (
 	.c_instr(mem_instr),
 	.c_size(mem_size),
 	.c_addr(mem_addr),
+	.c_hint_addr(mem_hint_addr),
+	.c_hint_instr(mem_hint_instr),
+	.c_ihint_addr(mem_ihint_addr),
 	.c_wdata(mem_wdata),
 	.c_fc(mem_fc),
 	.c_ack(mem_ack),
@@ -268,6 +351,14 @@ ap040_mmu mmu (
 	.m_instr(mm_instr),
 	.m_size(mm_size),
 	.m_addr(mm_addr),
+	.m_hint_addr(mm_hint_addr),
+	.m_hint_instr(mm_hint_instr),
+	.m_hint_ptag(mm_hint_ptag),
+	.m_hint_match(mm_hint_match),
+	.m_hint_wmatch(mm_hint_wmatch),
+	.m_ihint_addr(mm_ihint_addr),
+	.m_ihint_ptag(mm_ihint_ptag),
+	.m_ihint_match(mm_ihint_match),
 	.m_wdata(mm_wdata),
 	.m_fc(mm_fc),
 	.m_ack(mm_ack),
@@ -326,6 +417,9 @@ end
 wire        snp_stb  = cache_snoop_stb | wsnp_pend;
 wire [31:0] snp_addr = cache_snoop_stb ? cache_snoop_addr : wsnp_addr;
 
+// a posted store is draining (the bench's FC check attributes those bus
+// cycles to the store, not to whatever the core is doing by then)
+wire        cache_posting;
 generate
 if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	// With the snoop port wired up, chip RAM is cacheable too: a chipset
@@ -373,14 +467,37 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_instr(mm_instr),
 		.c_size(mm_size),
 		.c_addr(mm_addr),
+		.c_hint_addr(mm_hint_addr),
+		.c_hint_instr(mm_hint_instr),
+		.c_hint_ptag(mm_hint_ptag),
+		.c_hint_match(mm_hint_match),
+		.c_hint_wmatch(mm_hint_wmatch),
+		.c_hint_away(mem_hint_away),
+		.c_fast_ready(mem_fast_ready),
+		.c_ack_q(mem_ack_q),
+		.c_ihint_addr(mm_ihint_addr),
+		.c_ihint_ptag(mm_ihint_ptag),
+		.c_ihint_match(mm_ihint_match),
+		.c_ihold(mem_req && sel_instr && !ifetch_hinted_first),
 		.c_wdata(mm_wdata),
 		.c_fc(mm_fc),
 		.c_nocache(mm_nocache | ~cache_allow |
 		           (mm_instr & cache_chip & ~cache_allow_all)),
-		.c_post_ok(1'b0),   // no store queue below this bench: never post
+		// Post stores to on-board RAM as the MiSTer wrapper does (its
+		// predicate: RAM or the VRAM window); the cache drains them from
+		// its captured copy, so the bench needs no queue of its own.  The
+		// bench's magic registers at $F1xx are its I/O (the bus-error
+		// target at $F140 among them) and are never posted.
+		// Tied low until 2026-09-19, which left every posted-store path
+		// unexercised by the suite.
+		.c_post_ok((AP040_POST_STORES != 0) && (mm_addr[31:30] == 2'b00) && (mm_addr[15:8] != 8'hF1)),
+		// the same on the hint's physical tag (pa[31:10]): the magic page
+		// group $F000-$F3FF is excluded whole
+		.c_post_ok_hint((AP040_POST_STORES != 0) && (mm_hint_ptag[21:20] == 2'b00) && (mm_hint_ptag[5:0] != 6'b111100)),
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),
+		.c_posting(cache_posting),
 		.c_rdata(mm_rdata),
 		.c_line_stb(mm_line_stb),
 		.c_line_tag(mm_line_tag),
@@ -404,6 +521,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	);
 end
 else begin : g_nocache
+	assign cache_posting = 1'b0;
 	// no internal caches: the MMU talks straight to the bus adapter and
 	// CINV/CPUSH complete immediately (a 68040 whose caches never fill).
 	// The Minimig build uses this and relies on cpu_cache_new in the RAM

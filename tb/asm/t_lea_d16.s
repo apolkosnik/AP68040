@@ -1,0 +1,112 @@
+; All 64 An source/destination pairs, signed d16 limits, CCR preservation,
+; consecutive dependent LEAs, plus PC-relative/absolute fallback paths.
+    org 0
+    dc.l $7000,start
+    rept 254
+    dc.l failed
+    endr
+    org $400
+check macro
+    move.l #$12348000,\1
+    move.w #$1f,ccr
+    lea \3(\1),\2
+    move.w sr,d1
+    andi.w #$1f,d1
+    cmpi.w #$1f,d1
+    bne failed
+    cmpa.l #($12348000+\3),\2
+    bne failed
+    lea 1(\2),\2
+    lea -1(\2),\2
+    cmpa.l #($12348000+\3),\2
+    bne failed
+    endm
+pair macro
+    check \1,\2,-32768
+    check \1,\2,-1
+    check \1,\2,0
+    check \1,\2,1
+    check \1,\2,32767
+    endm
+start:
+    move.l #$80008000,d0
+    movec d0,cacr
+    pair a0,a0
+    pair a0,a1
+    pair a0,a2
+    pair a0,a3
+    pair a0,a4
+    pair a0,a5
+    pair a0,a6
+    pair a0,a7
+    pair a1,a0
+    pair a1,a1
+    pair a1,a2
+    pair a1,a3
+    pair a1,a4
+    pair a1,a5
+    pair a1,a6
+    pair a1,a7
+    pair a2,a0
+    pair a2,a1
+    pair a2,a2
+    pair a2,a3
+    pair a2,a4
+    pair a2,a5
+    pair a2,a6
+    pair a2,a7
+    pair a3,a0
+    pair a3,a1
+    pair a3,a2
+    pair a3,a3
+    pair a3,a4
+    pair a3,a5
+    pair a3,a6
+    pair a3,a7
+    pair a4,a0
+    pair a4,a1
+    pair a4,a2
+    pair a4,a3
+    pair a4,a4
+    pair a4,a5
+    pair a4,a6
+    pair a4,a7
+    pair a5,a0
+    pair a5,a1
+    pair a5,a2
+    pair a5,a3
+    pair a5,a4
+    pair a5,a5
+    pair a5,a6
+    pair a5,a7
+    pair a6,a0
+    pair a6,a1
+    pair a6,a2
+    pair a6,a3
+    pair a6,a4
+    pair a6,a5
+    pair a6,a6
+    pair a6,a7
+    pair a7,a0
+    pair a7,a1
+    pair a7,a2
+    pair a7,a3
+    pair a7,a4
+    pair a7,a5
+    pair a7,a6
+    pair a7,a7
+    move.l #$7000,a7
+    lea marker(pc),a0
+    cmpa.l #marker,a0
+    bne failed
+    lea ($12345678).l,a0
+    cmpa.l #$12345678,a0
+    bne failed
+    move.w #$600d,($f102).l
+    stop #$2700
+marker:
+    dc.w 0
+failed:
+    move.w #$1ea,($f100).l
+    move.w #$bad0,($f102).l
+    stop #$2700

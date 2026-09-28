@@ -43,6 +43,18 @@ module ap040_cache
 	input             c_instr,
 	input       [1:0] c_size,
 	input      [31:0] c_addr,
+	input      [31:0] c_hint_addr,   // next access, one cycle early
+	input             c_hint_instr,
+	input      [21:0] c_hint_ptag,   // its physical tag, registered by the MMU
+	input             c_hint_match,  // the request is that hint
+	input             c_hint_wmatch, // ... and the MMU vouches for writing its page now
+	input             c_hint_away,   // this clock's hint is not the presented request (P182)
+	output            c_fast_ready,  // registered: a hinted data read can hit in one clock now (P182)
+	output            c_ack_q,       // registered: this clock's acknowledge is ack_r's (P204)
+	input      [31:0] c_ihint_addr,  // the instruction side's hint (P175)
+	input      [21:0] c_ihint_ptag,  // its physical tag, registered by the MMU
+	input             c_ihint_match, // the request is that hint
+	input             c_ihold,       // an instruction request is presented (the arbiter's registered choice)
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
 	input             c_nocache,
@@ -50,7 +62,15 @@ module ap040_cache
 	// its store queue and never report a bus error for them), so the cache
 	// may acknowledge such a store on admission and drain it afterwards.
 	input             c_post_ok,
+	// The same predicate evaluated on the HINT's physical address (the
+	// platform derives it from c_hint_ptag, which the MMU registered), so
+	// the one-clock posted store below hangs off registers only; a store
+	// it acknowledges is posted whatever the live c_post_ok says (the two
+	// agree whenever the request is the hint, except when the store queue
+	// filled in between, and then the drain simply waits for it).
+	input             c_post_ok_hint,
 	output            c_ack,
+	output            c_posting,     // a posted store is draining (bench attribution)
 	output     [31:0] c_rdata,
 	// Instruction line sideband: one cycle after an instruction hit is
 	// acknowledged, the whole 16-byte physical line it came from (word 0 in
@@ -117,7 +137,8 @@ module ap040_cache
 // SETW index bits per bank: 6 = 4 KB (the MC68040 geometry), 8 = 16 KB.
 // Sets, rows ({bank, set}) and data words ({bank, set, way}) derive from it;
 // the tag is everything above the index.
-localparam SETW = 8;
+// Interim peripheral build: 8 KB per bank leaves M10Ks for Mac devices.
+localparam SETW = 7;
 localparam ROWIW = SETW + 1;
 localparam DIDXW = SETW + 3;
 localparam TAGW = 28 - SETW;
@@ -129,12 +150,88 @@ localparam ROWW = 2 + 4 + 4*TAGW;
 // one) addresses array k at way (k - w) mod 4; a line-wise read of one way
 // addresses every array at that way and returns the whole 16-byte line in a
 // single cycle.  Same total bits as the plain per-way layout.
-(* ramstyle = "no_rw_check" *) reg [31:0] cdata0 [0:(1<<DIDXW)-1];
-(* ramstyle = "no_rw_check" *) reg [31:0] cdata1 [0:(1<<DIDXW)-1];
-(* ramstyle = "no_rw_check" *) reg [31:0] cdata2 [0:(1<<DIDXW)-1];
-(* ramstyle = "no_rw_check" *) reg [31:0] cdata3 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata0_b3 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata0_b2 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata0_b1 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata0_b0 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata1_b3 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata1_b2 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata1_b1 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata1_b0 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata2_b3 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata2_b2 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata2_b1 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata2_b0 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata3_b3 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata3_b2 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata3_b1 [0:(1<<DIDXW)-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] cdata3_b0 [0:(1<<DIDXW)-1];
+
+// Mirrored data banks read the NEXT word of all four ways on every idle
+// read (P170, from P136 without its live-request look paths): a longword
+// at 2 mod 4, or a word at 3 mod 4, inside its line is acknowledged in its
+// request cycle from the registered hint, as fast_hit does for an aligned
+// one.  Speedometer's Pascal pushes word arguments, so every callee's stack
+// longwords sit at 2 mod 4 and took the registered path (MOVEM 45k, RTS 12k,
+// UNLK 16k acknowledges per Permute(7)).
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata0_b3 [0:(1<<(DIDXW-1))-1];   // data rows only (P175b)
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata0_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata0_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata0_b0 [0:(1<<(DIDXW-1))-1];
+reg [31:0] pair_q0;
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata1_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata1_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata1_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata1_b0 [0:(1<<(DIDXW-1))-1];
+reg [31:0] pair_q1;
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata2_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata2_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata2_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata2_b0 [0:(1<<(DIDXW-1))-1];
+reg [31:0] pair_q2;
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata3_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata3_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata3_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] pairdata3_b0 [0:(1<<(DIDXW-1))-1];
+reg [31:0] pair_q3;
 
 wire [ROWW-1:0] tag_q;
+wire [ROWW-1:0] hint_tag_q;
+// P175: the instruction side's own idle read.  A mirror of the tag RAM and
+// of the data banks, written in step with them, is read every clock at the
+// instruction hint's row and word, so the fetch's one-clock hit
+// (fast_ihit) never competes with the data hint for the architectural
+// arrays.  The mirror banks for the pair hit (pairdata) stay as they are.
+wire [ROWW-1:0] ihint_tag_q;
+// P178: the data hint's NEXT row (data bank), for the one-clock hit of a
+// longword that spans two lines: the mirror tag RAM's port B reads its
+// tags and the pair banks read its word 0 when the hint sits at word 3.
+wire [ROWW-1:0] xhint_tag_q;
+wire [31:0] c_ihint_addr_x = c_ihint_addr;
+wire  [SETW-1:0] xi_set = c_ihint_addr[SETW+3:4];
+wire  [ROWIW-1:0] xi_row = {1'b1, xi_set};
+wire  [1:0] xi_w = c_ihint_addr[3:2];
+// The mirrors hold only their own bank's rows (the index drops the bank
+// bit): a full-depth mirror is 28 M10K and took the device over its RAM
+// budget, at which point Quartus quietly turned the framework's OSD and
+// palette buffers into 80,000 registers (P175b, first fit).
+(* ramstyle = "no_rw_check" *) reg [7:0] idata0_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata0_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata0_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata0_b0 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata1_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata1_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata1_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata1_b0 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata2_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata2_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata2_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata2_b0 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata3_b3 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata3_b2 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata3_b1 [0:(1<<(DIDXW-1))-1];
+(* ramstyle = "no_rw_check" *) reg [7:0] idata3_b0 [0:(1<<(DIDXW-1))-1];
+reg [31:0] idata_q0, idata_q1, idata_q2, idata_q3;
 reg  [31:0] data_q0, data_q1, data_q2, data_q3;
 
 // RAM control (driven combinationally from the FSM state so the arrays
@@ -149,7 +246,8 @@ wire        cd_rd_en;
 wire  [DIDXW-1:0] cd_ridx, cd_widx;
 wire  [3:0] cd_we;               // one per way
 wire [31:0] cd_wdat;             // single-word writes (fills, aligned merges)
-wire [31:0] cd_wdat0, cd_wdat1, cd_wdat2, cd_wdat3;   // per array, for pair merges
+wire [31:0] cd_wdat0, cd_wdat1, cd_wdat2, cd_wdat3;   // per array
+wire  [3:0] cd_be0, cd_be1, cd_be2, cd_be3;           // their byte enables (P195)
 
 // Reads free-run: the address is held for the whole request, so a stalled
 // ce simply re-reads the same row.  Only the writes are ce-gated.
@@ -160,23 +258,93 @@ dpram #(ROWIW, ROWW) ctag_ram
 	.data_a    (tag_wdat),
 	.wren_a    (ce & tag_we),
 	.q_a       (tag_q),
-	.address_b (inv_idx),
+	.address_b (inv_wren ? inv_idx : x_row),
 	.data_b    ({ROWW{1'b0}}),
 	.wren_b    (inv_wren),
-	.q_b       ()
+	.q_b       (hint_tag_q)
 );
+// P175: the mirror tag RAM -- port A takes the same writes and otherwise
+// reads the instruction hint's row; port B takes the same invalidates.
+dpram #(ROWIW, ROWW) ctag_ram_i
+(
+	.clock     (clk),
+	.address_a (tag_we ? tag_widx : xi_row),
+	.data_a    (tag_wdat),
+	.wren_a    (ce & tag_we),
+	.q_a       (ihint_tag_q),
+	.address_b (inv_wren ? inv_idx : x_rowp1),
+	.data_b    ({ROWW{1'b0}}),
+	.wren_b    (inv_wren),
+	.q_b       (xhint_tag_q)
+);
+// In the clock a fast instruction hit acknowledges, the mirror reads that
+// way's whole line (every array at {set, way}) for the offer a clock later
+// (P174, moved here from the pair banks); the instruction hint's own idle
+// read is skipped in that clock (the offer feeds the queue next).
+always @(posedge clk) begin
+	if (ce & cd_we[0] & cd_widx[DIDXW-1]) begin
+		if (cd_be0[3]) idata0_b3[cd_widx[DIDXW-2:0]] <= cd_wdat0[31:24];
+		if (cd_be0[2]) idata0_b2[cd_widx[DIDXW-2:0]] <= cd_wdat0[23:16];
+		if (cd_be0[1]) idata0_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat0[15:8];
+		if (cd_be0[0]) idata0_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat0[7:0];
+	end
+	if (ce & cd_we[1] & cd_widx[DIDXW-1]) begin
+		if (cd_be1[3]) idata1_b3[cd_widx[DIDXW-2:0]] <= cd_wdat1[31:24];
+		if (cd_be1[2]) idata1_b2[cd_widx[DIDXW-2:0]] <= cd_wdat1[23:16];
+		if (cd_be1[1]) idata1_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat1[15:8];
+		if (cd_be1[0]) idata1_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat1[7:0];
+	end
+	if (ce & cd_we[2] & cd_widx[DIDXW-1]) begin
+		if (cd_be2[3]) idata2_b3[cd_widx[DIDXW-2:0]] <= cd_wdat2[31:24];
+		if (cd_be2[2]) idata2_b2[cd_widx[DIDXW-2:0]] <= cd_wdat2[23:16];
+		if (cd_be2[1]) idata2_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat2[15:8];
+		if (cd_be2[0]) idata2_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat2[7:0];
+	end
+	if (ce & cd_we[3] & cd_widx[DIDXW-1]) begin
+		if (cd_be3[3]) idata3_b3[cd_widx[DIDXW-2:0]] <= cd_wdat3[31:24];
+		if (cd_be3[2]) idata3_b2[cd_widx[DIDXW-2:0]] <= cd_wdat3[23:16];
+		if (cd_be3[1]) idata3_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat3[15:8];
+		if (cd_be3[0]) idata3_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat3[7:0];
+	end
+	if (ce) begin
+		idata_q0 <= {idata0_b3[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd0 - xi_w}], idata0_b2[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd0 - xi_w}], idata0_b1[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd0 - xi_w}], idata0_b0[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd0 - xi_w}]};
+		idata_q1 <= {idata1_b3[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd1 - xi_w}], idata1_b2[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd1 - xi_w}], idata1_b1[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd1 - xi_w}], idata1_b0[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd1 - xi_w}]};
+		idata_q2 <= {idata2_b3[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd2 - xi_w}], idata2_b2[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd2 - xi_w}], idata2_b1[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd2 - xi_w}], idata2_b0[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd2 - xi_w}]};
+		idata_q3 <= {idata3_b3[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd3 - xi_w}], idata3_b2[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd3 - xi_w}], idata3_b1[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd3 - xi_w}], idata3_b0[fast_ihit ? {hqi_lo[SETW+3:4], hint_way} : {xi_set, 2'd3 - xi_w}]};
+	end
+end
 
 wire  [DIDXW-1:0] cd_ridx0, cd_ridx1, cd_ridx2, cd_ridx3;
 always @(posedge clk) begin
-	if (ce & cd_we[0]) cdata0[cd_widx] <= cd_wdat0;
-	if (ce & cd_we[1]) cdata1[cd_widx] <= cd_wdat1;
-	if (ce & cd_we[2]) cdata2[cd_widx] <= cd_wdat2;
-	if (ce & cd_we[3]) cdata3[cd_widx] <= cd_wdat3;
+	if (ce & cd_we[0]) begin
+		if (cd_be0[3]) cdata0_b3[cd_widx] <= cd_wdat0[31:24];
+		if (cd_be0[2]) cdata0_b2[cd_widx] <= cd_wdat0[23:16];
+		if (cd_be0[1]) cdata0_b1[cd_widx]  <= cd_wdat0[15:8];
+		if (cd_be0[0]) cdata0_b0[cd_widx]   <= cd_wdat0[7:0];
+	end
+	if (ce & cd_we[1]) begin
+		if (cd_be1[3]) cdata1_b3[cd_widx] <= cd_wdat1[31:24];
+		if (cd_be1[2]) cdata1_b2[cd_widx] <= cd_wdat1[23:16];
+		if (cd_be1[1]) cdata1_b1[cd_widx]  <= cd_wdat1[15:8];
+		if (cd_be1[0]) cdata1_b0[cd_widx]   <= cd_wdat1[7:0];
+	end
+	if (ce & cd_we[2]) begin
+		if (cd_be2[3]) cdata2_b3[cd_widx] <= cd_wdat2[31:24];
+		if (cd_be2[2]) cdata2_b2[cd_widx] <= cd_wdat2[23:16];
+		if (cd_be2[1]) cdata2_b1[cd_widx]  <= cd_wdat2[15:8];
+		if (cd_be2[0]) cdata2_b0[cd_widx]   <= cd_wdat2[7:0];
+	end
+	if (ce & cd_we[3]) begin
+		if (cd_be3[3]) cdata3_b3[cd_widx] <= cd_wdat3[31:24];
+		if (cd_be3[2]) cdata3_b2[cd_widx] <= cd_wdat3[23:16];
+		if (cd_be3[1]) cdata3_b1[cd_widx]  <= cd_wdat3[15:8];
+		if (cd_be3[0]) cdata3_b0[cd_widx]   <= cd_wdat3[7:0];
+	end
 	if (ce & cd_rd_en) begin
-		data_q0 <= cdata0[cd_ridx0];
-		data_q1 <= cdata1[cd_ridx1];
-		data_q2 <= cdata2[cd_ridx2];
-		data_q3 <= cdata3[cd_ridx3];
+		data_q0 <= {cdata0_b3[cd_ridx0], cdata0_b2[cd_ridx0], cdata0_b1[cd_ridx0], cdata0_b0[cd_ridx0]};
+		data_q1 <= {cdata1_b3[cd_ridx1], cdata1_b2[cd_ridx1], cdata1_b1[cd_ridx1], cdata1_b0[cd_ridx1]};
+		data_q2 <= {cdata2_b3[cd_ridx2], cdata2_b2[cd_ridx2], cdata2_b1[cd_ridx2], cdata2_b0[cd_ridx2]};
+		data_q3 <= {cdata3_b3[cd_ridx3], cdata3_b2[cd_ridx3], cdata3_b1[cd_ridx3], cdata3_b0[cd_ridx3]};
 	end
 end
 
@@ -205,6 +373,20 @@ wire        span2     = !c_instr && (c_addr[3:2] != 2'd3) &&
 // splits page-crossing accesses itself, so both halves of what arrives
 // here translated identically.  (These were 3.8 M reads at 10.5 clocks
 // in the Speedometer bracket, 4 % of its cycles.)
+// While no request is presented the idle RAM reads index by the hint bus;
+// the request bus is registered state only (see the core's mem_hint_addr).
+// The core repeats a presented request on the hint bus (mem_hint_addr is
+// mem_addr_q while mem_req), so the RAM address inputs index by the hint
+// bus alone: no request/hint mux in front of fifty RAM address bits.
+// P175: while an instruction request is presented the architectural
+// banks follow the instruction hint (which repeats that request), so its
+// registered paths (idle_hit, C_LOOK, the line read) index its own row.
+wire [31:0] x_addr  = c_ihold ? c_ihint_addr : c_hint_addr;
+wire        x_instr = c_ihold;
+wire  [SETW-1:0] x_set = x_addr[SETW+3:4];
+wire  [SETW:0]   x_row = {x_instr, x_set};
+wire  [SETW:0]   x_rowp1 = {1'b0, x_set + {{(SETW-1){1'b0}}, 1'b1}};   // the data hint's next row (P178)
+wire  [1:0] x_w     = x_addr[3:2];
 wire        xline     = !c_instr && (c_addr[3:2] == 2'd3) &&
                         ((c_size == `AP040_SZ_L && c_addr[1:0] != 2'b00) ||
                          (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b11));
@@ -241,7 +423,21 @@ localparam C_TAGW  = 3'd5;
 localparam C_PASS  = 3'd6;
 localparam C_SWEEP = 3'd7;   // reset / CINV: walk the rows clearing them
 
-reg   [2:0] cst;
+`ifdef AP040_EXPERIMENTAL_XSTORE
+localparam C_XSTORE_LOOK = 4'd8, C_XSTORE_WRITE = 4'd9;
+reg [3:0] cst;
+reg cross_store, cross_fault, cross_second_lost;
+wire cross_lookup = cst == C_XSTORE_LOOK;
+wire cross_second = cst == C_XSTORE_WRITE;
+// Only host-qualified non-faulting posted memory uses delayed hit merges.
+// Uncacheable and potentially faulting writes retain both-set invalidation.
+wire cross_accept = c_write && !c_instr && de && !c_nocache &&
+                    write_cross_line && c_post_ok;
+`else
+reg [2:0] cst;
+wire cross_store = 1'b0, cross_fault = 1'b0, cross_second_lost = 1'b0;
+wire cross_lookup = 1'b0, cross_second = 1'b0, cross_accept = 1'b0;
+`endif
 reg   [ROWIW-1:0] sweep_cnt;
 reg         sweep_all;   // reset sweep clears both banks
 reg         winv_pend;   // a store still owes its second-line invalidate
@@ -271,6 +467,8 @@ reg   [1:0] r_hway;              // the way the first C_LOOK cycle found
 reg   [1:0] fill_cnt;            // beats completed in this fill (requested word first)
 reg   [2:0] r_fc;                // the fill's own function code (the requester may be gone)
 reg         sline_ready;         // a spanning store's line read has completed
+reg         sp_held;             // ... and its two merge words are held (P187)
+reg  [31:0] sp_h0, sp_h1;
 reg         fill_acked;          // the requester already has its data
 reg  [31:0] r_wdata;             // captured aligned store data for hit update
 reg         ack_r;
@@ -420,6 +618,16 @@ endfunction
 wire snoop_fill_row = s_stb && !r_bank && (s_addr[SETW+3:4] == r_row[SETW-1:0]);
 wire snoop_look_row = s_stb && !c_instr && (s_addr[SETW+3:4] == a_set);
 wire snoop_xrow     = s_stb && (s_addr[SETW+3:4] == r_setB);
+// A next-line snoop may arrive while CE is stopped. Retain it until
+// the read resumes so the second-line result cannot use stale RAM data.
+reg xline_snoop_pending;
+always @(posedge clk) begin
+    if (!nreset) xline_snoop_pending <= 0;
+    else begin
+        if (ce && rd_accept) xline_snoop_pending <= 0;
+        if (cst == C_LOOK && xlook && snoop_xrow) xline_snoop_pending <= 1;
+    end
+end
 reg  fill_snooped, look_snooped;
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -463,7 +671,7 @@ wire store_update_ok = c_write && !c_instr && de && !c_nocache && store_lane;
 // a matching line (MC68040UM 4.3.1.1: write-through stores update matching
 // lines) instead of invalidating its whole set.
 wire store_update2   = c_write && !c_instr && de && !c_nocache && span2;
-wire store_any_update = store_update_ok || store_update2;
+wire store_any_update = store_update_ok || store_update2 || cross_accept;
 
 // Set when a transfer this cache issued took a bus error; cleared when
 // the core withdraws the faulted request.  Without it the level-held
@@ -507,21 +715,74 @@ assign m_addr  = fill_active ? {r_addr[31:4], r_beat, 2'b00} :
 assign m_wdata = post_active ? p_wdata : c_wdata;
 assign m_fc    = fill_active ? r_fc : (post_active ? p_fc : c_fc);
 
-assign c_ack   = (pass_active && !post_active) ? m_ack : ack_r;
+// A data read whose idle read (set up by the core's hint) holds the
+// matching word is acknowledged in its request cycle: the tag compare
+// runs against the hint's registered physical tag (c_hint_ptag) and the
+// MMU vouches that the request is that hint (c_hint_match), so nothing
+// in the acknowledge path starts at the live translation.  Instruction
+// fetches keep the registered acknowledge (their consumer is the fetch
+// queue's ring write, the tightest path in the core).
+wire fast_hit;
+wire [31:0] fast_data;
+wire fast_ihit;
+wire [1:0] hint_way;
+wire [ROWIW-1:0] hq_irow;
+reg  pair_idle_valid;
+reg  iline_pair_pending;
+// Keep writes identical to the architectural cache banks. Only the
+// independent synchronous read address differs; cache capacity is unchanged.
+wire [1:0] pair_read_word = x_w + 2'd1;
+wire [SETW:0] pair_row = (x_w == 2'd3 && !x_instr) ? x_rowp1 : x_row;   // P178
+always @(posedge clk) begin
+    if (ce & cd_we[0] & !cd_widx[DIDXW-1]) begin
+		if (cd_be0[3]) pairdata0_b3[cd_widx[DIDXW-2:0]] <= cd_wdat0[31:24];
+		if (cd_be0[2]) pairdata0_b2[cd_widx[DIDXW-2:0]] <= cd_wdat0[23:16];
+		if (cd_be0[1]) pairdata0_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat0[15:8];
+		if (cd_be0[0]) pairdata0_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat0[7:0];
+	end
+    if (ce & cd_we[1] & !cd_widx[DIDXW-1]) begin
+		if (cd_be1[3]) pairdata1_b3[cd_widx[DIDXW-2:0]] <= cd_wdat1[31:24];
+		if (cd_be1[2]) pairdata1_b2[cd_widx[DIDXW-2:0]] <= cd_wdat1[23:16];
+		if (cd_be1[1]) pairdata1_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat1[15:8];
+		if (cd_be1[0]) pairdata1_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat1[7:0];
+	end
+    if (ce & cd_we[2] & !cd_widx[DIDXW-1]) begin
+		if (cd_be2[3]) pairdata2_b3[cd_widx[DIDXW-2:0]] <= cd_wdat2[31:24];
+		if (cd_be2[2]) pairdata2_b2[cd_widx[DIDXW-2:0]] <= cd_wdat2[23:16];
+		if (cd_be2[1]) pairdata2_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat2[15:8];
+		if (cd_be2[0]) pairdata2_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat2[7:0];
+	end
+    if (ce & cd_we[3] & !cd_widx[DIDXW-1]) begin
+		if (cd_be3[3]) pairdata3_b3[cd_widx[DIDXW-2:0]] <= cd_wdat3[31:24];
+		if (cd_be3[2]) pairdata3_b2[cd_widx[DIDXW-2:0]] <= cd_wdat3[23:16];
+		if (cd_be3[1]) pairdata3_b1[cd_widx[DIDXW-2:0]]  <= cd_wdat3[15:8];
+		if (cd_be3[0]) pairdata3_b0[cd_widx[DIDXW-2:0]]   <= cd_wdat3[7:0];
+	end
+    if (ce & cd_rd_en) begin
+        pair_q0 <= {pairdata0_b3[{pair_row[SETW-1:0], 2'd0 - pair_read_word}], pairdata0_b2[{pair_row[SETW-1:0], 2'd0 - pair_read_word}], pairdata0_b1[{pair_row[SETW-1:0], 2'd0 - pair_read_word}], pairdata0_b0[{pair_row[SETW-1:0], 2'd0 - pair_read_word}]};
+        pair_q1 <= {pairdata1_b3[{pair_row[SETW-1:0], 2'd1 - pair_read_word}], pairdata1_b2[{pair_row[SETW-1:0], 2'd1 - pair_read_word}], pairdata1_b1[{pair_row[SETW-1:0], 2'd1 - pair_read_word}], pairdata1_b0[{pair_row[SETW-1:0], 2'd1 - pair_read_word}]};
+        pair_q2 <= {pairdata2_b3[{pair_row[SETW-1:0], 2'd2 - pair_read_word}], pairdata2_b2[{pair_row[SETW-1:0], 2'd2 - pair_read_word}], pairdata2_b1[{pair_row[SETW-1:0], 2'd2 - pair_read_word}], pairdata2_b0[{pair_row[SETW-1:0], 2'd2 - pair_read_word}]};
+        pair_q3 <= {pairdata3_b3[{pair_row[SETW-1:0], 2'd3 - pair_read_word}], pairdata3_b2[{pair_row[SETW-1:0], 2'd3 - pair_read_word}], pairdata3_b1[{pair_row[SETW-1:0], 2'd3 - pair_read_word}], pairdata3_b0[{pair_row[SETW-1:0], 2'd3 - pair_read_word}]};
+        pair_idle_valid <= 1'b1;
+    end
+end
+
+assign c_ack   = (pass_active && !post_active) ? m_ack : (ack_r | fast_hit | fast_ihit | fast_store | fast_span_ack | fast_pair_idle | fast_xline_idle);
 // The offer is a level, not a pulse: the core refuses a line while a
 // queue fetch is outstanding or a data access acknowledges in the same
 // cycle, and a pulse lost to that refusal cost explicit fetches for the
 // rest of the line (Sieve, 2026-09-14).  The core's accept is idempotent.
 assign c_line_stb  = iline_valid && !iline_pending;
-assign c_busy      = fill_active || (cst == C_TAGW) || post_active;
+assign c_busy      = fill_active || (cst == C_TAGW) || post_active || cross_lookup || cross_second;
+assign c_posting   = post_active;
 // A spanning store merges from its line read, which completes one cycle
 // after admission; a capture-cycle acknowledge would arrive first and
 // force the invalidate fallback (13 % more data fills in the Speedometer
 // profile), so only non-spanning stores are reported posted at once.
-assign m_posted    = post_active && (!r_span2 || sline_ready);
+assign m_posted    = post_active;   // P195: a spanning store no longer reads its line first
 assign c_line_tag  = iline_tag;
 assign c_line_data = iline_data;
-assign c_rdata = pass_active ? m_rdata : rdata_r;
+assign c_rdata = (pass_active && !post_active) ? m_rdata : fast_pair_idle ? hint_pair_data : fast_xline_idle ? hint_xline_data : fast_span_ack ? span_extract({sp_w0, sp_w1}, r_size, r_off) : (fast_hit ? fast_data : fast_ihit ? fast_idata : rdata_r);
 
 assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                    c_req && !ack_r && !c_write && !bypass &&
@@ -535,8 +796,12 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
 // alike) while the first lookup's hit is being decided
 wire xlook_read = (cst == C_LOOK) && r_xline && !xlook && look_hit &&
                   !look_snooped && !snoop_look_row && !inv_wren;
-assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row :
-                   xlook_read ? {1'b0, r_setB} : a_row;
+assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active || cross_lookup || cross_second) ? r_row :
+                   // P196: a store accepted while the core hints its next access
+                   // looks its tag up at its own row
+                   (c_hint_away && c_write) ? a_row :
+                   idle_xline_hit ? {1'b0, a_set + {{(SETW-1){1'b0}},1'b1}} :
+                   xlook_read ? {1'b0, r_setB} : x_row;
 wire [4*TAGW-1:0] tags_next = (r_way == 2'd0) ? {tag_q[4*TAGW-1:TAGW], r_tag} :
                         (r_way == 2'd1) ? {tag_q[4*TAGW-1:2*TAGW], r_tag, tag_q[TAGW-1:0]} :
                         (r_way == 2'd2) ? {tag_q[4*TAGW-1:3*TAGW], r_tag, tag_q[2*TAGW-1:0]} :
@@ -625,7 +890,7 @@ wire ipred_hit = (cst == C_IDLE) && c_req && !ack_r && !c_write && c_instr &&
                  ie && !c_nocache && fits_long && !ci_inv_pend &&
                  !(cinv_req && !cinv_done) && iline_valid &&
                  (c_addr[31:4] == iline_tag);
-wire iline_hit = ipred_hit;
+wire iline_hit = ipred_hit && !fast_ihit;
 wire [31:0] iline_lw = (c_addr[3:2] == 2'd0) ? iline_data[127:96] :
                        (c_addr[3:2] == 2'd1) ? iline_data[95:64]  :
                        (c_addr[3:2] == 2'd2) ? iline_data[63:32]  :
@@ -636,24 +901,96 @@ wire [31:0] iline_lw = (c_addr[3:2] == 2'd0) ? iline_data[127:96] :
 // AFTER translation, permissions and cacheability have been resolved.
 // Remember which synchronous read actually produced the RAM outputs. The
 // tag read free-runs even with ce low, whereas data reads are ce-gated.
+// Port B prepares the hinted tag row while port A serves a posted store.
+// A read is still admitted only after the store has left C_PASS.
+reg hint_tag_valid;
+reg [ROWIW-1:0] hint_tag_idx;
+// P175: the instruction mirrors' read of the previous clock
+reg ihint_tag_valid, idle_idata_valid;
+reg [ROWIW-1:0] ihint_tag_idx;
+reg xhint_tag_valid;
+reg [ROWIW-1:0] xhint_tag_idx;
+reg [DIDXW-1:0] idle_idata_idx;
+reg [SETW+3:0] hqi_lo;
+always @(posedge clk) begin
+	hqi_lo <= c_ihint_addr[SETW+3:0];
+	if (!nreset) begin ihint_tag_valid <= 0; ihint_tag_idx <= 0; idle_idata_valid <= 0; idle_idata_idx <= 0; xhint_tag_valid <= 0; xhint_tag_idx <= 0; end
+	else begin
+		ihint_tag_idx <= xi_row;
+		ihint_tag_valid <= !inv_wren && !tag_we;
+		xhint_tag_idx <= x_rowp1;
+		xhint_tag_valid <= !inv_wren && !tag_we;
+		if (ce) begin
+			idle_idata_idx <= {xi_row, xi_w};
+			idle_idata_valid <= !fast_ihit && !inv_wren && (!(|cd_we) || (cd_widx[DIDXW-1:2] != xi_row));
+		end
+		else if (inv_wren || (|cd_we)) idle_idata_valid <= 0;
+	end
+end
+always @(posedge clk) begin
+    if (!nreset) begin hint_tag_valid <= 0; hint_tag_idx <= 0; end
+    else begin
+        hint_tag_idx <= x_row;
+        hint_tag_valid <= !inv_wren && !tag_we;
+    end
+end
+// Save the original word before speculative reads replace the RAM outputs.
+// Partial stores must merge against this word when their bus ack arrives.
+reg posted_word_valid;
+reg [31:0] posted_word;
+always @(posedge clk) begin
+    if (!nreset) begin posted_word_valid <= 0; posted_word <= 0; end
+    else if (ce) begin
+        if (!post_active) posted_word_valid <= 0;
+        else if (!posted_word_valid) begin
+            posted_word <= data_hit;
+            posted_word_valid <= 1;
+        end
+    end
+end
+wire [31:0] store_merge_word = (post_active && posted_word_valid) ? posted_word : data_hit;
+// P187: a spanning store's merge words are captured (sp_h0/sp_h1) in the
+// clock its line read lands, so from then on the data banks are free for
+// the next access's idle read as for any other posted store -- Pascal's
+// 2-mod-4 stack longwords made every such store cost the following read
+// its one-clock hit.
+wire posted_hint_read = (cst == C_PASS) && post_active &&
+    !cross_store && !pass_ci_chk && !winv_pend &&
+    !ci_inv_pend && !store_inv_lost;
 reg idle_data_valid, idle_tag_valid;
+// P178 fix: the pair banks' next-row read (x_rowp1, for the cross-line
+// hit) needs its own same-clock write check -- idle_data_valid only
+// rejects a write to x_row, and a posted store's C_PASS write to the next
+// line lands exactly in the clocks posted_hint_read keeps the idle read up.
+reg idle_next_valid;
 reg [DIDXW-1:0] idle_data_idx;
+wire rd_redirect;   // P220: the arrays read another row/word than the hint's
 reg [ROWIW-1:0] idle_tag_idx;
 always @(posedge clk) begin
 	if (!nreset) begin
 		idle_data_valid <= 0;
 		idle_tag_valid <= 0;
+		idle_next_valid <= 0;
 		idle_data_idx <= 0;
 		idle_tag_idx <= 0;
 	end else begin
 		idle_tag_idx <= tag_we ? tag_widx : tag_ridx;
 		// Reject all mixed-port writes, conservatively even to another row.
 		idle_tag_valid <= !tag_we && !inv_wren;
-		if (inv_wren || (ce && |cd_we)) idle_data_valid <= 0;
+		if (inv_wren || (ce && |cd_we)) begin idle_data_valid <= 0; idle_next_valid <= 0; end
 		if (ce && cd_rd_en) begin
-			idle_data_idx <= {c_instr, a_set, c_addr[3:2]};
-			idle_data_valid <= (cst == C_IDLE) && !iline_read &&
-			                   !inv_wren && !(|cd_we);
+			idle_data_idx <= {x_instr, x_set, x_addr[3:2]};
+			// P220: and only when the arrays really read the hint's row and
+			// word -- a cross-line idle hit (its registered twin fires in the
+			// same clock as fast_xline_idle), the crossing lookups and the
+			// second-line reads steer rd_row/rd_w elsewhere, and a read issued
+			// in place on the next edge used to hit on that other row's data
+			idle_data_valid <= ((cst == C_IDLE) || posted_hint_read) && !iline_read && !rd_redirect &&
+                               !inv_wren && (!(|cd_we) ||
+                               (cd_widx[DIDXW-1:2] != x_row));
+			idle_next_valid <= ((cst == C_IDLE) || posted_hint_read) && !iline_read && !rd_redirect &&
+                               !inv_wren && (!(|cd_we) ||
+                               ((cd_widx[DIDXW-1:2] != x_row) && (cd_widx[DIDXW-1:2] != x_rowp1)));
 		end
 	end
 end
@@ -662,24 +999,257 @@ wire idle_hit = rd_accept && !ipred_hit && !err_hold && !m_err && fits_lane &&
                 (idle_data_idx == {c_instr, c_addr[SETW+3:2]}) &&
                 (idle_tag_idx == a_row) && look_hit &&
                 !tag_we && !inv_wren && !look_snooped && !snoop_look_row;
+// Start a settled within-line pair read at admission.
+// P217: not when the one-clock pair hit is predicted from its registered
+// terms: the line read it starts replaced the next clock's idle read, so a
+// run of 2-mod-4 longwords (MOVEM on the stack, FPU operands, Pascal stack
+// temporaries) could not hit two in a row.  A wrong prediction only sends
+// the read to the registered lookup.
+wire pair_pred;   // assigned after hint_pair_lane
+wire idle_span_hit = rd_accept && !ipred_hit && !err_hold && !m_err && span2 && !pair_pred &&
+                idle_data_valid && idle_tag_valid &&
+                (idle_data_idx == {c_instr, c_addr[SETW+3:2]}) &&
+                (idle_tag_idx == a_row) && look_hit &&
+                !tag_we && !inv_wren && !look_snooped && !snoop_look_row;
+// Start a settled crossing read's second lookup at admission.
+wire idle_xline_hit = rd_accept && !ipred_hit && !err_hold && !m_err && xline &&
+                idle_data_valid && idle_tag_valid &&
+                (idle_data_idx == {c_instr, c_addr[SETW+3:2]}) &&
+                (idle_tag_idx == a_row) && look_hit &&
+                !tag_we && !inv_wren && !look_snooped && !snoop_look_row;
+wire hh0 = hint_tag_q[4*TAGW+0] && (hint_tag_q[0*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire hh1 = hint_tag_q[4*TAGW+1] && (hint_tag_q[1*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire hh2 = hint_tag_q[4*TAGW+2] && (hint_tag_q[2*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire hh3 = hint_tag_q[4*TAGW+3] && (hint_tag_q[3*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire       hint_look_hit = hh0 | hh1 | hh2 | hh3;
+// The fast hit's own view of the request: the hint bus repeats the
+// registered request address while it is presented, so the offset bits
+// come from there and not from the translated address (whose low bits
+// pass through the MMU's physical-address mux).  They are taken from
+// the cache's own registered copy of the hint (hq_lo), not from the live
+// bus: c_hint_match already requires the request to equal the hint the
+// MMU registered a cycle earlier, so the two agree whenever fast_hit can
+// be true, and the timing analyzer no longer follows the core's
+// combinational hint mux (state -> hint select) into the word select,
+// the ALU and the branch lookahead (a 33 ns false path that missed the
+// 33 MHz clock by 3.8 ns, 2026-09-17).
+reg  [SETW+3:0] hq_lo;
+always @(posedge clk) hq_lo <= c_hint_addr[SETW+3:0];
+wire        fast_lane = (c_size == `AP040_SZ_L && hq_lo[1:0] == 2'b00) ||
+                        (c_size == `AP040_SZ_W && hq_lo[1:0] != 2'b11) ||
+                        (c_size == `AP040_SZ_B);
+// Admission for the one-clock acknowledge without the request's live
+// translation: no c_req (the MMU asserts it only after its translation
+// passes), no bypass (cacheability is in the hint's vouch), no ipred_hit
+// (instruction only); c_hint_match carries "a data request is presented,
+// it is the registered hint, it translated, it is cacheable and readable".
+wire        fast_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) && !ack_r &&
+                          !c_write && !c_instr && de && !ci_inv_pend && !store_inv_lost;
+// P182: fast_accept's and fast_hit's registered terms, for the core's
+// acknowledge prediction (no request, hint compare or acknowledge in it)
+// P204: nothing is admitted in an ack_r clock (every admission requires
+// !ack_r), so the core may hint its next request in it
+assign c_ack_q = ack_r;
+// P210: or a posted store's C_PASS with fast_accept_pp's registered terms
+// (declared below): the read after a store hits there, and the MOVE store
+// behind it can be hinted in that clock (the posted store's C_PASS lasts one
+// clock, so the cache is back in C_IDLE when the MOVE store arrives)
+wire        c_fast_ready_pp;
+assign c_fast_ready = ((cst == C_IDLE) || c_fast_ready_pp) && !(cinv_req && !cinv_done) && !ack_r && de &&
+                      !ci_inv_pend && !store_inv_lost && idle_data_valid && hint_tag_valid;
+// Rotate words using the registered offset before the late tag selection.
+// Preserve the original way priority, including the no-hit default.
+wire [31:0] hint_word0 = (hq_lo[3:2] == 0) ? data_q0 :
+    (hq_lo[3:2] == 1) ? data_q1 :
+    (hq_lo[3:2] == 2) ? data_q2 : data_q3;
+wire [31:0] hint_word1 = (hq_lo[3:2] == 0) ? data_q1 :
+    (hq_lo[3:2] == 1) ? data_q2 :
+    (hq_lo[3:2] == 2) ? data_q3 : data_q0;
+wire [31:0] hint_word2 = (hq_lo[3:2] == 0) ? data_q2 :
+    (hq_lo[3:2] == 1) ? data_q3 :
+    (hq_lo[3:2] == 2) ? data_q0 : data_q1;
+wire [31:0] hint_word3 = (hq_lo[3:2] == 0) ? data_q3 :
+    (hq_lo[3:2] == 1) ? data_q0 :
+    (hq_lo[3:2] == 2) ? data_q1 : data_q2;
+wire [31:0] hint_data_hit = (hint_word0 & {32{hh0}}) |
+    (hint_word1 & {32{!hh0 && hh1}}) |
+    (hint_word2 & {32{!hh0 && !hh1 && hh2}}) |
+    (hint_word3 & {32{!hh0 && !hh1 && !hh2}});
+// idle_hit without look_hit (the live translation's tag compare)
+// P196: a data read may also hit in its request cycle while a posted store
+// finishes in C_PASS -- its row differing from the store's (whose RAM write
+// may land this clock), the store not line-crossing (the second line is
+// written after C_PASS), no invalidate owed.
+// The store writes only its own bytes (P195), so the read's idle-read data
+// stays right unless a word it takes is one the store writes: the store's
+// word (and the next, spanning) against the read's word (and the next, for
+// the pair and cross-line hits; the cross-line one's second word is word 0
+// of the next row).
+wire [SETW+1:0] pp_sw0 = {r_row[SETW-1:0], r_addr[3:2]};
+wire [SETW+1:0] pp_sw1 = pp_sw0 + {{SETW{1'b0}}, 2'd1};
+wire [SETW+1:0] pp_rw0 = hq_lo[SETW+3:2];
+wire [SETW+1:0] pp_rw1 = pp_rw0 + {{SETW{1'b0}}, 2'd1};
+wire        pp_clash = (pp_rw0 == pp_sw0) || (r_span2 && (pp_rw0 == pp_sw1)) ||
+                       (pp_rw1 == pp_sw0) || (r_span2 && (pp_rw1 == pp_sw1));
+assign c_fast_ready_pp = (cst == C_PASS) && post_active && !cross_store && !pass_ci_chk &&
+                         !winv_pend && !pp_clash;
+wire        fast_accept_pp = (cst == C_PASS) && post_active && !cross_store && !pass_ci_chk &&
+                             !winv_pend && !ci_inv_pend && !store_inv_lost &&
+                             !(cinv_req && !cinv_done) && !ack_r && !c_write && !c_instr && de &&
+                             !pp_clash;
+assign fast_hit  = (fast_accept || fast_accept_pp) && !err_hold && !m_err && fast_lane &&
+                   idle_data_valid && hint_tag_valid &&
+                   (idle_data_idx == {1'b0, hq_lo[SETW+3:2]}) &&
+                   (hint_tag_idx == {1'b0, hq_lo[SETW+3:4]}) && hint_look_hit &&
+                   // !snoop_wr, not !inv_wren: with cst == C_IDLE, !c_write,
+                   // !ci_inv_pend and !store_inv_lost already required, every
+                   // other term of inv_wren is zero, and inv_wren's store term
+                   // carries c_req -- the live translation (ATC RAM -> hit ->
+                   // walk decision), which put 8 ns in front of the fast
+                   // acknowledge and its data (build 5, -1.04 ns, 2026-09-17).
+                   // the snoop-row collision compares against the registered
+                   // hint's set as well: snoop_look_row uses a_set from c_addr,
+                   // whose low bits reach the cache through the MMU's
+                   // physical-address mux, i.e. another false dependency on
+                   // the live translation for the analyzer
+                   !tag_we && !snoop_wr && !look_snooped &&
+                   !(s_stb && (s_addr[SETW+3:4] == hq_lo[SETW+3:4])) &&
+                   !c_instr && c_hint_match;
+assign fast_data = lw_extract(hint_data_hit, c_size, hq_lo[1:0]);
+// P174/P175: the one-clock instruction hit -- fast_hit's terms on the
+// instruction side's own idle read (the mirror tag row and the mirror
+// data word at the instruction hint, the hint's registered physical tag,
+// the MMU's vouch that the request is that hint).  An instruction fetch
+// is an aligned longword or a word, so the lane always fits.  The
+// buffered-line hit (ipred_hit, a registered acknowledge) yields to it.
+wire ihh0 = ihint_tag_q[4*TAGW+0] && (ihint_tag_q[0*TAGW +: TAGW] == c_ihint_ptag[21:22-TAGW]);
+wire ihh1 = ihint_tag_q[4*TAGW+1] && (ihint_tag_q[1*TAGW +: TAGW] == c_ihint_ptag[21:22-TAGW]);
+wire ihh2 = ihint_tag_q[4*TAGW+2] && (ihint_tag_q[2*TAGW +: TAGW] == c_ihint_ptag[21:22-TAGW]);
+wire ihh3 = ihint_tag_q[4*TAGW+3] && (ihint_tag_q[3*TAGW +: TAGW] == c_ihint_ptag[21:22-TAGW]);
+wire ihint_look_hit = ihh0 | ihh1 | ihh2 | ihh3;
+assign hint_way = ihh0 ? 2'd0 : ihh1 ? 2'd1 : ihh2 ? 2'd2 : 2'd3;
+assign hq_irow  = {1'b1, hqi_lo[SETW+3:4]};
+wire [31:0] ihint_word0 = (hqi_lo[3:2] == 0) ? idata_q0 : (hqi_lo[3:2] == 1) ? idata_q1 : (hqi_lo[3:2] == 2) ? idata_q2 : idata_q3;
+wire [31:0] ihint_word1 = (hqi_lo[3:2] == 0) ? idata_q1 : (hqi_lo[3:2] == 1) ? idata_q2 : (hqi_lo[3:2] == 2) ? idata_q3 : idata_q0;
+wire [31:0] ihint_word2 = (hqi_lo[3:2] == 0) ? idata_q2 : (hqi_lo[3:2] == 1) ? idata_q3 : (hqi_lo[3:2] == 2) ? idata_q0 : idata_q1;
+wire [31:0] ihint_word3 = (hqi_lo[3:2] == 0) ? idata_q3 : (hqi_lo[3:2] == 1) ? idata_q0 : (hqi_lo[3:2] == 2) ? idata_q1 : idata_q2;
+wire [31:0] ihint_data_hit = (ihint_word0 & {32{ihh0}}) |
+    (ihint_word1 & {32{!ihh0 && ihh1}}) |
+    (ihint_word2 & {32{!ihh0 && !ihh1 && ihh2}}) |
+    (ihint_word3 & {32{!ihh0 && !ihh1 && !ihh2}});
+wire        ifast_lane = (c_size == `AP040_SZ_L && hqi_lo[1:0] == 2'b00) ||
+                         (c_size == `AP040_SZ_W && hqi_lo[1:0] != 2'b11);
+// P201: and during a posted store's C_PASS (fast_accept_pp's terms): the
+// hit reads only the instruction mirrors, which no store writes, so the
+// store's own row needs no clash check.
+wire        fast_iaccept = ((cst == C_IDLE) ||
+                            ((cst == C_PASS) && post_active && !cross_store && !pass_ci_chk && !winv_pend)) &&
+                           !(cinv_req && !cinv_done) && !ack_r &&
+                           !c_write && c_instr && ie && !ci_inv_pend && !store_inv_lost;
+assign fast_ihit = fast_iaccept && !err_hold && !m_err && ifast_lane &&
+                   idle_idata_valid && ihint_tag_valid &&
+                   (idle_idata_idx == {1'b1, hqi_lo[SETW+3:2]}) &&
+                   (ihint_tag_idx == hq_irow) && ihint_look_hit &&
+                   !tag_we && !snoop_wr && !look_snooped &&
+                   !(s_stb && (s_addr[SETW+3:4] == hqi_lo[SETW+3:4])) &&
+                   !iline_pending && !iline_pair_pending && c_ihint_match;
+wire [31:0] fast_idata = lw_extract(ihint_data_hit, c_size, hqi_lo[1:0]);
+// The hinted pair hit (P170): fast_hit's terms with the pair lane instead of the aligned one.
+wire hint_pair_lane = hq_lo[3:2] != 3 &&
+    ((c_size == `AP040_SZ_L && hq_lo[1:0] != 0) ||
+     (c_size == `AP040_SZ_W && hq_lo[1:0] == 3));
+assign pair_pred = c_fast_ready && hint_pair_lane && pair_idle_valid &&
+                   (idle_data_idx == {1'b0, hq_lo[SETW+3:2]}) &&
+                   (hint_tag_idx == {1'b0, hq_lo[SETW+3:4]});
+wire fast_pair_idle = (fast_accept || fast_accept_pp) && !err_hold && !m_err && hint_pair_lane &&
+                   idle_data_valid && pair_idle_valid && hint_tag_valid &&
+                   (idle_data_idx == {1'b0, hq_lo[SETW+3:2]}) &&
+                   (hint_tag_idx == {1'b0, hq_lo[SETW+3:4]}) && hint_look_hit &&
+                   // !snoop_wr, not !inv_wren: with cst == C_IDLE, !c_write,
+                   // !ci_inv_pend and !store_inv_lost already required, every
+                   // other term of inv_wren is zero, and inv_wren's store term
+                   // carries c_req -- the live translation (ATC RAM -> hit ->
+                   // walk decision), which put 8 ns in front of the fast
+                   // acknowledge and its data (build 5, -1.04 ns, 2026-09-17).
+                   // the snoop-row collision compares against the registered
+                   // hint's set as well: snoop_look_row uses a_set from c_addr,
+                   // whose low bits reach the cache through the MMU's
+                   // physical-address mux, i.e. another false dependency on
+                   // the live translation for the analyzer
+                   !tag_we && !snoop_wr && !look_snooped &&
+                   !(s_stb && (s_addr[SETW+3:4] == hq_lo[SETW+3:4])) &&
+                   !c_instr && c_hint_match;
+wire [31:0] hint_pair_word0 = hq_lo[3:2] == 0 ? pair_q1 : hq_lo[3:2] == 1 ? pair_q2 : hq_lo[3:2] == 2 ? pair_q3 : pair_q0;
+wire [31:0] hint_pair_word1 = hq_lo[3:2] == 0 ? pair_q2 : hq_lo[3:2] == 1 ? pair_q3 : hq_lo[3:2] == 2 ? pair_q0 : pair_q1;
+wire [31:0] hint_pair_word2 = hq_lo[3:2] == 0 ? pair_q3 : hq_lo[3:2] == 1 ? pair_q0 : hq_lo[3:2] == 2 ? pair_q1 : pair_q2;
+wire [31:0] hint_pair_word3 = hq_lo[3:2] == 0 ? pair_q0 : hq_lo[3:2] == 1 ? pair_q1 : hq_lo[3:2] == 2 ? pair_q2 : pair_q3;
+wire [31:0] hint_pair_next = (hint_pair_word0 & {32{hh0}}) |
+    (hint_pair_word1 & {32{!hh0 && hh1}}) |
+    (hint_pair_word2 & {32{!hh0 && !hh1 && hh2}}) |
+    (hint_pair_word3 & {32{!hh0 && !hh1 && !hh2}});
+wire [31:0] hint_pair_data = span_extract({hint_data_hit, hint_pair_next}, c_size, hq_lo[1:0]);
+// P178: the one-clock hit of a longword (or a word at 3 mod 4) that spans
+// two lines: this line's word 3 from the hinted idle read, the next line's
+// word 0 from the pair banks (read at the next row when the hint sits at
+// word 3), the next row's tags from the mirror tag RAM's port B.  The two
+// lines share the page unless the set wraps, which is excluded.
+wire xhh0 = xhint_tag_q[4*TAGW+0] && (xhint_tag_q[0*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire xhh1 = xhint_tag_q[4*TAGW+1] && (xhint_tag_q[1*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire xhh2 = xhint_tag_q[4*TAGW+2] && (xhint_tag_q[2*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire xhh3 = xhint_tag_q[4*TAGW+3] && (xhint_tag_q[3*TAGW +: TAGW] == c_hint_ptag[21:22-TAGW]);
+wire xhint_look_hit = xhh0 | xhh1 | xhh2 | xhh3;
+// word 0 of way k sits in array k
+wire [31:0] xhint_next = (pair_q0 & {32{xhh0}}) |
+    (pair_q1 & {32{!xhh0 && xhh1}}) |
+    (pair_q2 & {32{!xhh0 && !xhh1 && xhh2}}) |
+    (pair_q3 & {32{!xhh0 && !xhh1 && !xhh2}});
+wire [SETW-1:0] hq_setp1 = hq_lo[SETW+3:4] + {{(SETW-1){1'b0}}, 1'b1};
+wire hint_xline_lane = hq_lo[3:2] == 2'd3 && !(&hq_lo[SETW+3:4]) &&
+    ((c_size == `AP040_SZ_L && hq_lo[1:0] != 0) ||
+     (c_size == `AP040_SZ_W && hq_lo[1:0] == 3));
+wire fast_xline_idle = (fast_accept || fast_accept_pp) && !err_hold && !m_err && hint_xline_lane &&
+                   idle_next_valid && pair_idle_valid && hint_tag_valid && xhint_tag_valid &&
+                   (idle_data_idx == {1'b0, hq_lo[SETW+3:2]}) &&
+                   (hint_tag_idx == {1'b0, hq_lo[SETW+3:4]}) && hint_look_hit &&
+                   (xhint_tag_idx == {1'b0, hq_setp1}) && xhint_look_hit &&
+                   !tag_we && !snoop_wr && !look_snooped &&
+                   !(s_stb && ((s_addr[SETW+3:4] == hq_lo[SETW+3:4]) || (s_addr[SETW+3:4] == hq_setp1))) &&
+                   !c_instr && c_hint_match;
+wire [31:0] hint_xline_data = span_extract({hint_data_hit, xhint_next}, c_size, hq_lo[1:0]);
+
+// The one-clock posted store: a data write that the platform posts
+// (c_post_ok), whose request is the registered hint and whose page the
+// MMU vouches for writing (c_hint_wmatch: translated, cacheable, not
+// write-protected, modified bit set), admitted in C_IDLE with nothing
+// owed.  The admission below does everything it did -- captures the
+// copy it drains from, sets post_active, books the hit-update -- on this
+// same edge; only the acknowledge moves from the registered ack_r a
+// cycle later to now.  Every term is a register or the MMU's registered
+// verdict, as for fast_hit.  (2026-09-19)
+wire        fast_store = (cst == C_IDLE) && !(cinv_req && !cinv_done) && !ack_r &&
+                         !err_hold && !m_err && c_write && !c_instr &&
+                         !store_inv_lost && c_post_ok_hint && c_hint_wmatch;
 
 // Any instruction hit that identified its way (a C_LOOK hit, or an idle
 // admission) reads that way's whole line on the same edge it acknowledges.
 wire iline_seed_read = (cst == C_LOOK) && look_hit && r_bank && !look2;
-wire iline_idle_read = idle_hit && c_instr;
+wire iline_idle_read = idle_hit && c_instr && !fast_ihit;
 wire dline_read = (cst == C_LOOK) && look_hit && !r_bank && r_span2 && !look2;
 wire iline_tagw_read = (cst == C_TAGW) && r_bank && !fill_snooped && !snoop_fill_row;
-wire sline_read = (cst == C_PASS) && pass_store_chk && r_span2 && look_hit && !sline_ready;
-wire iline_read = iline_seed_read || iline_idle_read || dline_read || iline_tagw_read || sline_read;
-wire [ROWIW-1:0] line_read_row = iline_idle_read ? {1'b1, c_addr[SETW+3:4]} : r_row;
+wire sline_read = 1'b0;   // P195: byte-enable writes need no line read
+wire iline_read = iline_seed_read || iline_idle_read || dline_read || iline_tagw_read || sline_read || idle_span_hit;
+wire [ROWIW-1:0] line_read_row = (iline_idle_read || idle_span_hit) ? {c_instr, c_addr[SETW+3:4]} : r_row;
 wire [1:0] line_read_way = iline_tagw_read ? r_way : hit_way;
 
-assign cd_rd_en  = (cst == C_IDLE) || rd_accept || store_lookup_accept || iline_read ||
-                   xlook_read;
+assign cd_rd_en  = (cst == C_IDLE) || posted_hint_read || rd_accept || store_lookup_accept || iline_read ||
+                   xlook_read || cross_lookup;
 // word-wise: array k at way (k - w); line-wise: every array at the hit way;
 // the crossing read's second lookup: word 0 of the next row
-wire  [1:0] rd_w = xlook_read ? 2'd0 : c_addr[3:2];
-wire  [SETW:0] rd_row = xlook_read ? {1'b0, r_setB} : {c_instr, a_set};
+assign rd_redirect = idle_xline_hit || xlook_read || cross_lookup || cross_second;
+wire  [1:0] rd_w = (idle_xline_hit || xlook_read || cross_lookup || cross_second) ? 2'd0 : x_w;
+wire  [SETW:0] rd_row = (cross_lookup || cross_second) ? r_row :
+                        idle_xline_hit ? {1'b0, a_set + {{(SETW-1){1'b0}},1'b1}} :
+                   xlook_read ? {1'b0, r_setB} : x_row;
 assign cd_ridx0  = iline_read ? {line_read_row, line_read_way}
                               : {rd_row, 2'd0 - rd_w};
 assign cd_ridx1  = iline_read ? {line_read_row, line_read_way}
@@ -696,25 +1266,74 @@ wire [31:0] sp_w0 = (sp_a0 == 2'd0) ? data_q0 : (sp_a0 == 2'd1) ? data_q1 :
                     (sp_a0 == 2'd2) ? data_q2 : data_q3;
 wire [31:0] sp_w1 = (sp_a1 == 2'd0) ? data_q0 : (sp_a1 == 2'd1) ? data_q1 :
                     (sp_a1 == 2'd2) ? data_q2 : data_q3;
-wire store_hit_write = (cst == C_PASS) && pass_store_chk && m_ack && look_hit &&
-                       (!r_span2 || sline_ready);
+wire store_hit_write = look_hit &&
+                       (((cst == C_PASS) && pass_store_chk && m_ack && (!cross_store || !m_err) &&
+                         1'b1) ||
+                        (cross_second && !cross_second_lost));
 wire store_pair_write = store_hit_write && r_span2;
 wire fill_beat_write = ((cst == C_FILL) && r_issued && m_ack) || fill_line_write;
 wire  [1:0] wr_way = store_hit_write ? hit_way : r_way;
 wire  [1:0] wr_arr = wr_way + r_beat;
 wire  [1:0] wr_arr1 = wr_arr + 2'd1;
-wire [63:0] pair_new = span_merge({sp_w0, sp_w1}, r_wdata, r_size, r_off);
+// The registered whole-line read already supplies both words in look2.
+// Acknowledge a qualified spanning data hit here instead of registering it.
+// No c_req here (P176): the request was accepted into C_LOOK and is
+// level-held until its acknowledge, and c_req is the MMU's pass_ok -- the
+// live ATC lookup (ATC RAM -> hit -> need_walk), which this term put in
+// front of c_rdata and c_ack, i.e. in front of the operand that the
+// in-place compare-and-branch dispatch consumes in the same clock (the
+// CPU clock's worst path, -1.2 to -1.6 ns across seeds).  C_LOOK only
+// ever holds a read (stores post through C_PASS); c_write and c_instr are
+// the core's own registers through the arbiter mux and stay.
+wire fast_span_ack = (cst == C_LOOK) && look2 && r_span2 && !r_bank &&
+    !c_write && !c_instr && !look_snooped && !snoop_look_row &&
+    !err_hold && !m_err;
+wire [63:0] pair_new = span_merge(sp_held ? {sp_h0, sp_h1} : {sp_w0, sp_w1}, r_wdata, r_size, r_off);
 assign cd_we     = store_pair_write ? ((4'd1 << wr_arr) | (4'd1 << wr_arr1)) :
                    (store_hit_write || fill_beat_write) ? (4'd1 << wr_arr) : 4'd0;
-assign cd_wdat0  = store_pair_write ? (wr_arr1 == 2'd0 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
-assign cd_wdat1  = store_pair_write ? (wr_arr1 == 2'd1 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
-assign cd_wdat2  = store_pair_write ? (wr_arr1 == 2'd2 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
-assign cd_wdat3  = store_pair_write ? (wr_arr1 == 2'd3 ? pair_new[31:0] : pair_new[63:32]) : cd_wdat;
+// P195: a store hit writes only its own bytes, so no store reads the old
+// word first.  st_val/st_be place the operand over the pair {word w, word
+// w+1} (w = the word its first byte is in); a store inside one longword
+// uses the high half, a spanning store both, a line-crossing store the high
+// half in its first line (word 3) and the low half in the next (word 0).
+wire  [7:0] st_be  = ((r_size == `AP040_SZ_B) ? 8'b1000_0000 :
+                      (r_size == `AP040_SZ_W) ? 8'b1100_0000 : 8'b1111_0000) >> r_off;
+wire [63:0] st_val = ((r_size == `AP040_SZ_B) ? {r_wdata[7:0], 56'd0} :
+                      (r_size == `AP040_SZ_W) ? {r_wdata[15:0], 48'd0} : {r_wdata, 32'd0}) >> {r_off, 3'd0};
+wire        st_lo  = cross_second;          // the second line of a crossing store: its low half
+wire [31:0] st_w   = st_lo ? st_val[31:0] : st_val[63:32];
+wire  [3:0] st_b   = st_lo ? st_be[3:0]   : st_be[7:4];
+// array k: a spanning store's second word goes to wr_arr1, everything
+// else (its first word, a single-word store, a fill beat) to wr_arr
+assign {cd_be0, cd_wdat0} = store_pair_write ? ((wr_arr1 == 2'd0) ? {st_be[3:0], st_val[31:0]} : {st_be[7:4], st_val[63:32]}) :
+                            store_hit_write ? {st_b, st_w} : {4'hF, cd_wdat};
+assign {cd_be1, cd_wdat1} = store_pair_write ? ((wr_arr1 == 2'd1) ? {st_be[3:0], st_val[31:0]} : {st_be[7:4], st_val[63:32]}) :
+                            store_hit_write ? {st_b, st_w} : {4'hF, cd_wdat};
+assign {cd_be2, cd_wdat2} = store_pair_write ? ((wr_arr1 == 2'd2) ? {st_be[3:0], st_val[31:0]} : {st_be[7:4], st_val[63:32]}) :
+                            store_hit_write ? {st_b, st_w} : {4'hF, cd_wdat};
+assign {cd_be3, cd_wdat3} = store_pair_write ? ((wr_arr1 == 2'd3) ? {st_be[3:0], st_val[31:0]} : {st_be[7:4], st_val[63:32]}) :
+                            store_hit_write ? {st_b, st_w} : {4'hF, cd_wdat};
 assign cd_widx   = {r_bank, r_row[SETW-1:0], wr_way};
-assign cd_wdat   = store_hit_write ? lw_merge(data_hit, r_wdata, r_size, r_off) :
-	                  (fill_line_write ? fill_line_word : m_rdata);
+wire [63:0] cross_first_merge = span_merge({data_hit,32'd0}, r_wdata, r_size, r_off);
+wire [63:0] cross_last_merge = span_merge({32'd0,data_hit}, r_wdata, r_size, r_off);
+// fills only: a store hit's bytes come from st_val/st_be (P195)
+assign cd_wdat   = fill_line_write ? fill_line_word : m_rdata;
 
 
+`ifdef AP040_EXPERIMENTAL_XSTORE
+// Port-B invalidations are free-running even when CE is low. Remember a
+// second-row invalidation through the lookup so undefined read-during-write
+// tag data cannot select a live cache way for the delayed merge.
+wire [SETW-1:0] cross_row_b = (cst == C_IDLE) ? a_set + 1'b1 : r_setB;
+always @(posedge clk) begin
+    if (!nreset) cross_second_lost <= 0;
+    else begin
+        if (ce && cst == C_IDLE && cross_accept) cross_second_lost <= 0;
+        if ((cross_store || (cst == C_IDLE && cross_accept)) &&
+            inv_wren && inv_idx == {1'b0,cross_row_b}) cross_second_lost <= 1;
+    end
+end
+`endif
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -737,11 +1356,15 @@ always @(posedge clk) begin
 		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
 		fill_hold2 <= 0; r_span2 <= 0; look2 <= 0; r_hway <= 0;
 		r_xline <= 0; xlook <= 0; xsnooped <= 0; r_setB <= 0; r_tagB <= 0;
-		fill_cnt <= 0; fill_acked <= 0; r_fc <= 0; sline_ready <= 0;
+		fill_cnt <= 0; fill_acked <= 0; r_fc <= 0; sline_ready <= 0; sp_held <= 0;
 		post_active <= 0; p_addr <= 0; p_wdata <= 0; p_size <= 0; p_fc <= 0;
 		iline_pending <= 0; iline_valid <= 0; iline_way <= 0;
 		iline_tag <= 0; iline_data <= 0; iline_stb <= 0; iline_stb_pend <= 0;
+		iline_pair_pending <= 0;
 		ack_r <= 0; rdata_r <= 0;
+`ifdef AP040_EXPERIMENTAL_XSTORE
+        cross_store <= 0; cross_fault <= 0;
+`endif
 	end
 	else if (ce) begin
 		ack_r <= 0;
@@ -762,6 +1385,18 @@ always @(posedge clk) begin
 				default: iline_data <= {data_q3, data_q0, data_q1, data_q2};
 			endcase
 			iline_pending <= 0;
+			iline_valid <= 1;
+			iline_stb <= 1;
+		end
+		// P174: the line read on the mirror banks completed on the preceding edge
+		if (iline_pair_pending) begin
+			case (iline_way)
+				2'd0: iline_data <= {idata_q0, idata_q1, idata_q2, idata_q3};
+				2'd1: iline_data <= {idata_q1, idata_q2, idata_q3, idata_q0};
+				2'd2: iline_data <= {idata_q2, idata_q3, idata_q0, idata_q1};
+				default: iline_data <= {idata_q3, idata_q0, idata_q1, idata_q2};
+			endcase
+			iline_pair_pending <= 0;
 			iline_valid <= 1;
 			iline_stb <= 1;
 		end
@@ -794,6 +1429,15 @@ always @(posedge clk) begin
 					sweep_all <= 0;   // honour the cinv_ic/cinv_dc selects
 					cst <= C_SWEEP;
 				end
+				else if (fast_ihit) begin
+					// P174: acknowledged in the request cycle from the
+					// hinted idle read; the way's line is read on the mirror
+					// banks on this edge and offered next cycle.
+					iline_pair_pending <= 1;
+					iline_valid <= 0;
+					iline_way <= hint_way;
+					iline_tag <= c_addr[31:4];
+				end
 				else if (iline_hit) begin
 					// Registered completion just like C_LOOK, from the
 					// buffered line; the buffer stays valid for the rest of
@@ -802,11 +1446,23 @@ always @(posedge clk) begin
 					ack_r <= 1;
 					iline_stb_pend <= 1;
 				end
-				else if (idle_hit) begin
+				else if (fast_pair_idle) begin
+					// completed in the request cycle from the pair banks (P170)
+					rdata_r <= hint_pair_data;
+				end
+				else if (fast_xline_idle) begin
+					// completed in the request cycle across two lines (P178)
+					rdata_r <= hint_xline_data;
+				end
+				else if (idle_hit || fast_hit) begin
 					// Identical registered response to C_LOOK, using the prior
 					// matching read rather than issuing a redundant RAM read.
-					rdata_r <= lw_extract(data_hit, c_size, c_addr[1:0]);
-					ack_r <= 1;
+					// A data hit the hint vouched for was acknowledged
+					// combinationally (fast_hit).
+					if (!fast_hit && !fast_pair_idle) begin
+						rdata_r <= lw_extract(data_hit, c_size, c_addr[1:0]);
+						ack_r <= 1;
+					end
 					if (c_instr) begin
 						// the line read runs in parallel (iline_idle_read)
 						iline_pending <= 1;
@@ -870,12 +1526,20 @@ always @(posedge clk) begin
 							// when memory acknowledges it in C_PASS.  A fault can
 							// therefore never leave uncommitted data in the cache.
 							pass_store_chk <= store_any_update;
+`ifdef AP040_EXPERIMENTAL_XSTORE
+                            cross_store <= cross_accept;
+                            r_setB <= a_set + 1'b1;
+                            r_tagB <= (&a_set) ? a_tag + 1'b1 : a_tag;
+`endif
 							r_span2 <= store_update2;
 							sline_ready <= 0;
+							sp_held <= 0;
 							// A posted store is acknowledged now and drained
 							// from its captured copy while the core moves on.
-							if (c_post_ok) begin
-								ack_r <= 1;
+							if (c_post_ok || fast_store) begin
+								// acknowledged now by fast_store, or next
+								// cycle by ack_r
+								if (!fast_store) ack_r <= 1;
 								post_active <= 1;
 								p_addr <= c_addr; p_wdata <= c_wdata;
 								p_size <= c_size; p_fc <= c_fc;
@@ -901,6 +1565,17 @@ always @(posedge clk) begin
 							cst <= C_PASS;
 						end
 					end
+					else if (c_instr && !c_ihold) begin
+						// P184: a hinted fetch's first clock -- the banks read
+						// the data hint's row; hold it (fast_ihit would have
+						// taken it), the banks follow it from the next clock.
+					end
+					else if (c_hint_away && !c_instr) begin
+						// P182: the core is hinting its next request, not
+						// this read, so the RAMs are reading another row:
+						// hold the read one clock (it is level-held, and the
+						// hint repeats it from the next clock).
+					end
 					else if (bypass) begin
 						// the tag row read runs in parallel here too, so
 						// a cache-inhibited read can detect and kill a
@@ -921,9 +1596,14 @@ always @(posedge clk) begin
 						r_word <= {2'd0, c_addr[3:2]};
 						r_span2 <= span2;
 						r_fc <= c_fc;
-						look2 <= 0;
+						look2 <= idle_span_hit;
+                        if (idle_span_hit) r_hway <= hit_way;
 						r_xline <= xline;
-						xlook <= 0;
+                        xlook <= idle_xline_hit;
+                        if (idle_xline_hit) begin
+                            fill_hold2 <= data_hit;
+                            xsnooped <= 0;
+                        end
 						r_setB <= a_set + {{(SETW-1){1'b0}}, 1'b1};
 						r_tagB <= (&a_set) ? a_tag + {{(TAGW-1){1'b0}}, 1'b1} : a_tag;
 						cst <= C_LOOK;
@@ -932,6 +1612,14 @@ always @(posedge clk) begin
 			end
 
 			C_PASS: begin
+				if (fast_ihit) begin
+					// P201: the one-clock instruction hit under a posted store
+					// (as in C_IDLE: the way's line is offered next cycle)
+					iline_pair_pending <= 1;
+					iline_valid <= 0;
+					iline_way <= hint_way;
+					iline_tag <= c_addr[31:4];
+				end
 				// the second-set invalidate clears only when port B truly
 				// served it; a snoop or a recorded first-set replay owns
 				// the port this cycle and winv stays pending
@@ -943,9 +1631,12 @@ always @(posedge clk) begin
 					r_hway <= hit_way;
 					sline_ready <= 1;
 				end
-				if (pass_store_chk && r_span2 && m_ack && look_hit && !sline_ready) begin
-					ci_inv_pend <= 1;
-					ci_inv_row  <= r_row;
+				// P187: the line read has landed in data_q this clock; hold the
+				// merge words before an idle read replaces it
+				if (sline_ready && !sp_held) begin
+					sp_h0   <= sp_w0;
+					sp_h1   <= sp_w1;
+					sp_held <= 1;
 				end
 				if (pass_ci_chk) begin
 					pass_ci_chk <= 0;
@@ -964,15 +1655,36 @@ always @(posedge clk) begin
 					post_active <= 0;
 					cst <= (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
+`ifdef AP040_EXPERIMENTAL_XSTORE
+                    if (cross_store) begin
+                        cross_store <= 0; cross_fault <= 1;
+                        winv_pend <= 1; winv_set2 <= r_setB;
+                        cst <= C_FERR;
+                    end
+`endif
 				end
 				else if (m_ack) begin
 					pass_store_chk <= 0;
 					post_active <= 0;
 					cst <= (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
-				end
+`ifdef AP040_EXPERIMENTAL_XSTORE
+                    if (cross_store) begin
+                        r_row <= {1'b0,r_setB}; r_tag <= r_tagB;
+                        r_addr <= {r_addr[31:4]+28'd1,4'd0}; r_beat <= 0;
+                        cst <= C_XSTORE_LOOK;
+                    end
+`endif
+                end
 			end
 
+`ifdef AP040_EXPERIMENTAL_XSTORE
+            C_XSTORE_LOOK: cst <= C_XSTORE_WRITE;
+            C_XSTORE_WRITE: begin
+                cross_store <= 0;
+                cst <= C_IDLE;
+            end
+`endif
 			C_FERR: begin
 				// The core withdraws the faulting request while this
 				// state runs, and only C_IDLE used to watch for that.
@@ -981,7 +1693,12 @@ always @(posedge clk) begin
 				if (!c_req) err_hold <= 0;
 				// a free-running snoop owns port B when it fires; retry
 				// until this row's invalidate is the one that lands
-				if (!snoop_wr) cst <= C_IDLE;
+				if (!snoop_wr) begin
+                    cst <= cross_fault ? C_WINV : C_IDLE;
+`ifdef AP040_EXPERIMENTAL_XSTORE
+                    cross_fault <= 0;
+`endif
+                end
 			end
 
 			C_WINV: begin
@@ -1012,7 +1729,7 @@ always @(posedge clk) begin
 					look2 <= 0;
 					if (!look_snooped && !snoop_look_row) begin
 						rdata_r <= span_extract({sp_w0, sp_w1}, r_size, r_off);
-						ack_r <= 1;
+						if (!fast_span_ack) ack_r <= 1;
 						cst <= C_IDLE;
 					end
 					else begin
@@ -1033,12 +1750,12 @@ always @(posedge clk) begin
 					// next); a snoop that touched the row around the read
 					// falls back to the bypass
 					xlook <= 0;
-					if (look_hit && !xsnooped && !snoop_xrow) begin
+					if (look_hit && !xsnooped && !xline_snoop_pending && !snoop_xrow) begin
 						rdata_r <= span_extract({fill_hold2, data_hit}, r_size, r_off);
 						ack_r <= 1;
 						cst <= C_IDLE;
 					end
-					else if (!xsnooped && !snoop_xrow) begin
+					else if (!xsnooped && !xline_snoop_pending && !snoop_xrow) begin
 						r_row  <= {1'b0, r_setB};
 						r_tag  <= r_tagB;
 						r_addr <= {r_addr[31:4] + 28'd1, 4'd0};

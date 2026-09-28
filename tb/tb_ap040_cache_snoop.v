@@ -57,6 +57,8 @@ wire        cinv_done;
 reg         c_req = 0, c_write = 0, c_instr = 0, c_nocache = 0;
 reg  [1:0]  c_size = 0;
 reg  [31:0] c_addr = 0, c_wdata = 0;
+reg [31:0] tb_hq_addr = 0;   // the hint the MMU would have registered
+always @(posedge clk) tb_hq_addr <= c_addr;
 wire        c_ack;
 wire [31:0] c_rdata;
 
@@ -94,6 +96,13 @@ ap040_cache dut
 	.cinv_done(cinv_done),
 	.c_req(c_req), .c_write(c_write), .c_instr(c_instr),
 	.c_size(c_size), .c_addr(c_addr), .c_wdata(c_wdata),
+	.c_hint_addr(c_addr), .c_hint_instr(c_instr),
+	.c_ihint_addr(c_addr), .c_ihint_ptag(c_addr[31:10]), .c_ihint_match(c_req && c_instr && (tb_hq_addr == c_addr)), .c_ihold(c_req && c_instr),
+	// the MMU vouches for a request only when it equals the hint it
+	// registered a cycle earlier (m_hint_match); the bench's hint bus is
+	// its request bus, so model that register here
+	.c_hint_ptag(c_addr[31:10]), .c_hint_match(c_req && (tb_hq_addr == c_addr)),
+	.c_hint_wmatch(1'b0), .c_hint_away(1'b0), .c_post_ok_hint(1'b0),   // no posting, no store fast lane here
 	.c_fc(3'd5), .c_nocache(c_nocache), .c_post_ok(1'b0),
 	.c_ack(c_ack), .c_rdata(c_rdata),
 	.m_req(m_req), .m_write(m_write), .m_instr(m_instr),
@@ -954,15 +963,20 @@ initial begin
 	c_instr = 0;
 	expect_read(32'hA000, 32'h1234_5678, 14);
 	while (dut.cst != 3'd0) @(posedge clk);   // the fill completes behind its early ack
-	@(negedge clk); c_addr = 32'hA000;
+	// the core hints the exact address one cycle before the request
+	@(negedge clk); c_addr = 32'hA001;
 	repeat (2) @(posedge clk);
 	cpu_read_count_sized(32'hA001, 2'b00, d, fast_cycles);
-	if (d !== 32'h34 || fast_cycles != 2) begin
+	// a settled data read the hint vouches for is acknowledged in its
+	// request cycle (fast_hit)
+	if (d !== 32'h34 || fast_cycles != 1) begin
 		$display("FAIL test 14: settled byte data=%h cycles=%0d",d,fast_cycles);
 		errors = errors + 1;
 	end
+	@(negedge clk); c_addr = 32'hA002;
+	repeat (2) @(posedge clk);
 	cpu_read_count_sized(32'hA002, 2'b01, d, fast_cycles);
-	if (d !== 32'h5678 || fast_cycles != 2) begin
+	if (d !== 32'h5678 || fast_cycles != 1) begin
 		$display("FAIL test 14: settled word data=%h cycles=%0d",d,fast_cycles);
 		errors = errors + 1;
 	end

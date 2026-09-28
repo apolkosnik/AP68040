@@ -31,7 +31,9 @@ wire berr = nreset && active &&
              (phase == 7 && busstate == 2'b00 && addr_out[15:0] == 16'h020a));
 wire clkena_in = !active || mem_ready || berr;
 
-ap040_tg68k_compat dut (
+// stores are not posted here: the bench bus-errors the exception frame's
+// stack write, which a posted (never-faulting) store could not carry
+ap040_tg68k_compat #(.AP040_POST_STORES(0)) dut (
 	.clk(clk), .nreset(nreset), .cache_allow_all(1'b1),
 	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),
 	.cache_z2_ena(1'b0),
