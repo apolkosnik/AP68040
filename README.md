@@ -101,6 +101,19 @@ Three groups of ports are optional and can be tied off:
   flat simulation environments.
 - **`mmu_*`, `cacr_out`, `vbr_out`, `debug_*`** — observation only.
 
+`AP040_FPU_REVISION` selects the FPU state-frame ABI at elaboration time:
+`8'h41` (default) or `8'h40` for older non-Turbo NeXT software. Revision
+`0x40` uses a 44-byte unimplemented-instruction frame; `0x41` uses 52 bytes.
+NULL frames remain four zero bytes; IDLE and 100-byte BUSY frames carry the
+selected revision. FRESTORE rejects non-null frames from another revision.
+This selects serialization/layout, not an alternative arithmetic datapath.
+
+BUSY FRESTORE with `CU_SAVEPC=0xfe` resumes supported arithmetic commands
+in opclass 0/2 using the frame's ETEMP and FPTEMP, including their extended
+exponent bits. Completion uses the existing background-FPU interlock and
+deferred arithmetic-exception handling. Other resume opclasses and
+software-only opcodes are not newly implemented by this path.
+
 `dpram` is a plain inferred true-dual-port RAM. Replace it with a vendor
 macro (altsyncram, XPM) if your flow needs one; the ports are
 `clock, address_a, data_a, wren_a, q_a, address_b, data_b, wren_b, q_b` with
@@ -114,6 +127,16 @@ advertises a valid WB3 in its access-error frame. A host OS that completes
 valid writeback slots itself — NetBSD's `trap.c` does — would otherwise
 double-apply the store of an RMW instruction.
 
+MOVEM operand faults set SSW.CM and stack the original effective address.
+RTE uses that address for indexed/PC-relative modes and replays the transfer
+list without rereading a memory-indirect pointer that MOVEM may have changed.
+Base/index load deferral remains in place. CT and WB2/WB1 are not implemented.
+
+Failed MMU searches install nonresident ATC entries, as on a 68040. Repairing
+a descriptor alone does not make it accessible: software must invalidate the
+old entry (PFLUSH or PTEST), or wait for replacement. PTEST reports a table
+bus error with MMUSR.B and also caches the failed translation.
+
 ## Testing
 
 ```
@@ -121,9 +144,27 @@ cd tb && ./run_tests.sh          # rtl_old (reference core): needs iverilog and 
 cd tb && ./run_pipe_tests.sh     # rtl (pipeline, in progress): needs only iverilog
 ```
 
-Everything under `tb/` runs against a core alone, with no host-project
-sources, so a failure is the CPU's rather than an integration artifact.
-`run_tests.sh` covers the integer ISA, the exception and trace model, the MMU
+`sh tb/run_fpu_frames.sh` independently checks both FPU revisions' headers,
+payloads, pointer adjustments, frame round-trips, invalid-frame rejection
+and BUSY-command resumption under all three bus-handshake phases.
+
+The main runner also checks the shared arithmetic datapaths directly:
+`tb_ap040_alu_arithmetic.v` exhausts byte ADD/ADDX/SUB/SUBX/CMP operands and
+X/Z combinations, then checks word/long boundaries and seeded random inputs
+against an independent arithmetic/CCR oracle. `tb_ap040_fpu_normalize.v`
+checks all three normalization states, every leading-zero count, GRS bits,
+operand tags, exponent wrap and clock-enable holding against a serial-shift
+reference. These tests do not require guest software.
+
+`tb_ap040_regfile.v` compares the integer register file with a flip-flop
+reference through consecutive writes, clock-enable stalls, reset and all
+three stack-pointer banks. A second leg poisons the pending RAM word to
+check bypass isolation; disabling that bypass must fail the negative control.
+This does not replace MLAB timing analysis or hardware boot testing.
+
+Everything under `tb/` runs against the core alone, with no host-project
+sources, so a failure is the CPU's rather than an integration artifact. The
+suite covers the integer ISA, the exception and trace model, the MMU
 (translation, TTRs, page-table walks, access faults, 4K and 8K pages), the
 caches, and the FPU -- against `rtl_old`. `run_pipe_tests.sh` covers whatever
 the pipeline has reached so far (see `AP040_IMPLEMENTATION_PLAN.md` for the
@@ -145,7 +186,7 @@ comments record which oracle settled each one and where.
 
 ## License
 
-GPL v3 or later — see [LICENSE](LICENSE). The core was written as part of
+GPL v2 or later — see [LICENSE](LICENSE). The core was written as part of
 Minimig-AGA_MiSTer, which is distributed under the same terms.
 
-Copyright © 2025-2026 Adam Polkosnik
+Copyright © 2026 Adam Polkosnik

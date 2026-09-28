@@ -57,7 +57,7 @@ wire [31:0] abs_m  = (sign_op && op_lo[31]) ? (32'd0 - op_lo) : op_lo;
 // divide: four cascaded restoring steps per cycle (64 bits = 16 rounds),
 // each exactly one former one-bit iteration; the divisor is an explicit
 // argument so the function stays pure (module-level variables read from
-// inside a function are unreliable in continuous assignments under iverilog)
+// inside a function are unreliable in continuous assignments)
 function [96:0] div_step;
 	input [96:0] a;
 	input [31:0] d;

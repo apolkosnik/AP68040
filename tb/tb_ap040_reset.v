@@ -57,7 +57,8 @@ ap040_tg68k_compat dut
 	.cache_z3_ena0(1'b0),
 	.cache_z3_base1(4'd0),
 	.cache_z3_ena1(1'b0),
-	.clkena_in(clkena_in),
+	.clkena_in(clkena_in), .bus_clkena_in(clkena_in),
+	.tick_in(1'b1),
 	.data_in(data_in),
 	.ipl(3'b111),
 	.ipl_autovector(1'b1),
@@ -69,7 +70,7 @@ ap040_tg68k_compat dut
 	.nuds(nuds),
 	.nlds(nlds),
 	.busstate(busstate),
-	.longword(longword),
+	.longword(longword), .post_drain(),
 	.nresetout(nresetout),
 	.fc(fc),
 

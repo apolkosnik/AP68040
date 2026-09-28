@@ -53,6 +53,7 @@ module ap040_mmu
 	// PTEST/PFLUSH sideband
 	input             pt_req,
 	input             pt_write,
+	input             pt_access,  // internal operand check, not a PTEST instruction
 	input      [31:0] pt_addr,
 	input       [2:0] pt_fc,
 	output reg        pt_done,
@@ -121,14 +122,14 @@ endfunction
 //---------------------------------------------------------------------------
 
 // The entry payload (tag, PA, attributes) lives in ONE bram.vhd dpram:
-// 32 rows of {bank, set}, 4 ways of 45 bits per row.  A flop array here
+// 32 rows of {bank, set}, 4 ways of 46 bits per row.  A flop array here
 // costs ~5.7K registers plus the 4-way mux fabric (the single largest
 // ALM sink in the design); the M10K row costs a one-clock lookup pipe
 // on ENABLED translation only -- TC.E=0 and TTR hits stay combinational
 // and pay nothing, which is the common Amiga configuration.  Validity
 // and the round-robin pointers stay in flops so PFLUSHA, warm-reset
 // preservation and the lookup guard remain single-cycle.
-localparam EW   = 45;            // {tag[16:0], pa[19:0], attr[7:0]}
+localparam EW   = 46;            // {resident, tag[16:0], pa[19:0], attr[7:0]}
 localparam ROWW = 4*EW;
 
 reg         atc_v    [0:127];
@@ -160,10 +161,14 @@ wire [ROWW-1:0] row_q, frow_q;
 reg   [4:0] l_row;
 reg  [16:0] l_tag;
 reg         l_ld;
+reg   [4:0] sweep_row_q;
+reg         sweep_valid_q;
 always @(posedge clk) begin
 	l_row <= a_row;
 	l_tag <= a_tag;
 	l_ld  <= c_req && !sweep_on && !fill_we;
+	sweep_row_q <= sweep_row;
+	sweep_valid_q <= nreset && sweep_on;
 end
 wire lk_fresh = l_ld && (l_row == a_row) && (l_tag == a_tag);
 
@@ -179,6 +184,7 @@ wire hit3 = lk_fresh && atc_v[{l_row, 2'd3}] && (a_w3[44:28] == l_tag);
 wire atc_hit = hit0 | hit1 | hit2 | hit3;
 
 wire [EW-1:0] h_ent = hit0 ? a_w0 : hit1 ? a_w1 : hit2 ? a_w2 : a_w3;
+wire        h_r    = h_ent[45];
 wire [19:0] h_pa   = h_ent[27:8];
 wire  [7:0] h_attr = h_ent[7:0];
 wire        h_s    = h_attr[4];
@@ -213,9 +219,9 @@ wire        pt_ttr_w = pt_ttr_a ? pt_ttra[2] : pt_ttrb[2];
 
 wire ttr_fault = ttr_hit && c_write && ttr_w;
 wire atc_fault = tc_e && !ttr_hit && atc_hit &&
-                 ((c_write && h_w) || (!a_super && h_s));
+                 (!h_r || (c_write && h_w) || (!a_super && h_s));
 // write to a clean page runs a table search to set the M bit
-wire atc_mmiss = atc_hit && c_write && !h_m && !h_w;
+wire atc_mmiss = atc_hit && h_r && c_write && !h_m && !h_w;
 
 // lk_fresh gates atc_hit, so a walk is only started once the piped row
 // has been judged against the live request
@@ -255,6 +261,7 @@ reg        w_super, w_write, w_user;
 reg [31:0] w_desc_addr;
 reg [31:0] w_desc;
 reg        w_wp;
+reg        w_buserr;            // failed-search MMUSR B status (PTEST only)
 reg [31:0] w_req_addr, w_req_wdat;
 reg        w_req_wr;
 reg        w_active;
@@ -291,7 +298,10 @@ wire [1:0] f_way = fhit0 ? 2'd0 : fhit1 ? 2'd1 : fhit2 ? 2'd2 : fhit3 ? 2'd3
 wire [19:0] f_pa_new   = tc_p ? {w_desc[31:13], 1'b0} : w_desc[31:12];
 wire  [7:0] f_attr_new = {w_desc[10], w_desc[9:8], w_desc[7], w_desc[6:5],
                           w_desc[4], (w_wp | w_desc[2])};
-wire [EW-1:0] f_ent_new = {f_tag, f_pa_new, f_attr_new};
+// A failed 68040 search installs a VALID but nonresident entry. Future
+// accesses fault on that entry without walking again until it is flushed.
+wire [EW-1:0] f_ent_new = (wst == W_FLT) ? {1'b0, f_tag, 28'd0} :
+                                        {1'b1, f_tag, f_pa_new, f_attr_new};
 wire [ROWW-1:0] fill_wrow = {
 	(f_way == 2'd3) ? f_ent_new : f_w3,
 	(f_way == 2'd2) ? f_ent_new : f_w2,
@@ -300,7 +310,8 @@ wire [ROWW-1:0] fill_wrow = {
 // the fill writes in the SAME cycle W_FILL commits the way choice:
 // a registered strobe would land one cycle later, after the round
 // robin pointer has already advanced under f_way's feet
-assign fill_we = (wst == W_FILL) && !w_active && ce;
+assign fill_we = (((wst == W_FILL || wst == W_DFLT) && !w_active) ||
+                  wst == W_FLT) && ce && nreset;
 
 dpram #(5, ROWW) atc_ram
 (
@@ -397,7 +408,7 @@ always @(posedge clk) begin
 		wst <= W_IDLE;
 		w_issued <= 0; w_pt <= 0;
 		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0;
-		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0;
+		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0; w_buserr <= 0;
 		w_req_addr <= 0; w_req_wdat <= 0; w_req_wr <= 0;
 		w_active <= 0; f_bank <= 0;
 		c_flt <= 0;
@@ -415,19 +426,18 @@ always @(posedge clk) begin
 		pt_done <= 0;
 		pf_done <= 0;
 		if (w_active && !w_issued) w_issued <= 1;
+		if (fill_we) begin
+			atc_v[{fill_row, f_way}] <= 1;
+			if (!f_way_hit) atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
+		end
 
 		if (walk_err) begin
 			// A physical bus error while fetching or updating a descriptor is
-			// reported as an unsuccessful table search.  Do not fill the ATC.
-			// A probing PTEST reports it in the MMUSR B bit.
+			// reported as an unsuccessful table search and cached as
+			// nonresident. A probing PTEST also reports its MMUSR B bit.
 			w_active <= 0;
-			if (w_pt) begin
-				pt_mmusr <= 32'h0000_0800;
-				pt_done <= 1;
-				w_pt <= 0;
-				wst <= W_IDLE;
-			end
-			else wst <= W_FLT;
+			w_buserr <= 1;
+			wst <= W_FLT;
 		end
 		else case (wst)
 			W_IDLE: begin
@@ -477,6 +487,7 @@ always @(posedge clk) begin
 					w_user  <= !a_super;
 					w_write <= c_write;
 					w_wp    <= 0;
+					w_buserr <= 0;
 					f_bank  <= c_instr;
 					wrd({(a_super ? srp[31:9] : urp[31:9]), 9'd0} +
 					    {23'd0, c_addr[31:25], 2'b00});
@@ -485,8 +496,10 @@ always @(posedge clk) begin
 			end
 
 			// Tag sweep for PFLUSH page/nonglobal variants and the PTEST
-			// pre-flush.  Two-cycle pipeline over the 32 rows: the row
-			// addressed at count N is judged at count N+1 from q_a.
+			// pre-flush. The RAM runs even when ce is low: pair its data
+			// with the registered read address, and advance only after the
+			// requested row has arrived. Counting enabled clocks as RAM
+			// latency can otherwise skip rows when the CPU is divided/stalled.
 			W_SWEEP: begin : sweep
 				reg [16:0] sw_tag;
 				reg  [3:0] sw_set;
@@ -498,9 +511,9 @@ always @(posedge clk) begin
 				                       : {pf_fc[2], pf_addr[31:16]});
 				sw_set = sw_pt ? (tc_p ? pt_addr[16:13] : pt_addr[15:12])
 				               : (tc_p ? pf_addr[16:13] : pf_addr[15:12]);
-				if (sweep_cnt != 0) begin : sweep_act
+				if (sweep_valid_q && sweep_row_q == sweep_row) begin : sweep_act
 					reg [4:0] pr;
-					pr = sweep_cnt[4:0] - 5'd1;
+					pr = sweep_row_q;
 					for (w = 0; w < 4; w = w + 1) begin : sweep_way
 						reg [EW-1:0] e;
 						e = row_q[w*EW +: EW];
@@ -515,21 +528,22 @@ always @(posedge clk) begin
 								atc_v[{pr, w[1:0]}] <= 0;
 						end
 					end
-				end
-				if (sweep_cnt == 6'd32) begin
-					sweep_on  <= 0;
-					sweep_cnt <= 0;
-					if (!sw_pt) begin
-						pf_done <= 1;
-						wst <= W_IDLE;
+					if (sweep_cnt == 6'd31) begin
+						sweep_on  <= 0;
+						sweep_cnt <= 0;
+						if (!sw_pt) begin
+							pf_done <= 1;
+							wst <= W_IDLE;
+						end
+						else wst <= W_PTGO;
 					end
-					else wst <= W_PTGO;
+					else sweep_cnt <= sweep_cnt + 1'd1;
 				end
-				else sweep_cnt <= sweep_cnt + 1'd1;
 			end
 
 			// PTEST proper, after its pre-flush sweep
 			W_PTGO: begin
+					w_buserr <= 0;
 					w_pt    <= 1;
 					w_la    <= pt_addr;
 					w_super <= pt_fc[2];
@@ -556,6 +570,14 @@ always @(posedge clk) begin
 						// reference; t_mmu 38 pins it.
 						pt_mmusr <= (pt_write && pt_ttr_w) ? 32'h0000_0800
 						                                   : 32'h0000_0003;
+						pt_done <= 1;
+						w_pt <= 0;
+						wst <= W_IDLE;
+					end
+					else if (pt_access && !tc_e) begin
+						// Ordinary accesses bypass translation with TC.E clear.
+						// Explicit PTEST still searches the tables in that mode.
+						pt_mmusr <= 32'h0000_0001;
 						pt_done <= 1;
 						w_pt <= 0;
 						wst <= W_IDLE;
@@ -688,10 +710,6 @@ always @(posedge clk) begin
 					if (walk_ack) w_active <= 0;
 				end
 				else if (w_pt) begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					// PTEST reports the PAGE FRAME, not the translated
 					// address of the probed LA.  In 8K mode that means
 					// bit 12 is CLEAR: the frame is 8K-aligned, and the
@@ -714,22 +732,21 @@ always @(posedge clk) begin
 					wst <= W_IDLE;
 				end
 				else begin
-					atc_v[{fill_row, f_way}] <= 1;
-					// fill_we writes fill_wrow at this same edge
-					if (!f_way_hit)
-						atc_rr[fill_row] <= atc_rr[fill_row] + 2'd1;
 					wst <= W_IDLE;   // the held request now hits and forwards
 				end
 			end
 
 			W_FLT: begin
 				if (w_pt) begin
-					pt_mmusr <= 32'd0;   // not resident
+					pt_mmusr <= w_buserr ? 32'h0000_0800 : 32'd0;
 					pt_done <= 1;
 					w_pt <= 0;
+					wst <= W_IDLE;
 				end
-				else c_flt <= 1;
-				wst <= W_IDLE;
+				else begin
+					c_flt <= 1;
+					wst <= W_DROP;
+				end
 			end
 
 			default: wst <= W_IDLE;

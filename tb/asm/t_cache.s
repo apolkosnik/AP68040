@@ -36,6 +36,31 @@ start:
 	movec	cacr,d1
 	chkl	d1,$80008000,1
 
+;------------------------ MOVEC source clobbered by the next instruction
+; MOVEQ is the one opcode the fast path dispatches straight out of decode
+; with its Dn writeback deferred into the following decode.  A MOVEC's
+; source read is staged in S_MOVEC1 and sampled in S_MOVEC2; if a MOVEQ
+; that FOLLOWS the MOVEC could ever commit ahead of that sample, the
+; control register would take the MOVEQ's value.  These cases pin the
+; ordering.  They were written while chasing a suspected instance of
+; exactly that, which turned out to be a bench running a program image
+; that did not exist -- the hazard was never real on this core, and these
+; cases passed on first run.  They stay because the class is real and
+; cheap to guard.  Two registers: CACR, and DFC, which is harmless if
+; wrong so a failure here cannot take the rest of this program down.
+	move.l	#$80008000,d0
+	movec	d0,cacr
+	moveq	#1,d0
+	movec	cacr,d1
+	chkl	d1,$80008000,20
+	move.l	#5,d0
+	movec	d0,dfc
+	moveq	#1,d0
+	movec	dfc,d1
+	chkl	d1,5,21
+	move.l	#$80008000,d0		; leave both caches on for what follows
+	movec	d0,cacr
+
 ;--------------------------------------- I-cache and self modifying code
 	; stub at $2000: moveq #1,d0 ; rts
 	move.w	#$7001,($2000).l

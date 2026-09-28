@@ -68,7 +68,7 @@ wire sub_c  = (size == `AP040_SZ_B) ? sub_full[8]  : (size == `AP040_SZ_W) ? sub
 wire subx_c = (size == `AP040_SZ_B) ? subx_full[8] : (size == `AP040_SZ_W) ? subx_full[16] : subx_full[32];
 
 // explicit size selects: res_msb reads `size` from inside the function
-// body, which iverilog leaves out of a continuous assignment's sensitivity
+// body, which is left out of a continuous assignment's sensitivity
 // (functions reading module state are only safe from the main @* block,
 // which reads szmask directly and so re-evaluates on every size change)
 wire add_r_msb  = (size == `AP040_SZ_B) ? add_full[7]  : (size == `AP040_SZ_W) ? add_full[15]  : add_full[31];
