@@ -3,16 +3,21 @@
 //                                                                          //
 // ap68040_decode.sv - D1: instruction parse                                 //
 //                                                                          //
-// One instruction per cycle from the eight-word window at the queue head:  //
 //   operation word | fixed extension words | immediate | EA0 ext | EA1 ext //
-// The generated PLA (rtl/gen/ap68040_dec_pla.svh, checked against WinUAE  //
-// for all 65536 operation words) names the routine, size, the legal EA     //
-// modes and the instruction's format.  A MOVE whose two EAs together need  //
-// more than eight words is parsed in two cycles (EA1 in the second).      //
 //                                                                          //
-// Unconditional and statically predicted (backward) PC-relative branches  //
-// redirect fetch from here.  Illegal, line A/F, privilege, TRAP #n, odd    //
-// PC and fetch bus errors become a record carrying the exception vector.  //
+// Fast path: one instruction per cycle.  The queue's predecode of slot 0  //
+// gives the length assuming brief index extensions; D1 only checks bit 8  //
+// of the words at the index extension positions.  Slow path (a full-      //
+// format extension, an FPU immediate, or more than seven words): one      //
+// phase per part -- operation word with fixed words and immediate, then   //
+// EA0's extension, then EA1's -- each sized from the word at the head.    //
+//                                                                          //
+// Records go to D2 through a two-entry FIFO, so neither side depends on   //
+// the other combinationally.  PC-relative displacements, branch targets   //
+// and the next PC are added here.  Unconditional and statically          //
+// predicted (backward) branches redirect fetch.  Illegal, line A/F,      //
+// privilege, TRAP #n, odd PC and fetch faults become records carrying    //
+// their exception vector.                                                 //
 //--------------------------------------------------------------------------//
 
 module ap68040_decode
@@ -24,33 +29,28 @@ module ap68040_decode
 
 	input  logic [15:0] win [8],
 	input  logic  [7:0] win_flt,
-	input  logic  [4:0] qcnt,
+	input  pd_t         pd0,
+	input  logic  [3:0] qcnt,
 	input  logic [31:0] qpc,
 	input  logic        q_odd,
 	input  logic        smode,
 
-	output logic  [3:0] consume,
+	output logic  [2:0] consume,
 	output logic        d_redir_v,
 	output logic [31:0] d_redir_pc,
 
-	output logic        rec_v,
-	output dinst_t      rec,
-	input  logic        rec_take
+	// record FIFO towards D2: rq0 is the head
+	output logic  [1:0] rq_n,
+	output dinst_t      rq0,
+	output dinst_t      rq1,
+	input  logic        rq_pop
 );
-
 
 `include "gen/ap68040_dec_pla.svh"
 
 //--------------------------------------------------------------------------
 // helpers
 //--------------------------------------------------------------------------
-function automatic logic [3:0] ea_idx(input logic [2:0] m, input logic [2:0] r);
-	if (m != 3'd7) ea_idx = {1'b0, m};
-	else if (r <= 3'd4) ea_idx = 4'd7 + {1'b0, r};
-	else ea_idx = EM_NONE;
-endfunction
-
-// words of extension for an EA: w is its first extension word
 function automatic logic [2:0] ea_len(input logic [3:0] idx, input logic [15:0] w,
                                       input logic [2:0] immlen);
 	logic [2:0] n;
@@ -59,9 +59,8 @@ function automatic logic [2:0] ea_len(input logic [3:0] idx, input logic [15:0] 
 		EM_ABSL: n = 3'd2;
 		EM_IMM:  n = immlen;
 		EM_AX, EM_PCX: begin
-			if (!w[8]) n = 3'd1;
-			else begin
-				n = 3'd1;
+			n = 3'd1;
+			if (w[8]) begin
 				case (w[5:4])
 					2'd2: n = n + 3'd1;
 					2'd3: n = n + 3'd2;
@@ -83,9 +82,12 @@ function automatic logic [31:0] sx16(input logic [15:0] v);
 	sx16 = {{16{v[15]}}, v};
 endfunction
 
-// build the EA record from the window, the EA's first extension word at p
+// EA record from its extension words w0.. at instruction word offset p;
+// pcb = pc + 2*p (the extension word's address, the PC-relative base),
+// already added into bd for PC-relative modes
 function automatic ea_t mk_ea(input logic [3:0] idx, input logic [2:0] r,
-                              input logic [2:0] p, input logic [2:0] immlen,
+                              input logic [3:0] p, input logic [2:0] immlen,
+                              input logic [31:0] pcb,
                               input logic [15:0] w0, input logic [15:0] w1,
                               input logic [15:0] w2, input logic [15:0] w3,
                               input logic [15:0] w4);
@@ -93,27 +95,29 @@ function automatic ea_t mk_ea(input logic [3:0] idx, input logic [2:0] r,
 	e = '0;
 	e.m    = idx;
 	e.r    = r;
-	e.xoff = p;
+	e.xoff = p[2:0];
 	case (idx)
-		EM_AD16, EM_ABSW, EM_PC16: e.bd = sx16(w0);
+		EM_AD16, EM_ABSW: e.bd = sx16(w0);
+		EM_PC16: e.bd = pcb + sx16(w0);
 		EM_ABSL: e.bd = {w0, w1};
 		EM_IMM:  e.bd = (immlen == 3'd1) ? {16'd0, w0} : {w0, w1};
 		EM_AX, EM_PCX: begin
+			logic [31:0] bd;
 			e.xa = w0[15];
 			e.xr = w0[14:12];
 			e.xl = w0[11];
 			e.sc = w0[10:9];
 			if (!w0[8]) begin
-				e.bd = {{24{w0[7]}}, w0[7:0]};
+				bd = {{24{w0[7]}}, w0[7:0]};
 			end
 			else begin
 				logic [15:0] o0, o1;
 				e.bs = w0[7];
 				e.is = w0[6];
 				case (w0[5:4])
-					2'd2: begin e.bd = sx16(w1);  o0 = w2; o1 = w3; end
-					2'd3: begin e.bd = {w1, w2};  o0 = w3; o1 = w4; end
-					default: begin e.bd = 32'd0; o0 = w1; o1 = w2; end
+					2'd2: begin bd = sx16(w1);  o0 = w2; o1 = w3; end
+					2'd3: begin bd = {w1, w2};  o0 = w3; o1 = w4; end
+					default: begin bd = 32'd0; o0 = w1; o1 = w2; end
 				endcase
 				if (w0[1:0] != 2'd0)
 					e.mi = (w0[2] && !w0[6]) ? 2'd2 : 2'd1;
@@ -123,92 +127,13 @@ function automatic ea_t mk_ea(input logic [3:0] idx, input logic [2:0] r,
 					default: e.od = 32'd0;
 				endcase
 			end
+			// PC-relative with the base not suppressed: the PC is added here
+			e.bd = (idx == EM_PCX && !e.bs) ? (pcb + bd) : bd;
 		end
 		default: ;
 	endcase
 	mk_ea = e;
 endfunction
-
-//--------------------------------------------------------------------------
-// state
-//--------------------------------------------------------------------------
-logic        ph;            // 1: second cycle of a long MOVE (EA1)
-dinst_t      part;          // record under construction in phase 1
-logic  [3:0] part_len;      // words consumed by phase 0
-logic        hold_redir;    // a predicted branch is redirecting fetch
-
-//--------------------------------------------------------------------------
-// phase-0 parse of the instruction at win[0]
-//--------------------------------------------------------------------------
-pla_t        pla;
-logic [15:0] opw;
-logic  [1:0] sz;
-logic  [3:0] i0, i1;
-logic  [2:0] nimm, p0, p1, l0, l1, el_imm, ea1_immlen;
-logic  [3:0] total;
-logic        legal;
-logic [15:0] w_p0 [5];
-logic [15:0] w_p1 [5];
-
-assign opw = win[0];
-always_comb pla = dec_pla(opw);
-
-always_comb begin
-	sz = (pla.szc == 2'd3) ? opw[7:6] : pla.szc;
-	i0 = ea_idx(opw[5:3], opw[2:0]);
-	i1 = ea_idx(opw[8:6], opw[11:9]);
-	case (pla.immk)
-		3'd1:    nimm = (sz == SZ_L) ? 3'd2 : 3'd1;
-		3'd2, 3'd3: nimm = 3'd1;
-		3'd4:    nimm = 3'd2;
-		3'd5:    nimm = (opw[7:0] == 8'h00) ? 3'd1 : (opw[7:0] == 8'hFF) ? 3'd2 : 3'd0;
-		3'd6:    nimm = (opw[2:0] == 3'd2) ? 3'd1 : (opw[2:0] == 3'd3) ? 3'd2 : 3'd0;
-		3'd7:    nimm = opw[6] ? 3'd2 : 3'd1;
-		default: nimm = 3'd0;
-	endcase
-	// immediate EA operand length: the operation size, or the FPU format
-	if (pla.rt == UA_FPU_GEN) begin
-		case (win[1][12:10])
-			3'd0, 3'd1: el_imm = 3'd2;   // L, S
-			3'd2, 3'd3: el_imm = 3'd6;   // X, P
-			3'd4, 3'd6: el_imm = 3'd1;   // W, B
-			3'd5:       el_imm = 3'd4;   // D
-			default:    el_imm = 3'd0;
-		endcase
-	end
-	else
-		el_imm = (sz == SZ_L) ? 3'd2 : 3'd1;
-	ea1_immlen = 3'd0;
-	p0 = 3'd1 + {1'b0, pla.nfix} + nimm;
-	for (int i = 0; i < 5; i++) w_p0[i] = win[3'(p0 + i)];
-	l0 = pla.ea0v ? ea_len(i0, w_p0[0], el_imm) : 3'd0;
-	p1 = p0 + l0;
-	for (int i = 0; i < 5; i++) w_p1[i] = win[3'(p1 + i)];
-	l1 = pla.ea1v ? ea_len(i1, w_p1[0], ea1_immlen) : 3'd0;
-	total = {1'b0, p1} + {1'b0, l1};
-	legal = pla.match &&
-	        (!pla.ea0v || (i0 != EM_NONE && pla.ea0m[i0])) &&
-	        (!pla.ea1v || (i1 != EM_NONE && pla.ea1m[i1]));
-end
-
-// a MOVE whose EAs overflow the window: p1 + l1 > 8 (p1 itself is <= 6)
-wire split = legal && pla.ea1v && ({1'b0, p1} + {1'b0, l1} > 4'd8);
-
-// phase-1 parse: EA1 extension at win[0]
-logic [3:0] i1s;
-logic [2:0] l1s;
-assign i1s = ea_idx(part.opw[8:6], part.opw[11:9]);
-assign l1s = ea_len(i1s, win[0], 3'd0);
-
-//--------------------------------------------------------------------------
-// record assembly
-//--------------------------------------------------------------------------
-dinst_t      nrec;
-logic        go;            // a record (or phase-0 part) is produced
-logic  [3:0] use_n;         // words consumed
-logic        flt;           // a consumed word came from a faulted fetch
-logic        nredir;
-logic [31:0] ntarget;
 
 // effective first micro-instruction given the routine's leading jump
 function automatic logic jcond(input logic [4:0] jc, input logic [3:0] e0,
@@ -229,45 +154,122 @@ function automatic logic jcond(input logic [4:0] jc, input logic [3:0] e0,
 		JC_EXT11:    jcond = ext1[11];
 		JC_EXT10:    jcond = ext1[10];
 		JC_SZ_L:     jcond = (s == SZ_L);
+		JC_SZ_B:     jcond = (s == SZ_B);
 		JC_AY7:      jcond = (ry == 3'd7);
 		JC_BOTH_MEM: jcond = m0 && m1;
 		JC_MASK0:    jcond = (ext1 == 16'd0);
 		JC_X1A:      jcond = ext1[15];
-		JC_SZ_B:     jcond = (s == SZ_B);
 		JC_CREG_RF:  jcond = (ext1[11:0] == 12'h800) || (ext1[11:0] == 12'h803) ||
 		                     (ext1[11:0] == 12'h804);
 		default:     jcond = 1'b0;
 	endcase
 endfunction
 
+// FPU immediate length from the command word's source format
+function automatic logic [2:0] fp_immlen(input logic [15:0] cmd);
+	case (cmd[12:10])
+		3'd0, 3'd1: fp_immlen = 3'd2;   // L, S
+		3'd2, 3'd3: fp_immlen = 3'd6;   // X, P
+		3'd4, 3'd6: fp_immlen = 3'd1;   // W, B
+		3'd5:       fp_immlen = 3'd4;   // D
+		default:    fp_immlen = 3'd0;
+	endcase
+endfunction
+
+function automatic logic has_ext(input logic [3:0] i);
+	has_ext = (i != EM_NONE) && (i >= EM_AD16);
+endfunction
+
+//--------------------------------------------------------------------------
+// the instruction at the head: attributes of its decoder entry
+//--------------------------------------------------------------------------
+pla_t a0;
+always_comb a0 = ent_attr(pd0.ent, pd0.legal);
+wire [15:0] opw = win[0];
+
+//--------------------------------------------------------------------------
+// state
+//--------------------------------------------------------------------------
+typedef enum logic [1:0] { PH_IDLE, PH_EA0, PH_EA1 } ph_t;
+ph_t         ph;
+dinst_t      part;          // record under construction (slow path)
+pd_t         part_pd;
+logic  [3:0] part_len;      // words consumed so far
+logic  [2:0] part_imml;     // EA0 immediate length (slow path)
+logic        hold_redir;    // a predicted branch is redirecting fetch
+
+//--------------------------------------------------------------------------
+// fast path
+//--------------------------------------------------------------------------
+wire  [2:0] fb    = pd0.b;
+wire  [2:0] fp1   = pd0.p1;
+wire        full0 = pd0.x0 && win[fb][8];
+wire        full1 = pd0.x1 && win[fp1][8];
+wire        fast  = pd0.legal && !pd0.slow && !full0 && !full1 && (pd0.tot <= 4'd7);
+
+//--------------------------------------------------------------------------
+// record assembly
+//--------------------------------------------------------------------------
+dinst_t      nrec;
+logic        go;            // a record is produced
+logic        go_part;       // a slow-path phase completes (no record yet)
+logic  [3:0] use_n;
+logic        flt;
+logic [31:0] ntarget;
+ph_t         nph;
+
 always_comb begin
 	logic [31:0] disp;
-	logic  [2:0] avail_ok;
+	logic        nredir;
 	nrec    = '0;
 	go      = 1'b0;
+	go_part = 1'b0;
 	use_n   = 4'd0;
 	flt     = 1'b0;
 	nredir  = 1'b0;
 	ntarget = '0;
 	disp    = '0;
+	nph     = ph;
 
-	if (ph) begin
-		// second cycle of a long MOVE: EA1 extension words at the head
+	if (ph != PH_IDLE) begin
+		// slow path: the EA extension at the head
+		logic [3:0] i;
+		logic [2:0] l, il;
+		i  = (ph == PH_EA0) ? part_pd.i0 : part_pd.i1;
+		il = (ph == PH_EA0) ? part_imml : 3'd0;
+		l  = ea_len(i, win[0], il);
 		nrec = part;
-		if ({2'b00, l1s} <= qcnt) begin
-			go    = 1'b1;
-			use_n = {1'b0, l1s};
-			flt   = |(win_flt & ((8'd1 << l1s) - 8'd1));
-			nrec.ea1 = mk_ea(i1s, part.opw[11:9], part_len[2:0], 3'd0,
-			                 win[0], win[1], win[2], win[3], win[4]);
-			nrec.npc = part.pc + {27'd0, part_len + {1'b0, l1s}, 1'b0};
+		if ({1'b0, l} <= qcnt) begin
+			use_n = {1'b0, l};
+			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
+			if (ph == PH_EA0)
+				nrec.ea0 = mk_ea(i, part.opw[2:0], part_len, il,
+				                 part.pc + {27'd0, part_len, 1'b0},
+				                 win[0], win[1], win[2], win[3], win[4]);
+			else
+				nrec.ea1 = mk_ea(i, part.opw[11:9], part_len, 3'd0,
+				                 part.pc + {27'd0, part_len, 1'b0},
+				                 win[0], win[1], win[2], win[3], win[4]);
+			if (ph == PH_EA0 && il == 3'd6)
+				nrec.fimm = {win[2], win[3], win[4], win[5]};
+			if (ph == PH_EA0 && il == 3'd4)
+				nrec.fimm = {win[2], win[3], 32'd0};
+			if (ph == PH_EA0 && has_ext(part_pd.i1) && !flt) begin
+				go_part = 1'b1;
+				nph     = PH_EA1;
+			end
+			else begin
+				go  = 1'b1;
+				nph = PH_IDLE;
+			end
+			nrec.npc = part.pc + {27'd0, part_len + {1'b0, l}, 1'b0};
 			if (flt) begin
 				nrec.exc = 8'd2;
 				nrec.rt  = UA_DEC_EXC;
 			end
 		end
 	end
-	else if (q_odd && qcnt == 5'd0) begin
+	else if (q_odd && qcnt == 4'd0) begin
 		// the stream starts at an odd address: address error
 		go       = 1'b1;
 		nrec.pc  = qpc;
@@ -275,38 +277,74 @@ always_comb begin
 		nrec.exc = 8'd3;
 		nrec.rt  = UA_DEC_EXC;
 	end
-	else if (qcnt != 5'd0) begin
-		nrec.pc   = qpc;
-		nrec.opw  = opw;
-		nrec.ext1 = win[1];
-		nrec.ext2 = win[2];
-		nrec.sz   = sz;
-		nrec.eop  = pla.eop;
-		nrec.econd = pla.econd;
-		nrec.ccr  = pla.ccr;
-		nrec.t0   = pla.t0;
-		// immediate field: words 1 + nfix ..
-		begin
-			logic [2:0] pi;
-			pi = 3'd1 + {1'b0, pla.nfix};
-			case (nimm)
-				3'd1:    nrec.imm = (pla.immk == 3'd2 || (pla.immk == 3'd1 && sz == SZ_B)) ?
-				                    {24'd0, win[pi][7:0]} : sx16(win[pi]);
-				3'd2:    nrec.imm = {win[pi], win[3'(pi + 1)]};
-				default: nrec.imm = 32'd0;
-			endcase
+	else if (qcnt != 4'd0) begin
+		logic [2:0] pi, nimm;
+		nrec.pc    = qpc;
+		nrec.opw   = opw;
+		nrec.ext1  = win[1];
+		nrec.ext2  = win[2];
+		nrec.sz    = pd0.sz;
+		nrec.eop   = a0.eop;
+		nrec.econd = a0.econd;
+		nrec.ccr   = a0.ccr;
+		nrec.t0    = a0.t0;
+		pi   = 3'd1 + {1'b0, a0.nfix};
+		nimm = pd0.b - pi;
+		case (nimm)
+			3'd1:    nrec.imm = (a0.immk == 3'd2 || (a0.immk == 3'd1 && pd0.sz == SZ_B)) ?
+			                    {24'd0, win[pi][7:0]} : sx16(win[pi]);
+			3'd2:    nrec.imm = {win[pi], win[3'(pi + 1)]};
+			default: nrec.imm = 32'd0;
+		endcase
+		nrec.ea0 = '0; nrec.ea0.m = EM_NONE;
+		nrec.ea1 = '0; nrec.ea1.m = EM_NONE;
+
+		if (!pd0.legal) begin
+			// illegal / unimplemented operation word
+			use_n    = 4'd1;
+			go       = 1'b1;
+			flt      = win_flt[0];
+			nrec.exc = (opw[15:12] == 4'hA) ? 8'd10 :
+			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
-		nrec.ea0 = mk_ea(pla.ea0v ? i0 : EM_NONE, opw[2:0], p0, el_imm,
-		                 w_p0[0], w_p0[1], w_p0[2], w_p0[3], w_p0[4]);
-		nrec.fimm = {w_p0[2], w_p0[3], w_p0[4], win[3'(p0 + 5)]};
-		nrec.ea1 = mk_ea(pla.ea1v ? i1 : EM_NONE, opw[11:9], p1, 3'd0,
-		                 w_p1[0], w_p1[1], w_p1[2], w_p1[3], w_p1[4]);
+		else if (fast) begin
+			if (pd0.tot <= qcnt) begin
+				go    = 1'b1;
+				use_n = pd0.tot;
+				flt   = |(win_flt & ((9'd1 << pd0.tot) - 9'd1));
+				nrec.ea0 = mk_ea(pd0.i0, opw[2:0], {1'b0, fb},
+				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
+				                 qpc + {28'd0, fb, 1'b0},
+				                 win[fb], win[3'(fb + 1)], 16'd0, 16'd0, 16'd0);
+				nrec.ea1 = mk_ea(pd0.i1, opw[11:9], {1'b0, fp1}, 3'd0,
+				                 qpc + {28'd0, fp1, 1'b0},
+				                 win[fp1], win[3'(fp1 + 1)], 16'd0, 16'd0, 16'd0);
+			end
+		end
+		else if ({1'b0, pd0.b} <= qcnt) begin
+			// slow path, first phase: operation word, fixed words, immediate;
+			// the EAs without extension words are complete already
+			nrec.ea0 = mk_ea(pd0.i0, opw[2:0], 4'd0, 3'd0, 32'd0,
+			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
+			nrec.ea1 = mk_ea(pd0.i1, opw[11:9], 4'd0, 3'd0, 32'd0,
+			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
+			use_n = {1'b0, pd0.b};
+			flt   = |(win_flt & ((8'd1 << pd0.b) - 8'd1));
+			if (flt) begin
+				go = 1'b1;                   // stop at the faulted part
+			end
+			else begin
+				go_part = 1'b1;
+				nph     = has_ext(pd0.i0) ? PH_EA0 : PH_EA1;
+			end
+		end
+
+		nrec.npc = qpc + {27'd0, use_n, 1'b0};
+		nrec.rt  = (jcond(a0.jc0, pd0.i0, pd0.i1, win[1], pd0.sz, opw[2:0])) ? a0.jt0 :
+		           (a0.jc0 != JC_NEVER) ? a0.rt + 9'd1 : a0.rt;
 		// fixed operand forms: (Ay)+,(Ax)+ and -(Ay),-(Ax); MOVE16
-		if (pla.fea == 2'd3) begin
-			nrec.ea0 = '0;
-			nrec.ea1 = '0;
+		if (a0.fea == 2'd3) begin
 			if (opw[5]) begin
-				// MOVE16 (Ax)+,(Ay)+
 				nrec.ea0.m = EM_AIP; nrec.ea0.r = opw[2:0];
 				nrec.ea1.m = EM_AIP; nrec.ea1.r = win[1][14:12];
 			end
@@ -319,101 +357,74 @@ always_comb begin
 				nrec.ea1 = opw[3] ? ra : aa;
 			end
 		end
-		else if (pla.fea != 2'd0) begin
-			nrec.ea0   = '0;
-			nrec.ea1   = '0;
-			nrec.ea0.m = (pla.fea == 2'd1) ? EM_AIP : EM_APD;
-			nrec.ea1.m = (pla.fea == 2'd1) ? EM_AIP : EM_APD;
+		else if (a0.fea != 2'd0) begin
+			nrec.ea0.m = (a0.fea == 2'd1) ? EM_AIP : EM_APD;
+			nrec.ea1.m = (a0.fea == 2'd1) ? EM_AIP : EM_APD;
 			nrec.ea0.r = opw[2:0];
 			nrec.ea1.r = opw[11:9];
 		end
 
-		if (!legal) begin
-			// illegal / unimplemented operation word
-			use_n    = 4'd1;
-			go       = 1'b1;
-			flt      = win_flt[0];
-			nrec.exc = (opw[15:12] == 4'hA) ? 8'd10 :
-			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
-			nrec.rt  = UA_DEC_EXC;
-		end
-		else if (split) begin
-			// phase 0 of a long MOVE
-			if ({2'b00, p1} <= qcnt) begin
-				go    = 1'b1;
-				use_n = {1'b0, p1};
-				flt   = |(win_flt & ((8'd1 << p1) - 8'd1));
-			end
-		end
-		else if ({1'b0, total} <= qcnt) begin
-			go    = 1'b1;
-			use_n = total;
-			flt   = |(win_flt & ((9'd1 << total) - 9'd1));
-		end
-
-		nrec.npc = qpc + {27'd0, use_n, 1'b0};
-		nrec.rt  = (jcond(pla.jc0, pla.ea0v ? i0 : EM_NONE, pla.ea1v ? i1 : EM_NONE,
-		                  win[1], sz, opw[2:0])) ? pla.jt0 :
-		           (pla.jc0 != JC_NEVER) ? pla.rt + 9'd1 : pla.rt;
-
-		if (legal) begin
-			if (pla.priv && !smode) begin
+		if (pd0.legal) begin
+			if (a0.priv && !smode)
 				nrec.exc = 8'd8;
-				nrec.rt  = UA_DEC_EXC;
-			end
-			else if (pla.rt == UA_TRAP) begin
+			else if (a0.rt == UA_TRAP)
 				nrec.exc = 8'd32 + {4'd0, opw[3:0]};
-				nrec.rt  = UA_DEC_EXC;
-			end
-			else if ((pla.rt == UA_MOVEC_RD || pla.rt == UA_MOVEC_WR) &&
+			else if ((a0.rt == UA_MOVEC_RD || a0.rt == UA_MOVEC_WR) &&
 			         !((win[1][11:3] == 9'h000) ||
-			           (win[1][11:3] == 9'h100 && win[1][2:0] != 3'd2))) begin
+			           (win[1][11:3] == 9'h100 && win[1][2:0] != 3'd2)))
 				// 68040 control registers: $000-$007 and $800-$807 except CAAR
 				nrec.exc = 8'd4;
-				nrec.rt  = UA_DEC_EXC;
-			end
-			else if (pla.rt == UA_ILLEGAL || pla.rt == UA_BKPT) begin
+			else if (a0.rt == UA_ILLEGAL || a0.rt == UA_BKPT)
 				nrec.exc = 8'd4;
-				nrec.rt  = UA_DEC_EXC;
-			end
 		end
-		if (flt) begin
-			nrec.exc = 8'd2;
-			nrec.rt  = UA_DEC_EXC;
+		if (flt) nrec.exc = 8'd2;
+		if (nrec.exc != 8'd0) begin
+			nrec.rt = UA_DEC_EXC;
+			if (go_part) begin
+				// an exception needs no further parsing
+				go_part = 1'b0;
+				go      = 1'b1;
+				nph     = PH_IDLE;
+			end
 		end
 
 		// PC-relative branches: target and static prediction
-		if (pla.rt == UA_BCC || pla.rt == UA_BSR) begin
+		if (a0.rt == UA_BCC || a0.rt == UA_BSR) begin
 			disp = (opw[7:0] == 8'h00) ? sx16(win[1]) :
 			       (opw[7:0] == 8'hFF) ? {win[1], win[2]} :
 			       {{24{opw[7]}}, opw[7:0]};
 			ntarget = qpc + 32'd2 + disp;
-			nredir  = (pla.rt == UA_BSR) || (opw[11:8] == 4'h0) || disp[31];
+			nredir  = (a0.rt == UA_BSR) || (opw[11:8] == 4'h0) || disp[31];
 		end
-		else if (pla.rt == UA_DBCC) begin
+		else if (a0.rt == UA_DBCC) begin
 			disp    = sx16(win[1]);
 			ntarget = qpc + 32'd2 + disp;
 			nredir  = disp[31];
 		end
 		nrec.target = ntarget;
-		nrec.pred   = nredir && (nrec.exc == 8'd0);
+		nrec.pred   = nredir && (nrec.exc == 8'd0) && pd0.legal;
 	end
 end
 
-// the output register can take a record when empty or being taken
-wire out_free = !rec_v || rec_take;
-wire stall    = flush || hold_redir || d_redir_v;
-wire fire     = go && out_free && !stall;
+// the FIFO has room when it holds at most one record (registered)
+wire room  = (rq_n != 2'd2);
+wire stall = flush || hold_redir || d_redir_v || !room;
+wire fire  = (go || go_part) && !stall;
+wire push  = fire && go;
+wire pop   = rq_pop && (rq_n != 2'd0);
 
-assign consume = fire ? use_n : 4'd0;
+assign consume = fire ? use_n[2:0] : 3'd0;
 
 always_ff @(posedge clk) begin
 	if (!nreset) begin
-		rec_v      <= 1'b0;
-		rec        <= '0;
-		ph         <= 1'b0;
+		rq_n       <= 2'd0;
+		rq0        <= '0;
+		rq1        <= '0;
+		ph         <= PH_IDLE;
 		part       <= '0;
+		part_pd    <= '0;
 		part_len   <= '0;
+		part_imml  <= '0;
 		d_redir_v  <= 1'b0;
 		d_redir_pc <= '0;
 		hold_redir <= 1'b0;
@@ -421,26 +432,41 @@ always_ff @(posedge clk) begin
 	else begin
 		d_redir_v  <= 1'b0;
 		hold_redir <= d_redir_v;
-		if (rec_take) rec_v <= 1'b0;
-		if (fire) begin
-			if (!ph && split && nrec.exc == 8'd0) begin
-				ph       <= 1'b1;
-				part     <= nrec;
-				part_len <= use_n;
+
+		case ({push, pop})
+			2'b01: begin rq0 <= rq1; rq_n <= rq_n - 2'd1; end
+			2'b10: begin
+				if (rq_n == 2'd0) rq0 <= nrec; else rq1 <= nrec;
+				rq_n <= rq_n + 2'd1;
 			end
-			else begin
-				ph    <= 1'b0;
-				rec_v <= 1'b1;
-				rec   <= nrec;
-				if (!ph && nrec.pred) begin
-					d_redir_v  <= 1'b1;
-					d_redir_pc <= ntarget;
+			2'b11: begin
+				if (rq_n == 2'd1) rq0 <= nrec;
+				else begin rq0 <= rq1; rq1 <= nrec; end
+			end
+			default: ;
+		endcase
+
+		if (fire) begin
+			ph <= nph;
+			if (go_part) begin
+				part <= nrec;
+				if (ph == PH_IDLE) begin
+					part_pd   <= pd0;
+					part_len  <= use_n;
+					part_imml <= (a0.rt == UA_FPU_GEN) ? fp_immlen(win[1]) :
+					             (pd0.sz == SZ_L) ? 3'd2 : 3'd1;
 				end
+				else
+					part_len <= part_len + use_n;
+			end
+			if (push && nrec.pred && ph == PH_IDLE) begin
+				d_redir_v  <= 1'b1;
+				d_redir_pc <= ntarget;
 			end
 		end
 		if (flush) begin
-			rec_v      <= 1'b0;
-			ph         <= 1'b0;
+			rq_n       <= 2'd0;
+			ph         <= PH_IDLE;
 			d_redir_v  <= 1'b0;
 			hold_redir <= 1'b0;
 		end

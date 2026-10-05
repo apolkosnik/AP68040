@@ -84,6 +84,7 @@ logic  [2:0] tm_q;
 logic  [1:0] beat;
 logic  [2:0] waits;
 logic        burst;          // still a burst (no TBI given)
+logic  [1:0] inh_left;       // long-word transfers left of a burst-inhibited line
 
 // byte lanes selected by SIZ/A1/A0 (Table 7-1)
 function automatic logic [3:0] lanes(input logic [1:0] s, input logic [1:0] a10);
@@ -128,6 +129,7 @@ always_ff @(posedge clk) begin
 		beat   <= 2'd0;
 		waits  <= 3'd0;
 		burst  <= 1'b0;
+		inh_left <= 2'd0;
 	end
 	else if (bclk_en) begin
 		ta_n   <= 1'b1;
@@ -180,7 +182,9 @@ always_ff @(posedge clk) begin
 			// answer this beat
 			logic retry;
 			logic [3:0] be;
-			retry = (retry_pct > 0) && (beat == 2'd0) &&
+			// a burst-inhibited line's follow-up transfers may not be retried
+			// (MC68040UM 7.6.2: that aborts the line)
+			retry = (retry_pct > 0) && (beat == 2'd0) && (inh_left == 2'd0) &&
 			        (($urandom % 100) < retry_pct) && (tt_q != 2'd3);
 			be = lanes(siz_q, base[1:0]);
 			if (tea_req || (!inmem && tt_q != 2'd3)) begin
@@ -209,11 +213,13 @@ always_ff @(posedge clk) begin
 						if (be[3 - i])
 							mem[baddr[AW-1:2]][31 - 8*i -: 8] <= d_cpu[31 - 8*i -: 8];
 				end
+				if (inh_left != 2'd0) inh_left <= inh_left - 2'd1;
 				if (beat == 2'd0) begin
 					if (siz_q == 2'b11 && (tbi_mode == 2'd1 ||
 					    (tbi_mode == 2'd2 && ($urandom % 2) == 0))) begin
 						tbi_n <= 1'b0;
 						burst <= 1'b0;
+						inh_left <= 2'd3;
 					end
 					tci_n <= !tci_req;
 				end

@@ -3,13 +3,13 @@
 //                                                                          //
 // ap68040_fetch.sv - instruction fetch and the instruction queue            //
 //                                                                          //
-// The queue is a 16-word circular buffer.  The decoder sees the first      //
-// eight words (win), their count, the address of win[0] (qpc) and a fault  //
-// flag per word; it consumes 0..8 words per cycle.  Fetches run ahead      //
-// sequentially until the queue is full; a redirect (decoder branch or a    //
-// WB redirect) empties the queue and restarts at the new address.  A bus  //
-// error on a fetch is not an exception here: the words are marked and the  //
-// decoder raises the fault only if it uses them (MC68040UM 8.2.1).         //
+// The queue is a 12-word shift register: slot 0 is always the next word   //
+// D1 decodes, so D1 reads registers at fixed positions.  Every word is    //
+// predecoded (ap68040_predec) as it enters, so D1 sizes an instruction    //
+// from slot 0's predecode without decoding it.  D1 consumes 0..7 words a //
+// cycle.  Fetches run ahead sequentially while there is room; a redirect  //
+// (D1 branch or a WB redirect) empties the queue.  A bus error on a fetch //
+// marks the words; D1 raises the fault only if it uses them (8.2.1).      //
 //--------------------------------------------------------------------------//
 
 module ap68040_fetch
@@ -29,9 +29,10 @@ module ap68040_fetch
 	// decoder side
 	output logic [15:0] win [8],
 	output logic  [7:0] win_flt,      // the word came from a faulted fetch
-	output logic  [4:0] qcnt,
+	output pd_t         pd0,          // predecode of win[0]
+	output logic  [3:0] qcnt,
 	output logic [31:0] qpc,
-	input  logic  [3:0] consume,
+	input  logic  [2:0] consume,
 	output logic        q_odd,        // the stream starts at an odd address
 
 	// BIU client
@@ -44,37 +45,40 @@ module ap68040_fetch
 	input  logic [31:0] b_rdata
 );
 
-logic [15:0] qbuf [16];
-logic [15:0] qflt;
-logic  [3:0] h;
-logic  [4:0] cnt;
+localparam int QN = 12;
+
+logic [15:0] qw   [QN];
+pd_t         qp   [QN];
+logic [QN-1:0] qf;
+logic  [3:0] cnt;
+logic [31:0] qpc_r;
 
 logic [31:0] fpc;             // address of the next fetch (word aligned)
 logic        busy;            // a fetch is on the bus
-logic        gnt_seen;
 logic        stale;           // the fetch on the bus belongs to a flushed stream
 logic        odd;             // the stream starts at an odd address
 
-assign qcnt = cnt;
+assign qcnt  = cnt;
+assign qpc   = qpc_r;
 assign q_odd = odd;
-assign qpc  = qpc_r;
-logic [31:0] qpc_r;
+assign pd0   = qp[0];
 
 always_comb begin
 	for (int i = 0; i < 8; i++) begin
-		win[i]     = qbuf[4'(h + i)];
-		win_flt[i] = qflt[4'(h + i)];
+		win[i]     = qw[i];
+		win_flt[i] = qf[i];
 	end
 end
 
-// words this long word contributes: two, or one when fpc points at its
-// second word (after a redirect)
-wire  [1:0] nwords = fpc[1] ? 2'd1 : 2'd2;
-wire  [4:0] cnt_after = cnt - {1'b0, consume};
-wire        room   = (cnt_after + 5'd2) <= 5'd16;
+// predecode of the two words of a fetched long word
+pd_t pd_hi, pd_lo;
+ap68040_predec pdh (.op(b_rdata[31:16]), .pd(pd_hi));
+ap68040_predec pdl (.op(b_rdata[15:0]),  .pd(pd_lo));
 
+// a request only when the queue has room for a whole long word even if D1
+// consumes nothing (registered count: no dependency on D1 this cycle)
 always_comb begin
-	b_req  = !busy && room && !stop && !redir_v && !d_redir_v && !odd;
+	b_req  = !busy && (cnt <= 4'(QN - 2)) && !stop && !redir_v && !d_redir_v && !odd;
 	b_breq = '0;
 	b_breq.addr = {fpc[31:2], 2'b00};
 	b_breq.siz  = SIZ_L;
@@ -83,54 +87,54 @@ always_comb begin
 	b_breq.tm   = smode ? TM_SCODE : TM_UCODE;
 end
 
+wire        arrive = busy && (b_done || b_err) && !stale;
+wire  [1:0] nin    = arrive ? (fpc[1] ? 2'd1 : 2'd2) : 2'd0;
+wire  [3:0] keep   = cnt - {1'b0, consume};    // words left after D1
+
 always_ff @(posedge clk) begin
 	if (!nreset) begin
-		h      <= '0;
-		cnt    <= '0;
-		qflt   <= '0;
-		fpc    <= '0;
-		qpc_r  <= '0;
-		busy   <= 1'b0;
-		stale  <= 1'b0;
-		odd    <= 1'b0;
-		for (int i = 0; i < 16; i++) qbuf[i] <= '0;
+		cnt   <= '0;
+		qf    <= '0;
+		fpc   <= '0;
+		qpc_r <= '0;
+		busy  <= 1'b0;
+		stale <= 1'b0;
+		odd   <= 1'b0;
+		for (int i = 0; i < QN; i++) begin qw[i] <= '0; qp[i] <= '0; end
 	end
 	else begin
-		logic [3:0] hn;
-		logic [4:0] cn;
-		hn = h + consume;
-		cn = cnt - {1'b0, consume};
-
 		if (b_gnt) busy <= 1'b1;
-
 		if (busy && (b_done || b_err)) begin
-			busy <= 1'b0;
-			if (!stale) begin
-				if (nwords == 2'd2) begin
-					qbuf[4'(hn + cn)]     <= b_rdata[31:16];
-					qbuf[4'(hn + cn + 1)] <= b_rdata[15:0];
-					qflt[4'(hn + cn)]     <= b_err;
-					qflt[4'(hn + cn + 1)] <= b_err;
-					cn = cn + 5'd2;
-				end
-				else begin
-					qbuf[4'(hn + cn)] <= b_rdata[15:0];
-					qflt[4'(hn + cn)] <= b_err;
-					cn = cn + 5'd1;
-				end
-				fpc <= {fpc[31:2], 2'b00} + 32'd4;
-			end
+			busy  <= 1'b0;
 			stale <= 1'b0;
+			if (!stale) fpc <= {fpc[31:2], 2'b00} + 32'd4;
 		end
 
-		h     <= hn;
-		cnt   <= cn;
-		qpc_r <= qpc_r + {27'd0, consume, 1'b0};
+		// shift out what D1 consumed, append what arrived
+		for (int i = 0; i < QN; i++) begin
+			logic [4:0] src;
+			src = 5'(i) + {2'b00, consume};
+			if (4'(i) < keep) begin
+				qw[i] <= qw[src[3:0]];
+				qp[i] <= qp[src[3:0]];
+				qf[i] <= qf[src[3:0]];
+			end
+			else if (nin == 2'd2 && 4'(i) == keep) begin
+				qw[i] <= b_rdata[31:16]; qp[i] <= pd_hi; qf[i] <= b_err;
+			end
+			else if (nin == 2'd2 && 4'(i) == keep + 4'd1) begin
+				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err;
+			end
+			else if (nin == 2'd1 && 4'(i) == keep) begin
+				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err;
+			end
+		end
+		cnt   <= keep + {2'b00, nin};
+		qpc_r <= qpc_r + {28'd0, consume, 1'b0};
 
 		if (redir_v || d_redir_v) begin
 			logic [31:0] npc;
 			npc = redir_v ? redir_pc : d_redir_pc;
-			h     <= '0;
 			cnt   <= '0;
 			fpc   <= {npc[31:1], 1'b0};
 			qpc_r <= npc;

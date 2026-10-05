@@ -22,9 +22,11 @@ module ap68040_useq
 	input  logic        nreset,
 	input  logic        flush,
 
-	input  logic        rec_v,
-	input  dinst_t      rec,
-	output logic        rec_take,
+	// record FIFO from D1
+	input  logic  [1:0] rq_n,
+	input  dinst_t      rq0,
+	input  dinst_t      rq1,
+	output logic        rq_pop,
 
 	input  logic        smode,
 	input  logic        master,     // M bit
@@ -33,9 +35,10 @@ module ap68040_useq
 	input  logic  [3:0] exc_kind,
 	input  logic  [4:0] exc_ssp,
 
-	output logic        uo_v,
-	output uop_t        uo,
-	input  logic        uo_rdy      // the back end takes uo this cycle
+	// uop FIFO towards the back end: uq0 is the head
+	output logic  [1:0] uq_n,
+	output uop_t        uq0,
+	input  logic        uq_pop      // the back end takes uq0 this cycle
 );
 
 
@@ -44,9 +47,10 @@ module ap68040_useq
 //--------------------------------------------------------------------------
 // state
 //--------------------------------------------------------------------------
-dinst_t      cur;
-logic        cur_v;
-logic  [8:0] upc;
+logic  [8:0] upc;               // address of uw_q
+uword_t      uw_q;              // registered microcode word
+logic        uw_v;              // uw_q is valid for the current instruction
+logic        exc_mode;          // running an exception routine
 logic        first;
 logic        ind0, ind1;        // pointer of EA0 / EA1 already loaded
 logic        def_v;             // a deferred source update is pending
@@ -56,24 +60,23 @@ logic  [4:0] ssp;
 // MOVEM loop
 logic        mv_act;            // the loop has started for this instruction
 logic [15:0] mv_mask;           // registers still to transfer
-logic  [4:0] mv_k;              // transfers done
+logic [31:0] mv_off;            // address offset of the next transfer
+logic  [7:0] mv_cnt;            // bytes transferred so far
 logic        mv_t11;            // the address is in T11 (base register in the list)
 
-wire         can_emit = !uo_v || uo_rdy;
-
-// the record being worked on: the current one, or the next from D1
-wire         src_v   = cur_v || rec_v;
+// the instruction being sequenced: the D1 FIFO head, or nothing for an
+// exception routine
 dinst_t      src;
-logic  [8:0] src_upc;
+always_comb src = exc_mode ? '0 : rq0;
 logic        src_first;
-always_comb begin
-	src       = cur_v ? cur : rec;
-	src_upc   = cur_v ? upc : rec.rt;
-	src_first = cur_v ? first : 1'b1;
-end
+assign src_first = first;
 
 uword_t      uw;
-always_comb uw = ucode_rom(src_upc);
+assign uw = uw_q;
+
+// uop FIFO
+uop_t        uq1;
+wire         room_out = (uq_n != 2'd2);
 
 //--------------------------------------------------------------------------
 // register naming
@@ -309,7 +312,6 @@ always_comb begin
 		else                              nu.mem = M_LD;
 	end
 
-	pcx = src.pc + {28'd0, me.xoff, 1'b0};
 
 	if (me_v || uw.ag == AGM_EA0 || uw.ag == AGM_EA1 || uw.ag == AGM_LEA0) begin
 		logic [4:0] bre;
@@ -331,14 +333,14 @@ always_comb begin
 			end
 			EM_AD16: begin nu.base_v = 1'b1; nu.base = bre; nu.disp = me.bd; end
 			EM_ABSW, EM_ABSL: nu.disp = me.bd;
-			EM_PC16: begin nu.disp = pcx + me.bd; nu.mprog = 1'b1; end
+			EM_PC16: begin nu.disp = me.bd; nu.mprog = 1'b1; end   // D1 added the PC
 			EM_AX, EM_PCX: begin
 				logic [4:0] xr;
 				xr = me.xa ? areg(me.xr, sp_reg) : dreg(me.xr);
 				if (me.mi == 2'd0 || mi_stage1) begin
 					// address (or the pointer address) from base/index/bd
 					if (me.m == EM_AX) begin nu.base_v = !me.bs; nu.base = bre; nu.disp = me.bd; end
-					else begin nu.disp = (me.bs ? 32'd0 : pcx) + me.bd; nu.mprog = !me.bs; end
+					else begin nu.disp = me.bd; nu.mprog = !me.bs; end   // D1 added the PC
 					nu.idx_v = !me.is && (me.mi != 2'd2);
 					nu.idx   = xr;
 					nu.idx_l = me.xl;
@@ -511,7 +513,7 @@ always_comb begin
 		          ((src.ea0.m == EM_AI || pi || src.ea0.m == EM_AD16 ||
 		            src.ea0.m == EM_AX) && !(src.ea0.m == EM_AX && src.ea0.bs)) &&
 		          src.ext1[{1'b1, src.ea0.r}];
-		off = pd ? -({27'd0, mv_k} + 32'd1) * {29'd0, sb} : {27'd0, mv_k} * {29'd0, sb};
+		off = mv_act ? mv_off : (pd ? -{29'd0, sb} : 32'd0);
 		nu.last = lastx;
 		if (uw.d == S_MVR) begin
 			nu.d_v = 1'b1; nu.d_reg = r;
@@ -554,7 +556,7 @@ always_comb begin
 			end
 			if (lastx && pi) begin
 				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = an;
-				nu.upd_amt = 8'({27'd0, mv_k} * {29'd0, sb} + {29'd0, sb});
+				nu.upd_amt = (mv_act ? mv_cnt : 8'd0) + {5'd0, sb};
 			end
 		end
 	end
@@ -580,104 +582,138 @@ always_comb begin
 end
 
 //--------------------------------------------------------------------------
-// sequencing
+// sequencing.  uw_q is read one cycle ahead: the next address is chosen
+// from the current word and the records, and the ROM output registered.
 //--------------------------------------------------------------------------
-wire step = src_v && can_emit && !flush && !exc_go;
+wire step = uw_v && room_out && !flush && !exc_go;
+wire emit = step && !n_jump;
+wire stay = n_ptr || n_mv_pre || (uw.loop && !nu.last);   // same word again
+wire done = emit && !stay && uw.last;                       // instruction ends
 
-assign rec_take = step && !cur_v;
+assign rq_pop = done && !exc_mode;
+
+logic [8:0] na;          // next microcode address
+logic       nv;
+always_comb begin
+	na = upc;
+	nv = uw_v;
+	if (exc_go) begin
+		case (exc_kind)
+			4'd1:    na = UA_EXC_FMT2;
+			4'd2:    na = UA_EXC_FMT7;
+			4'd3:    na = UA_EXC_IRQ;
+			4'd5:    na = UA_EXC_IRQM;
+			4'd4:    na = UA_EXC_RESET;
+			default: na = UA_EXC_FMT0;
+		endcase
+		nv = 1'b1;
+	end
+	else if (flush) begin
+		nv = 1'b0;
+	end
+	else if (step) begin
+		if (n_jump)      na = jc_now ? uw.jt : upc + 9'd1;
+		else if (stay)   na = upc;
+		else if (!uw.last) na = upc + 9'd1;
+		else if (!exc_mode && rq_n == 2'd2) na = rq1.rt;   // next instruction
+		else nv = 1'b0;
+	end
+	else if (!uw_v && !exc_mode && rq_n != 2'd0) begin
+		na = rq0.rt;                                         // first word
+		nv = 1'b1;
+	end
+end
 
 always_ff @(posedge clk) begin
 	if (!nreset) begin
-		cur_v <= 1'b0;
-		cur   <= '0;
-		upc   <= '0;
-		first <= 1'b1;
-		ind0  <= 1'b0;
-		ind1  <= 1'b0;
-		def_v <= 1'b0;
-		def_reg <= '0;
-		def_amt <= '0;
-		ssp   <= R_ISP;
-		mv_act <= 1'b0;
-		mv_mask <= '0;
-		mv_k  <= '0;
-		mv_t11 <= 1'b0;
-		uo_v  <= 1'b0;
-		uo    <= '0;
+		upc      <= '0;
+		uw_q     <= '0;
+		uw_v     <= 1'b0;
+		exc_mode <= 1'b0;
+		first    <= 1'b1;
+		ind0     <= 1'b0;
+		ind1     <= 1'b0;
+		def_v    <= 1'b0;
+		def_reg  <= '0;
+		def_amt  <= '0;
+		ssp      <= R_ISP;
+		mv_act   <= 1'b0;
+		mv_mask  <= '0;
+		mv_off   <= '0;
+		mv_cnt   <= '0;
+		mv_t11   <= 1'b0;
+		uq_n     <= 2'd0;
+		uq0      <= '0;
+		uq1      <= '0;
 	end
 	else begin
-		if (uo_rdy) uo_v <= 1'b0;
+		upc  <= na;
+		uw_q <= ucode_rom(na);
+		uw_v <= nv;
 
-		if (step) begin
-			if (!cur_v) begin
-				cur   <= rec;
-				ind0  <= 1'b0;
-				ind1  <= 1'b0;
-				def_v <= 1'b0;
-				mv_act <= 1'b0;
-				mv_k   <= 5'd0;
-				mv_t11 <= 1'b0;
+		// uop FIFO
+		case ({emit, uq_pop && uq_n != 2'd0})
+			2'b01: begin uq0 <= uq1; uq_n <= uq_n - 2'd1; end
+			2'b10: begin
+				if (uq_n == 2'd0) uq0 <= nu; else uq1 <= nu;
+				uq_n <= uq_n + 2'd1;
 			end
-			cur_v <= 1'b1;
-			if (n_jump) begin
-				upc <= jc_now ? uw.jt : src_upc + 9'd1;
+			2'b11: begin
+				if (uq_n == 2'd1) uq0 <= nu;
+				else begin uq0 <= uq1; uq1 <= nu; end
 			end
-			else begin
-				uo_v  <= 1'b1;
-				uo    <= nu;
-				first <= 1'b0;
-				if (n_ptr) begin
-					upc <= src_upc;
-					if (n_ptr_ea1) ind1 <= 1'b1; else ind0 <= 1'b1;
-				end
-				else if (n_mv_pre) begin
-					upc    <= src_upc;
-					mv_t11 <= 1'b1;
-				end
-				else if (uw.loop && !nu.last) begin
-					upc     <= src_upc;
-					mv_act  <= 1'b1;
-					mv_mask <= n_mv_rest;
-					mv_k    <= mv_k + 5'd1;
-				end
-				else begin
-					if (n_def_set) begin
-						def_v   <= 1'b1;
-						def_reg <= n_def_reg;
-						def_amt <= n_def_amt;
-					end
-					if (uw.last) begin
-						cur_v <= 1'b0;
-						first <= 1'b1;
-					end
-					else upc <= src_upc + 9'd1;
-				end
+			default: ;
+		endcase
+
+		if (emit) begin
+			first <= 1'b0;
+			if (n_ptr) begin
+				if (n_ptr_ea1) ind1 <= 1'b1; else ind0 <= 1'b1;
 			end
+			else if (n_mv_pre) begin
+				mv_t11 <= 1'b1;
+			end
+			else if (uw.loop && !nu.last) begin
+				mv_act  <= 1'b1;
+				mv_mask <= n_mv_rest;
+				mv_off  <= (mv_act ? mv_off : ((src.ea0.m == EM_APD) ?
+				            -{29'd0, (src.sz == SZ_L) ? 3'd4 : 3'd2} : 32'd0)) +
+				           ((src.ea0.m == EM_APD) ? -{29'd0, (src.sz == SZ_L) ? 3'd4 : 3'd2}
+				                                  :  {29'd0, (src.sz == SZ_L) ? 3'd4 : 3'd2});
+				mv_cnt  <= (mv_act ? mv_cnt : 8'd0) + ((src.sz == SZ_L) ? 8'd4 : 8'd2);
+			end
+			else if (n_def_set) begin
+				def_v   <= 1'b1;
+				def_reg <= n_def_reg;
+				def_amt <= n_def_amt;
+			end
+		end
+		if (done) begin
+			// the next instruction starts with clean per-instruction state
+			first  <= 1'b1;
+			ind0   <= 1'b0;
+			ind1   <= 1'b0;
+			def_v  <= 1'b0;
+			mv_act <= 1'b0;
+			mv_t11 <= 1'b0;
+			if (exc_mode) exc_mode <= 1'b0;
 		end
 
 		if (flush) begin
-			cur_v <= 1'b0;
-			first <= 1'b1;
-			uo_v  <= 1'b0;
-		end
-		if (exc_go) begin
-			// exception routine: a pseudo instruction with no fields
-			cur   <= '0;
-			cur_v <= 1'b1;
 			first <= 1'b1;
 			ind0  <= 1'b0;
 			ind1  <= 1'b0;
 			def_v <= 1'b0;
-			ssp   <= exc_ssp;
-			uo_v  <= 1'b0;
-			case (exc_kind)
-				4'd1:    upc <= UA_EXC_FMT2;
-				4'd2:    upc <= UA_EXC_FMT7;
-				4'd3:    upc <= UA_EXC_IRQ;
-				4'd5:    upc <= UA_EXC_IRQM;
-				4'd4:    upc <= UA_EXC_RESET;
-				default: upc <= UA_EXC_FMT0;
-			endcase
+			mv_act <= 1'b0;
+			mv_t11 <= 1'b0;
+			uq_n  <= 2'd0;
+			if (!exc_go) exc_mode <= 1'b0;
+		end
+		if (exc_go) begin
+			exc_mode <= 1'b1;
+			first    <= 1'b1;
+			ssp      <= exc_ssp;
+			uq_n     <= 2'd0;
 		end
 	end
 end

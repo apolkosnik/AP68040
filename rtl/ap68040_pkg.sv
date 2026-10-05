@@ -238,6 +238,22 @@ typedef struct packed {
 	logic [31:0] od;      // outer displacement
 } ea_t;
 
+// predecode of a queue word taken as an operation word (computed as the
+// word enters the instruction queue, so D1 never decodes in its loop)
+typedef struct packed {
+	logic        legal;   // a legal operation word
+	logic  [8:0] ent;     // decoder entry
+	logic  [1:0] sz;
+	logic  [2:0] b;       // operation word + fixed words + immediate (1..5)
+	logic  [2:0] p1;      // first extension word of EA1 (b + EA0 words)
+	logic  [3:0] tot;     // length assuming brief index extensions
+	logic        x0;      // EA0 has an index extension (at b)
+	logic        x1;      // EA1 has an index extension (at p1)
+	logic        slow;    // parsed in several cycles (FPU immediate)
+	logic  [3:0] i0;      // EA0 mode index, EM_NONE when absent
+	logic  [3:0] i1;
+} pd_t;
+
 typedef struct packed {
 	logic [31:0] pc;
 	logic [31:0] npc;

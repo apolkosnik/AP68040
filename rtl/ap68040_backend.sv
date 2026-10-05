@@ -318,7 +318,8 @@ ap68040_muldiv md (
 );
 
 // EX holds while the unit runs, until the cycle its result is presented
-assign ex_hold = ex_v && ex_is_md && !ex_div0 && !ex_fault && !md_done;
+assign ex_hold = (ex_v && ex_is_md && !ex_div0 && !ex_fault && !md_done) ||
+                 (ex_v && ex_slow && !ex_ph);
 
 // multiply/divide result and flags
 logic [31:0] md_res;
@@ -385,6 +386,19 @@ logic [31:0] ex_latch;
 //--------------------------------------------------------------------------
 logic [31:0] bf_off;
 logic  [5:0] bf_w;
+
+// leading zero count of a nonzero 32-bit value, as a balanced tree
+function automatic logic [4:0] clz32(input logic [31:0] v);
+	logic [4:0] n;
+	logic [31:0] x;
+	x = v;
+	n[4] = (x[31:16] == 16'd0); if (n[4]) x = {x[15:0], 16'd0};
+	n[3] = (x[31:24] == 8'd0);  if (n[3]) x = {x[23:0], 8'd0};
+	n[2] = (x[31:28] == 4'd0);  if (n[2]) x = {x[27:0], 4'd0};
+	n[1] = (x[31:30] == 2'd0);  if (n[1]) x = {x[29:0], 2'd0};
+	n[0] = !x[31];
+	clz32 = n;
+endfunction
 logic  [7:0] bf_lonew;          // memory form: the new byte after the long
 logic [31:0] bf_res;
 logic  [7:0] bf_lo_out;
@@ -425,11 +439,10 @@ always_comb begin
 		3'd6: nwin = win | mask40;
 		default: nwin = (win & ~mask40) | (ins40 & mask40);
 	endcase
-	// leading zeros of the field (FFO)
+	// leading zeros of the field (FFO): a log-depth count over the top-
+	// aligned field; a zero field gives the width
 	zf = rot & top;
-	lz = bf_w;
-	for (int i = 0; i < 32; i++)
-		if (zf[i] && (6'(31 - i) < lz)) lz = 6'(31 - i);
+	lz = (zf == 32'd0) ? bf_w : {1'b0, clz32(zf)};
 	if (t == 3'd7) begin
 		nflag = ins_top[31];
 		zflag = (ins_top & top) == 32'd0;
@@ -493,40 +506,110 @@ function automatic logic [31:0] spr_read(input logic [7:0] n);
 	endcase
 endfunction
 
-always_comb begin
-	ex_res    = alu_res;
-	ex_flags  = alu_flags;
-	ex_dkill  = 1'b0;
-	ex_taken  = 1'b0;
-	ex_target = ex_u.target;
-	ex_xvec   = 8'd0;
-	ex_sr_we  = 1'b0;
-	ex_sr_new = {sr_r[15:5], alu_flags};
+// slow (two-cycle) operations: computed in EX's first cycle, registered,
+// used in the second, so their logic never reaches the result path
+function automatic logic is_slow(input logic [6:0] op);
+	case (op)
+		OP_ASL, OP_ASR, OP_LSL, OP_LSR, OP_ROL, OP_ROR, OP_ROXL, OP_ROXR,
+		OP_ABCD, OP_SBCD, OP_NBCD, OP_PACK, OP_UNPK, OP_BF, OP_CHK2B,
+		OP_SPR, OP_SRLOG, OP_RTE, OP_RTEF, OP_IACKV, OP_MISC: is_slow = 1'b1;
+		default: is_slow = 1'b0;
+	endcase
+endfunction
 
+typedef struct packed {
+	logic [31:0] res;
+	logic  [4:0] flags;
+	logic        dkill;
+	logic        taken;
+	logic [31:0] target;
+	logic  [7:0] xvec;
+	logic        sr_we;
+	logic [15:0] sr_new;
+} exo_t;
+
+wire  ex_slow = is_slow(ex_u.op);
+logic ex_ph;                    // second cycle of a slow op
+exo_t xf, xs, xs_q;
+
+logic [31:0] sl_res;
+logic  [4:0] sl_flags;
+ap68040_alu_slow alu_s (
+	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .flags_in(ccr_f),
+	.res(sl_res), .flags_out(sl_flags)
+);
+
+// fast operations
+always_comb begin
+	xf.res    = alu_res;
+	xf.flags  = alu_flags;
+	xf.dkill  = 1'b0;
+	xf.taken  = 1'b0;
+	xf.target = ex_u.target;
+	xf.xvec   = 8'd0;
+	xf.sr_we  = 1'b0;
+	xf.sr_new = {sr_r[15:5], alu_flags};
 	case (ex_u.op)
 		OP_MUL, OP_DIV: begin
-			ex_res   = md_res;
-			ex_flags = md_flags;
-			ex_dkill = md_dkill;
+			xf.res   = md_res;
+			xf.flags = md_flags;
+			xf.dkill = md_dkill;
 			if (ex_div0) begin
-				ex_xvec  = 8'd5;
-				ex_flags = {ccr_f[4:1], 1'b0};
+				xf.xvec  = 8'd5;
+				xf.flags = {ccr_f[4:1], 1'b0};
 			end
 		end
 		OP_MDRES: begin
-			ex_res   = ex_u.cond[0] ? md_lol : md_rem;
-			ex_dkill = md_ovfl;
+			xf.res   = ex_u.cond[0] ? md_lol : md_rem;
+			xf.dkill = md_ovfl;
 		end
-		OP_MDHI:  ex_res = ex_av;
-		OP_BCC: begin
-			ex_taken = alu_cc;
-		end
+		OP_MDHI:   xf.res = ex_av;
+		OP_BCC:    xf.taken = alu_cc;
 		OP_DBCC: begin
-			ex_taken = !alu_cc && (alu_res[15:0] != 16'hFFFF);
-			ex_dkill = alu_cc;
+			xf.taken = !alu_cc && (alu_res[15:0] != 16'hFFFF);
+			xf.dkill = alu_cc;
 		end
-		OP_TRAPCC: if (alu_trap) ex_xvec = 8'd7;
-		OP_CHK:    if (alu_trap) ex_xvec = 8'd6;
+		OP_TRAPCC: if (alu_trap) xf.xvec = 8'd7;
+		OP_CHK:    if (alu_trap) xf.xvec = 8'd6;
+		OP_CCRLOG: xf.res = ex_bv;
+		OP_SPW:    xf.res = ex_av;
+		OP_LATCH:  xf.res = ex_av;
+		OP_CAS2C: begin
+			if (!ex_u.cond[0] || cas2_eq) xf.flags = cmp_flags;
+			else xf.flags = ccr_f;
+		end
+		OP_CAS2R: begin
+			xf.res   = (ex_av & ex_szm) | (ex_bv & ~ex_szm);
+			xf.dkill = cas2_eq;
+		end
+		OP_BFSET:  xf.res = ex_u.cond[0] ? {24'd0, bf_lonew} : {{3{ex_av[31]}}, ex_av[31:3]};
+		OP_CAS: begin
+			xf.flags = alu_flags;
+			xf.res   = ex_bv;
+		end
+		default: ;
+	endcase
+	// control transfers
+	case (ex_u.br)
+		BR_IMM:  begin xf.taken = 1'b1; xf.target = ex_u.target; end
+		BR_EA:   begin xf.taken = 1'b1; xf.target = ex_ea; end
+		BR_A:    begin xf.taken = 1'b1; xf.target = ex_av; end
+		BR_B:    begin xf.taken = 1'b1; xf.target = ex_bv; end
+		default: ;
+	endcase
+end
+
+// slow operations (first EX cycle)
+always_comb begin
+	xs.res    = sl_res;
+	xs.flags  = sl_flags;
+	xs.dkill  = 1'b0;
+	xs.taken  = 1'b0;
+	xs.target = ex_u.target;
+	xs.xvec   = 8'd0;
+	xs.sr_we  = 1'b0;
+	xs.sr_new = {sr_r[15:5], ccr_f};
+	case (ex_u.op)
 		OP_CHK2B: begin
 			// WinUAE i_CHK2: signed compares of the sign-extended bounds
 			// (lower in ex_latch, upper in A) with B, which is sign-extended
@@ -542,99 +625,92 @@ always_comb begin
 			endcase
 			z = (up == rg) || (lo == rg);
 			c = !z && ((lo <= up) ? ((rg < lo) || (rg > up)) : ((rg > up) && (rg < lo)));
-			ex_flags = {ccr_f[4], ccr_f[3], z, ccr_f[1], c};
-			if (ex_u.cond[0] && c) ex_xvec = 8'd6;
+			xs.res   = ex_bv;
+			xs.dkill = 1'b1;
+			xs.flags = {ccr_f[4], ccr_f[3], z, ccr_f[1], c};
+			if (ex_u.cond[0] && c) xs.xvec = 8'd6;
 		end
-		OP_CCRLOG: ex_res = ex_bv;
 		OP_SRLOG: begin
-			logic [15:0] cur;
+			logic [15:0] cur, n;
 			cur = {sr_r[15:5], ccr_f};
 			case (ex_u.cond[1:0])
-				2'd0:    ex_sr_new = cur & ex_av[15:0];
-				2'd1:    ex_sr_new = cur | ex_av[15:0];
-				2'd2:    ex_sr_new = cur ^ ex_av[15:0];
-				default: ex_sr_new = ex_av[15:0];
+				2'd0:    n = cur & ex_av[15:0];
+				2'd1:    n = cur | ex_av[15:0];
+				2'd2:    n = cur ^ ex_av[15:0];
+				default: n = ex_av[15:0];
 			endcase
-			ex_sr_new = ex_sr_new & 16'hF71F;
-			ex_sr_we  = 1'b1;
-			ex_flags  = ex_sr_new[4:0];
+			xs.sr_new = n & 16'hF71F;
+			xs.sr_we  = 1'b1;
+			xs.flags  = xs.sr_new[4:0];
 		end
 		OP_SPR: begin
 			logic [31:0] v, m;
 			v = spr_read(ex_u.imm[7:0]);
 			m = (ex_u.sz == SZ_B) ? 32'h0000_00FF : (ex_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
-			ex_res = (v & m) | (ex_bv & ~m);
-		end
-		OP_SPW: ex_res = ex_av;
-		OP_LATCH: ex_res = ex_av;
-		OP_CAS2C: begin
-			if (!ex_u.cond[0] || cas2_eq) ex_flags = cmp_flags;
-			else ex_flags = ccr_f;
+			xs.res = (v & m) | (ex_bv & ~m);
+			xs.flags = ccr_f;
 		end
 		OP_MISC: begin
+			xs.flags = ccr_f;
 			if (ex_u.cond == 4'd2) begin
 				// STOP #imm: SR = imm, then wait for an interrupt
-				ex_sr_new = ex_av[15:0] & 16'hF71F;
-				ex_sr_we  = 1'b1;
-				ex_flags  = ex_sr_new[4:0];
+				xs.sr_new = ex_av[15:0] & 16'hF71F;
+				xs.sr_we  = 1'b1;
+				xs.flags  = xs.sr_new[4:0];
 			end
 		end
 		OP_IACKV: begin
 			// IACK data: [7:0] vector, [8] AVEC, [9] TEA (spurious)
 			logic [7:0] v;
-			v = ex_latch[9] ? 8'd24 : ex_latch[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_latch[7:0];
+			xs.flags = ccr_f;
 			if (!ex_u.cond[0]) begin
 				v = ex_av[9] ? 8'd24 : ex_av[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_av[7:0];
-				ex_res = {22'd0, v, 2'b00};                 // format $0 word
+				xs.res = {22'd0, v, 2'b00};                 // format $0 word
 			end
-			else
-				ex_res = vbr_r + {22'd0, v, 2'b00};         // vector address
+			else begin
+				v = ex_latch[9] ? 8'd24 : ex_latch[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_latch[7:0];
+				xs.res = vbr_r + {22'd0, v, 2'b00};         // vector address
+			end
 		end
 		OP_RTEF: begin
 			// 68040 frame formats (WinUAE i_RTE): $0 8, $1 8 (throwaway),
 			// $2 12, $3 12, $4 16, $7 60 bytes; others: format error
+			xs.flags = ccr_f;
 			case (ex_av[15:12])
-				4'h0, 4'h1: ex_res = 32'd8;
-				4'h2, 4'h3: ex_res = 32'd12;
-				4'h4:       ex_res = 32'd16;
-				4'h7:       ex_res = 32'd60;
-				default: begin ex_res = 32'd0; ex_xvec = 8'd14; end
+				4'h0, 4'h1: xs.res = 32'd8;
+				4'h2, 4'h3: xs.res = 32'd12;
+				4'h4:       xs.res = 32'd16;
+				4'h7:       xs.res = 32'd60;
+				default: begin xs.res = 32'd0; xs.xvec = 8'd14; end
 			endcase
 		end
 		OP_RTE: begin
-			ex_sr_new = ex_av[15:0] & 16'hF71F;
-			ex_sr_we  = 1'b1;
-			ex_flags  = ex_sr_new[4:0];
-			ex_taken  = 1'b1;
-			ex_target = rte_fmt1 ? ex_u.pc : ex_bv;
-		end
-		OP_CAS2R: begin
-			ex_res   = (ex_av & ex_szm) | (ex_bv & ~ex_szm);
-			ex_dkill = cas2_eq;
+			xs.sr_new = ex_av[15:0] & 16'hF71F;
+			xs.sr_we  = 1'b1;
+			xs.flags  = xs.sr_new[4:0];
+			xs.taken  = 1'b1;
+			xs.target = rte_fmt1 ? ex_u.pc : ex_bv;
 		end
 		OP_BF: begin
-			ex_res   = bf_res;
-			ex_flags = bf_flags;
-		end
-		OP_BFSET: ex_res = ex_u.cond[0] ? {24'd0, bf_lonew} : {{3{ex_av[31]}}, ex_av[31:3]};
-		OP_CAS: begin
-			// compare memory (B) with Dc (latch); equal: store Du (A),
-			// else: Dc = memory and the memory value is written back
-			logic [32:0] d;
-			ex_flags = alu_flags;     // the uop runs OP_CAS through CMP below
-			ex_res   = ex_bv;
+			xs.res   = bf_res;
+			xs.flags = bf_flags;
 		end
 		default: ;
 	endcase
+end
 
-	// control transfers
-	case (ex_u.br)
-		BR_IMM:  begin ex_taken = 1'b1; ex_target = ex_u.target; end
-		BR_EA:   begin ex_taken = 1'b1; ex_target = ex_ea; end
-		BR_A:    begin ex_taken = 1'b1; ex_target = ex_av; end
-		BR_B:    begin ex_taken = 1'b1; ex_target = ex_bv; end
-		default: ;
-	endcase
+// EX outputs: the registered slow result in a slow op's second cycle
+always_comb begin
+	exo_t x;
+	x = ex_slow ? xs_q : xf;
+	ex_res    = x.res;
+	ex_flags  = x.flags;
+	ex_dkill  = x.dkill;
+	ex_taken  = x.taken;
+	ex_target = x.target;
+	ex_xvec   = x.xvec;
+	ex_sr_we  = x.sr_we;
+	ex_sr_new = x.sr_new;
 end
 
 // CAS: flags of (memory - Dc) and the equal decision
@@ -808,6 +884,8 @@ always_ff @(posedge clk) begin
 		mmusr_r <= 32'd0; urp_r  <= 32'd0; srp_r  <= 32'd0;
 		xi_pc   <= 32'd0; xi_addr <= 32'd0; xi_sr <= 16'd0; xi_vecw <= 16'd0; xi_ssw <= 16'd0;
 		md_go   <= 1'b0;
+		ex_ph   <= 1'b0;
+		xs_q    <= '0;
 		md_hiin <= 32'd0;
 		md_rem  <= 32'd0;
 		md_lol  <= 32'd0;
@@ -909,6 +987,11 @@ always_ff @(posedge clk) begin
 		end
 		if (!stall_ex) ex_v <= adv_dc2;
 		if (ex_md_start) md_go <= 1'b1;
+		if (ex_v && ex_slow && !ex_ph) begin
+			ex_ph <= 1'b1;
+			xs_q  <= xs;
+		end
+		if (adv_ex || kill_now) ex_ph <= 1'b0;
 
 		//------------------------------------------------------------------
 		// EX -> WB

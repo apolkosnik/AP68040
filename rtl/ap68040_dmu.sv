@@ -100,14 +100,11 @@ function automatic logic ttr_hit(input logic [31:0] t, input logic [31:0] a,
 	          (t[14] || (t[13] == s));
 endfunction
 
-always_comb begin
-	// attributes of the uop entering DC1
-end
-
-wire        tt0 = ttr_hit(dtt0, dm_va, dm_super);
-wire        tt1 = ttr_hit(dtt1, dm_va, dm_super);
-wire  [1:0] req_cm  = tt0 ? dtt0[6:5] : tt1 ? dtt1[6:5] : 2'b00;
-wire  [1:0] req_upa = tt0 ? dtt0[9:8] : tt1 ? dtt1[9:8] : 2'b00;
+// attributes of the access in DC1 (from the registered address)
+wire        tt0 = ttr_hit(dtt0, m1.a, m1.smode);
+wire        tt1 = ttr_hit(dtt1, m1.a, m1.smode);
+wire  [1:0] dc1_cm  = tt0 ? dtt0[6:5] : tt1 ? dtt1[6:5] : 2'b00;
+wire  [1:0] dc1_upa = tt0 ? dtt0[9:8] : tt1 ? dtt1[9:8] : 2'b00;
 
 //--------------------------------------------------------------------------
 // bus sequencer for one operand (load at DC2 or store at WB)
@@ -241,12 +238,14 @@ always_ff @(posedge clk) begin
 			m1.smode   <= dm_super;
 			m1.noalloc <= dm_noalloc;
 			m1.iack    <= dm_iack;
-			m1.cm      <= req_cm;
-			m1.upa     <= req_upa;
 		end
 		else if (adv_dc1) m1.v <= 1'b0;
 
-		if (adv_dc1) m2 <= m1;
+		if (adv_dc1) begin
+			m2     <= m1;
+			m2.cm  <= dc1_cm;
+			m2.upa <= dc1_upa;
+		end
 		else if (adv_dc2) m2.v <= 1'b0;
 
 		if (adv_dc2) begin

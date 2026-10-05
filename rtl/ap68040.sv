@@ -124,12 +124,13 @@ logic [31:0] dm_ldata, dm_faddr, dm_st_data;
 logic  [7:0] dm_fvec;
 logic [15:0] dm_fssw, dm_st_fssw;
 
-logic        uo_v, uo_rdy;
-uop_t        uo;
+logic  [1:0] uq_n;
+uop_t        uq0;
+logic        uo_rdy;
 
 ap68040_backend be (
 	.clk(clk), .nreset(nreset),
-	.in_v(uo_v), .in_u(uo), .in_rdy(uo_rdy),
+	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.ucond_v(ucond_v), .ucond(ucond),
@@ -168,20 +169,22 @@ ap68040_dmu dmu (
 // front end
 logic [15:0] win [8];
 logic  [7:0] win_flt;
-logic  [4:0] qcnt;
+pd_t         pd0;
+logic  [3:0] qcnt;
 logic [31:0] qpc;
-logic  [3:0] consume;
+logic  [2:0] consume;
 logic        d_redir_v;
 logic [31:0] d_redir_pc;
-logic        rec_v, rec_take;
-dinst_t      rec;
+logic  [1:0] rq_n;
+dinst_t      rq0, rq1;
+logic        rq_pop;
 
 ap68040_fetch fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.stop(1'b0), .smode(sr[13]),
-	.win(win), .win_flt(win_flt), .qcnt(qcnt), .qpc(qpc), .consume(consume),
+	.win(win), .win_flt(win_flt), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),
 	.q_odd(q_odd),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
@@ -191,18 +194,18 @@ assign b_wdata[1] = '0;
 
 ap68040_decode dec (
 	.clk(clk), .nreset(nreset), .flush(flush),
-	.win(win), .win_flt(win_flt), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
+	.win(win), .win_flt(win_flt), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
-	.rec_v(rec_v), .rec(rec), .rec_take(rec_take)
+	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop)
 );
 
 ap68040_useq useq (
 	.clk(clk), .nreset(nreset), .flush(flush),
-	.rec_v(rec_v), .rec(rec), .rec_take(rec_take),
+	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
 	.smode(sr[13]), .master(sr[12]),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
-	.uo_v(uo_v), .uo(uo), .uo_rdy(uo_rdy)
+	.uq_n(uq_n), .uq0(uq0), .uq_pop(uo_rdy && uq_n != 2'd0)
 );
 
 endmodule
