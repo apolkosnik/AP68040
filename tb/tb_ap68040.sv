@@ -202,6 +202,34 @@ always_ff @(posedge clk) if (rsti_n) begin
 end
 int rc [9];
 initial for (int i = 0; i < 9; i++) rc[i] = 0;
+// loads that missed the DC2 fast path: miss, older store to the line,
+// a same-set RAM write after the lookup, other (split, CI, ...)
+int lsl [5];
+initial for (int i = 0; i < 5; i++) lsl[i] = 0;
+always_ff @(posedge clk) if (rsti_n && dut.dmu.adv_dc1 && dut.dmu.m1.v && dut.dmu.m1.mem == 2'd1) begin
+	if (dut.dmu.m1_fast && !dut.dmu.m1_stale && !(dut.dmu.dw && dut.dmu.dw_set == dut.dmu.m1.a[9:4]) &&
+	    dut.dmu.e_st == 0) lsl[0]++;
+	else if (!dut.dmu.x_dc1.hit) lsl[1]++;
+	else if (dut.dmu.m1_stale || (dut.dmu.dw && dut.dmu.dw_set == dut.dmu.m1.a[9:4])) lsl[2]++;
+	else if (dut.dmu.e_st != 0) lsl[3]++;
+	else lsl[4]++;
+end
+// DMU engine: jobs started (DC2 slow path, WB store, maintenance, walk)
+// and the cycles it is busy; DC2 cycles blocked by an older store (hz)
+int ej [6];
+int ejk [16];   // DC2 jobs by {mem, hit, split}
+initial begin for (int i = 0; i < 6; i++) ej[i] = 0; for (int i = 0; i < 16; i++) ejk[i] = 0; end
+always_ff @(posedge clk) if (rsti_n) begin
+	if (dut.dmu.e_st == dut.dmu.E_S_START) begin
+		ej[0]++;
+		ejk[{dut.dmu.m2.r.mem, dut.dmu.m2.x.hit, dut.dmu.m2.split}]++;
+	end
+	if (dut.dmu.e_st == dut.dmu.E_W_START) ej[1]++;
+	if (dut.dmu.e_st == dut.dmu.E_M_START) ej[2]++;
+	if (dut.dmu.e_st == dut.dmu.E_TW_START) ej[3]++;
+	if (dut.dmu.e_st != dut.dmu.E_IDLE) ej[4]++;
+	if (dut.dmu.m2.r.v && dut.dmu.m2.fast && dut.dmu.hz) ej[5]++;
+end
 // BTB: followed, overruled at a branch's end, restarted (flag inside)
 int btc [3];
 initial for (int i = 0; i < 3; i++) btc[i] = 0;
@@ -250,6 +278,16 @@ task automatic prof_report();
 	         100 * pf[PF_DC2] / tot, 100 * pf[PF_DC1] / tot, 100 * pf[PF_AG] / tot,
 	         100 * pf[PF_FE] / tot, 100 * pf[PF_FQE] / tot, pf[PF_REDIR], pf[PF_DREDIR]);
 	$display("PROF BTB: followed %0d, overruled at the end %0d, restarted %0d", btc[0], btc[1], btc[2]);
+	$display("PROF loads at DC1: fast %0d, miss %0d, set written since lookup %0d, engine busy %0d, other %0d",
+	         lsl[0], lsl[1], lsl[2], lsl[3], lsl[4]);
+	for (int i = 0; i < 5; i++) lsl[i] = 0;
+	$display("PROF engine: DC2 jobs %0d, WB store jobs %0d, maintenance %0d, walks %0d, busy cycles %0d; fast loads held by an older store %0d cycles",
+	         ej[0], ej[1], ej[2], ej[3], ej[4], ej[5]);
+	for (int i = 0; i < 6; i++) ej[i] = 0;
+	for (int i = 0; i < 16; i++) begin
+		if (ejk[i] != 0) $display("PROF   DC2 jobs mem=%0d hit=%0d split=%0d: %0d", i >> 2, (i >> 1) & 1, i & 1, ejk[i]);
+		ejk[i] = 0;
+	end
 	for (int i = 0; i < 3; i++) btc[i] = 0;
 	$display("PROF WB redirects: mispredict cond=%0d imm=%0d ea=%0d A(rts)=%0d B=%0d other=%0d | serialize=%0d sr-write=%0d smc=%0d",
 	         rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8]);

@@ -312,6 +312,22 @@ logic [15:0]  dw_be;
 logic  [1:0]  dw_src;              // 0 dw_word on every long word, 1 bo_line, 2 pv_line
 logic [31:0]  dw_word;
 logic [127:0] dw_wdata;
+// the previous cycle's RAM write (it landed at the last edge)
+logic         dwq;
+logic  [5:0]  dwq_set;
+logic  [1:0]  dwq_way, dwq_src;
+logic [15:0]  dwq_be;
+logic [31:0]  dwq_word;
+always_ff @(posedge clk) begin
+	dwq <= dw; dwq_set <= dw_set; dwq_way <= dw_way; dwq_src <= dw_src;
+	dwq_be <= dw_be; dwq_word <= dw_word;
+end
+// bytes of a long word (on every long word of a line) merged into a line
+function automatic logic [127:0] mrg(input logic [127:0] l, input logic [15:0] be,
+                                     input logic [31:0] w);
+	for (int i = 0; i < 16; i++) if (be[i]) l[8*i +: 8] = w[8*(i % 4) +: 8];
+	mrg = l;
+endfunction
 
 genvar gw;
 generate
@@ -327,7 +343,22 @@ generate
 			.we(dw && dw_way == 2'(gw)), .waddr(dw_set), .wbe(dw_be), .wdata(dw_wdata),
 			.raddr(la_set_n), .oce(1'b1), .q(dq_rn[gw])
 		);
-		always_ff @(posedge clk) if (adv_dc1) dq_r[gw] <= dq_rn[gw];
+		// DC2's copy of the set: byte writes to it are merged in (the
+		// RAM output misses the writes landing at the last edge and this
+		// one), so a load after a store to its line stays on the fast path
+		always_ff @(posedge clk) begin
+			logic [127:0] l;
+			if (adv_dc1) begin
+				l = dq_rn[gw];
+				if (dwq && dwq_src == 2'd0 && dwq_set == m1.a[9:4] && dwq_way == 2'(gw))
+					l = mrg(l, dwq_be, dwq_word);
+				if (dw && dw_src == 2'd0 && dw_set == m1.a[9:4] && dw_way == 2'(gw))
+					l = mrg(l, dw_be, dw_word);
+				dq_r[gw] <= l;
+			end
+			else if (dw && dw_src == 2'd0 && dw_set == m2.r.a[9:4] && dw_way == 2'(gw))
+				dq_r[gw] <= mrg(dq_r[gw], dw_be, dw_word);
+		end
 	end
 endgenerate
 
@@ -437,7 +468,8 @@ wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
 // read the RAM makes the captured line stale: the engine reads it again
 logic m1_stale;
 
-wire fast_now = m2.r.v && m2.fast && !hz;
+// (a store that left WB is still being written this cycle: dw)
+wire fast_now = m2.r.v && m2.fast && !hz && !(dw && dw_set == m2.r.a[9:4]);
 wire [31:0] fast_data = take(dq_r[m2.x.way], m2.r.a[3:0], nbytes(m2.r.msz));
 
 // a store with its translation known needs nothing from DC2 unless it must
@@ -599,8 +631,17 @@ wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
 
-wire dc2_slow = m2.r.v && !fast_now && !(st_simple && !e_job) && !e_dc2_done && !e_job;
+// a fast load behind an older store to its line waits for it (merged into
+// its copy) instead of taking the engine
+wire fast_wait = m2.r.v && m2.fast && (hz || (dw && dw_set == m2.r.a[9:4]));
+wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job;
 wire wb_slow  = wb_st && !wb_fast && !e_wst_done;
+
+// store ready: the fast store answers in its own WB cycle (the engine's
+// stores through the registered pulse)
+logic st_rdy_r, st_fault_r;
+assign st_rdy   = st_rdy_r || (wb_fast && !sn_frz);
+assign st_fault = st_rdy_r && st_fault_r;
 
 //--------------------------------------------------------------------------
 // BIU request from the engine's bus step
@@ -629,7 +670,7 @@ assign dm_hold1 = sn_frz || steal || steal_q ||
                    e_st != E_W_PART && e_st != E_W_DONE);
 
 always_ff @(posedge clk) begin
-	st_rdy    <= 1'b0;
+	st_rdy_r    <= 1'b0;
 	mt_done   <= 1'b0;
 	iw_done   <= 1'b0;
 	atc_wr    <= 1'b0;
@@ -663,7 +704,7 @@ always_ff @(posedge clk) begin
 		dw_set <= '0; dw_way <= '0; dw_be <= '0; dw_src <= '0; dw_word <= '0;
 		ic_inv <= 1'b0; ic_inv_scope <= '0; ic_inv_pa <= '0;
 		rrc <= 2'd0;
-		st_fault <= 1'b0; st_fssw <= '0; st_faddr <= '0;
+		st_fault_r <= 1'b0; st_fssw <= '0; st_faddr <= '0;
 		mt_mmusr <= '0;
 		atc_wla <= '0; atc_wfc2 <= 1'b0; atc_went <= '0; atc_fng <= 1'b0;
 		iatc_flush_ng <= 1'b0; iatc_flush_la <= '0; iatc_flush_fc2 <= 1'b0;
@@ -705,11 +746,11 @@ always_ff @(posedge clk) begin
 			m1.smode   <= dm_super;
 			m1.noalloc <= dm_noalloc;
 			m1.iack    <= dm_iack;
-			m1_stale   <= (dw && dw_set == dm_va[9:4]) || (e_st != E_IDLE);
+			m1_stale   <= (dw && dw_src != 2'd0 && dw_set == dm_va[9:4]) || (e_st != E_IDLE);
 		end
 		else begin
 			if (adv_dc1) m1.v <= 1'b0;
-			if ((dw && dw_set == m1.a[9:4]) || (e_st != E_IDLE)) m1_stale <= 1'b1;
+			if ((dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) || (e_st != E_IDLE)) m1_stale <= 1'b1;
 		end
 
 		if (adv_dc1) begin
@@ -717,12 +758,12 @@ always_ff @(posedge clk) begin
 			m2.x     <= x_dc1;
 			m2.split <= m1_split;
 			m2.x1    <= '0;
-			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_set == m1.a[9:4]) &&
+			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
 			            (e_st == E_IDLE);
 		end
 		else begin
 			if (adv_dc2) m2.r.v <= 1'b0;
-			if ((dw && dw_set == m2.r.a[9:4]) || (e_st != E_IDLE)) m2.fast <= 1'b0;
+			if ((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || (e_st != E_IDLE)) m2.fast <= 1'b0;
 		end
 
 		if (adv_dc2) begin
@@ -747,9 +788,10 @@ always_ff @(posedge clk) begin
 			dw_src  <= 2'd0;
 			dw_word <= wbf_word;
 			vp_set = m4.x.pa[9:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
-			st_rdy  <= 1'b1;
-			st_fault <= 1'b0;
-			e_wst_done <= 1'b1;
+			// answered this cycle: kept only if WB does not move
+			st_rdy_r   <= !adv_wb;
+			st_fault_r <= 1'b0;
+			e_wst_done <= !adv_wb;
 		end
 
 		//--------------------------------------------------------------
@@ -1044,8 +1086,8 @@ always_ff @(posedge clk) begin
 		end
 		E_W_DONE: begin
 			if (bo_err) begin
-				st_rdy     <= 1'b1;
-				st_fault   <= 1'b1;
+				st_rdy_r     <= 1'b1;
+				st_fault_r   <= 1'b1;
 				st_fssw    <= mk_ssw(1'b0, m4.r.lock, 1'b0, m4.r.msz, m4.r.fc);
 				st_faddr   <= m4.r.a;
 				e_wst_done <= 1'b1;
@@ -1060,8 +1102,8 @@ always_ff @(posedge clk) begin
 				e_st   <= E_W_PART;
 			end
 			else begin
-				st_rdy     <= 1'b1;
-				st_fault   <= 1'b0;
+				st_rdy_r     <= 1'b1;
+				st_fault_r   <= 1'b0;
 				e_wst_done <= 1'b1;
 				e_st       <= E_IDLE;
 			end
