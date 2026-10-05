@@ -1846,6 +1846,7 @@ always @(posedge clk) begin
 
 			F_ROUND: begin : f_round
 				reg [64:0] mr;
+				reg [63:0] rmask, rinc;      // the precision's kept bits and its ulp
 				reg        inx, up, ovf, unf, tomax;
 				reg [1:0]  pr;
 				reg signed [17:0] er, emin, emax;
@@ -1857,22 +1858,25 @@ always @(posedge clk) begin
 							up = round_up(a_m[40], a_m[39],
 							              (a_m[38:0] != 0) || (grs != 0), a_s);
 							inx = (a_m[39:0] != 0) || (grs != 0);
-							mr = {1'b0, a_m & 64'hFFFF_FF00_0000_0000} +
-							     (up ? 65'h100_0000_0000 : 65'd0);
+							rmask = 64'hFFFF_FF00_0000_0000;
+							rinc  = 64'h0000_0100_0000_0000;
 						end
 						2'd2: begin
 							up = round_up(a_m[11], a_m[10],
 							              (a_m[9:0] != 0) || (grs != 0), a_s);
 							inx = (a_m[10:0] != 0) || (grs != 0);
-							mr = {1'b0, a_m & 64'hFFFF_FFFF_FFFF_F800} +
-							     (up ? 65'h800 : 65'd0);
+							rmask = 64'hFFFF_FFFF_FFFF_F800;
+							rinc  = 64'h0000_0000_0000_0800;
 						end
 						default: begin
 							up = round_up(a_m[0], grs[2], grs[1:0] != 0, a_s);
 							inx = (grs != 0);
-							mr = {1'b0, a_m} + (up ? 65'd1 : 65'd0);
+							rmask = 64'hFFFF_FFFF_FFFF_FFFF;
+							rinc  = 64'h0000_0000_0000_0001;
 						end
 					endcase
+					// one incrementer for the three precisions
+					mr = {1'b0, a_m & rmask} + {1'b0, up ? rinc : 64'd0};
 					er = e_w + (mr[64] ? 18'sd1 : 18'sd0);
 					if (mr[64]) mr = {2'b01, 63'd0};
 					// Range control: the rounding precision narrows the
