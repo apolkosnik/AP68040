@@ -67,6 +67,11 @@ module ap68040_backend
 	output logic        dm_super,
 	output logic        dm_older,       // uops older than DC2 are in EX or WB
 	input  logic        sn_ihit,        // a snoop dropped valid instruction-cache data
+	input  logic        tw_busy,        // the DMU runs a table search
+	output logic        pst_ev,         // PST: an instruction ends this cycle...
+	output logic  [3:0] pst_code,       // ...with this encoding (MC68040UM table 5-6)
+	output logic  [3:0] pst_st,         // the present status otherwise
+	output logic        irq_pending,    // IPEND: a request beats the mask
 	output logic        bht_we,         // Bcc history training (decode's table)
 	output logic  [7:0] bht_wa,
 	output logic  [1:0] bht_wd,
@@ -353,6 +358,8 @@ assign dm_locke   = ag_u.mlocke;
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
 assign dm_older   = ex_v || wb_v;
+
+
 
 // Bcc history: the counter counts disagreement with the static rule
 // (saturating 0..3); trained as the branch leaves EX
@@ -1616,5 +1623,25 @@ assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
 assign dbg_pc     = wb_u.pc;
 assign ucond      = 1'b0;
+
+// processor status (MC68040UM 5.9.1, table 5-6): the end of an instruction
+// (branch taken / not taken / other) for one bus clock, else the present
+// status.  An exception's stacking (from its entry to the routine's last
+// uop) ends as a virtual JMP: supervisor, branch taken.
+logic xstk;
+always_ff @(posedge clk) begin
+	if (!nreset) xstk <= 1'b0;
+	else if (x_go) xstk <= 1'b1;
+	else if (adv_wb && wb_u.last) xstk <= 1'b0;
+end
+assign pst_ev   = adv_wb && wb_u.last && !wb_is_exc;
+assign irq_pending = irq_pend;
+assign pst_code = xstk ? 4'hB :
+                  {sr_r[13], 1'b0,
+                   (wb_cof || wb_redir) ? 2'b11 :
+                   ((wb_u.op == OP_BCC || wb_u.op == OP_DBCC) ? 2'b10 : 2'b01)};
+assign pst_st   = halted ? 4'h5 : stopped ? 4'hD : xstk ? 4'hF :
+                  (wb_v && wb_u.op == OP_RTE) ? 4'hE :
+                  tw_busy ? {sr_r[13], 3'b100} : {sr_r[13], 3'b000};
 
 endmodule

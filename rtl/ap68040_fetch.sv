@@ -61,6 +61,8 @@ module ap68040_fetch
 	input  logic [31:0] tc,
 	input  logic [31:0] itt0,
 	input  logic [31:0] itt1,
+	input  logic        cdis,         // CDIS: the cache is disabled (contents kept)
+	input  logic        mdis,         // MDIS: no page translation
 
 	// decoder side
 	output logic [15:0] win [8],
@@ -119,9 +121,9 @@ module ap68040_fetch
 
 localparam int QN = 12;          // 16 measured no faster
 
-wire tc_e  = tc[15];
+wire tc_e  = tc[15] && !mdis;
 wire tc_p  = tc[14];
-wire ic_en = cacr[15];
+wire ic_en = cacr[15] && !cdis;
 
 function automatic logic ttr_hit(input logic [31:0] t, input logic [31:0] a,
                                  input logic s);

@@ -108,6 +108,9 @@ module ap68040_dmu
 	input  logic [31:0] dtt1,
 	input  logic [31:0] itt0,
 	input  logic [31:0] itt1,
+	input  logic        cdis,           // CDIS: caches disabled (contents kept)
+	input  logic        mdis,           // MDIS: no page translation (TTRs still apply)
+	output logic        tw_busy,        // a table search is running (PST)
 
 	// instruction side: table walks for the I-ATC, ATC/cache maintenance
 	input  logic        iw_req,
@@ -157,9 +160,9 @@ module ap68040_dmu
 
 localparam logic [2:0] MT_CINV = 3'd1, MT_CPUSH = 3'd2, MT_PFLUSH = 3'd3, MT_PTEST = 3'd4;
 
-wire tc_e  = tc[15];
+wire tc_e  = tc[15] && !mdis;
 wire tc_p  = tc[14];
-wire dc_en = cacr[31];
+wire dc_en = cacr[31] && !cdis;
 
 //--------------------------------------------------------------------------
 // stage records
@@ -1736,6 +1739,10 @@ end
 // snoop: the line found, valid with sn_look (the RAM still reads the
 // snooped set in the first H cycle)
 assign sn_line = (sn_src == 2'd0) ? dq_rn[sn_way] : (sn_src == 2'd1) ? pv_line : bo_line;
+
+assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) ||
+                 (e_st == E_TW_DLK) || (e_st == E_TW_DBUS) || (e_st == E_TW_EVAL) ||
+                 (e_st == E_TW_UPD) || (e_st == E_TW_UPD_W) || (e_st == E_TW_DONE);
 
 // DC2 answer
 // once the engine has taken the DC2 uop, only its completion releases it

@@ -35,6 +35,7 @@
 //   $F294 long  copied to $F2A8 when written (a read of $F2A8, another   //
 //               line, shows whether the write reached the bus first)      //
 //   $F2B0 long  (read) counts its own bus reads into $F2B4              //
+//   $F2C0 word  bit 0 asserts CDIS, bit 1 MDIS                            //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -73,6 +74,11 @@ logic  [2:0] ipl_lvl;
 logic [31:0] dbg_pc;
 logic        dbg_retire, dbg_halted;
 
+// pins the program drives through $F2C0, and the status pins
+logic  [1:0] pins_r;
+logic        ipend_n;
+logic  [3:0] pst;
+
 // the bus: the 68040 or the alternate master drives it
 logic        mi_n, cpu_ta_n, cpu_ta_oe, slv_ta_n;
 logic        am_drive, am_rw_n, am_ts_n, am_bb_n, am_d_oe, am_bg_n;
@@ -95,6 +101,7 @@ ap68040 dut (
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
 	.tt_i(bus_tt), .sc(am_drive ? am_sc : 2'd0),
 	.mi_n(mi_n), .ta_n_o(cpu_ta_n), .ta_oe(cpu_ta_oe),
+	.cdis_n(!pins_r[0]), .mdis_n(!pins_r[1]), .ipend_n(ipend_n), .pst(pst),
 	.d_i(am_d_oe ? am_d : d_mem), .d_o(d_o), .d_oe(d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
@@ -341,6 +348,21 @@ m68040_alt_master am (
 assign am_trig = bclk_en && !ts_n && a_oe && !am_drive && rw_n && siz == 2'b11 &&
                  a_o[31:4] == am_trig_a[31:4];
 
+// PST never shows a reserved encoding (6 is the 68040V's, 7 reserved),
+// and shows "stopped" (D) once STOP has held for a few clocks
+int stop_clks;
+always_ff @(posedge clk) begin
+	stop_clks <= (rsti_n && dut.be.stopped) ? stop_clks + 1 : 0;
+	if (rsti_n && (pst == 4'h6 || pst == 4'h7)) begin
+		$display("FAIL: PST shows the reserved encoding %h", pst);
+		errors <= errors + 1;
+	end
+	if (stop_clks > 8 && pst != 4'hD) begin
+		$display("FAIL: PST is %h during STOP", pst);
+		errors <= errors + 1;
+	end
+end
+
 // +amtrace: every bus transfer beat, by either master
 logic amtrace;
 initial amtrace = $test$plusargs("amtrace");
@@ -401,6 +423,7 @@ always_ff @(posedge clk) begin
 		irq_exc_armed <= '0;
 		fetch_stall <= '0;
 		am_go       <= 1'b0;
+		pins_r      <= 2'b00;
 		am_n        <= '0;
 		am_trig_en  <= 1'b0;
 		am_trig_a   <= '0;
@@ -476,6 +499,7 @@ always_ff @(posedge clk) begin
 				16'hF14C: begin ipl_lvl <= w[2:0]; ipl_pulse <= w[15:8]; end
 				16'hF150: begin ipl_lvl <= w[2:0]; ipl_next <= w[6:4]; ipl_step <= w[15:8]; end
 				16'hF154: begin fberr_armed <= (w != 16'd0); fberr_addr <= w; end
+				16'hF2C0: pins_r <= w[1:0];
 				16'hF280: begin
 					// the command block was written to memory by the slave
 					for (int k = 0; k < 4; k++) begin

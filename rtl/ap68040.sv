@@ -58,6 +58,10 @@ module ap68040
 	output logic        bb_n_o,
 	output logic        bb_oe,
 	output logic        rsto_n,
+	input  logic        cdis_n,       // CDIS: disable the caches (contents kept)
+	input  logic        mdis_n,       // MDIS: disable page translation
+	output logic        ipend_n,      // IPEND
+	output logic  [3:0] pst,          // PST3-PST0 (MC68040UM table 5-6)
 
 	// debug / test
 	output logic [31:0] dbg_pc,
@@ -69,6 +73,42 @@ module ap68040
 logic [1:0] rst_q;
 always_ff @(posedge clk) rst_q <= {rst_q[0], rsti_n};
 wire nreset = rst_q[1];
+
+// CDIS and MDIS act at the next internal boundary: two bus-clock samples
+// (the multiplexed bus mode CDIS selects at reset is not provided)
+logic [1:0] cdis_s, mdis_s;
+always_ff @(posedge clk)
+	if (bclk_en) begin
+		cdis_s <= {cdis_s[0], !cdis_n};
+		mdis_s <= {mdis_s[0], !mdis_n};
+	end
+wire cdis = cdis_s[1];
+wire mdis = mdis_s[1];
+
+// IPEND and PST change on bus clock edges.  PST shows the end of each
+// instruction for one bus clock (the last one when several end within
+// it), else the present status.
+logic        irq_pending, pst_ev, pst_b;
+logic  [3:0] pst_code, pst_st, pst_bc;
+always_ff @(posedge clk) begin
+	if (!nreset) begin
+		ipend_n <= 1'b1;
+		pst     <= 4'h8;
+		pst_b   <= 1'b0;
+		pst_bc  <= 4'h8;
+	end
+	else begin
+		if (pst_ev) begin
+			pst_b  <= 1'b1;
+			pst_bc <= pst_code;
+		end
+		if (bclk_en) begin
+			ipend_n <= !irq_pending;
+			pst     <= pst_ev ? pst_code : pst_b ? pst_bc : pst_st;
+			pst_b   <= 1'b0;
+		end
+	end
+end
 
 // interrupt level synchronizer (two bus-clock samples)
 logic [2:0] ipl_s1, ipl_s2;
@@ -166,7 +206,7 @@ logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
 logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
-logic        bht_we;
+logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic  [1:0] bht_wd;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
@@ -188,6 +228,8 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
 	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd), .sn_ihit(sn_ihit),
+	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
+	.irq_pending(irq_pending),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
@@ -220,6 +262,7 @@ ap68040_dmu dmu (
 	.mt_done(mt_done), .mt_mmusr(mt_mmusr),
 	.cacr(cacr), .tc(tc), .urp(urp), .srp(srp),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1),
+	.cdis(cdis), .mdis(mdis), .tw_busy(tw_busy),
 	.iw_req(iw_req), .iw_va(iw_va), .iw_fc2(iw_fc2), .iw_done(iw_done), .iw_ent(),
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
@@ -271,7 +314,7 @@ ap68040_fetch fetch (
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.stop(1'b0), .smode(sr[13]),
-	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1),
+	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1), .cdis(cdis), .mdis(mdis),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
 	.pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),

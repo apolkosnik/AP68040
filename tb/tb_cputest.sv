@@ -69,6 +69,7 @@ ap68040 dut (
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(a_o), .ts_n_i(1'b1), .rw_n_i(1'b1), .siz_i(2'd0), .tt_i(2'd0), .sc(2'd0),
 	.mi_n(mi_n), .ta_n_o(cpu_ta_n), .ta_oe(cpu_ta_oe),
+	.cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(), .pst(),
 	.d_i(d_i), .d_o(d_o), .d_oe(d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
