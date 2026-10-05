@@ -240,7 +240,7 @@ endfunction
 // storage
 //--------------------------------------------------------------------------
 logic [3:0]  lv  [64];             // line valid, per set and way
-logic [3:0]  ld  [64][4];          // dirty long words [set][way]
+logic        ld  [64][4];          // dirty [set][way] (the push writes the whole line)
 logic [1:0]  rrc;                  // replacement counter
 
 // lookup ports: DC1, or the engine while it holds DC1
@@ -463,7 +463,7 @@ logic [21:0] f_tag;
 logic        pv_v;                // push buffer holds a dirty line
 logic [127:0] pv_line;
 logic [27:0] pv_lpa;              // its line address
-logic  [3:0] pv_dirty;
+logic        pv_dirty;
 logic  [1:0] pv_tln;
 logic [127:0] mv_line;            // MOVE16 line buffer
 
@@ -603,7 +603,7 @@ always_ff @(posedge clk) begin
 		bo_avec <= 1'b0; bo_tci <= 1'b0; bo_left <= '0; bo_pn <= '0; bo_pa <= '0;
 		steal <= 1'b0; st_la <= '0; st_fc2 <= 1'b0; st_set <= '0;
 		f_set <= '0; f_way <= '0; f_tag <= '0;
-		pv_v <= 1'b0; pv_line <= '0; pv_lpa <= '0; pv_dirty <= '0; pv_tln <= '0;
+		pv_v <= 1'b0; pv_line <= '0; pv_lpa <= '0; pv_dirty <= 1'b0; pv_tln <= '0;
 		mv_line <= '0;
 		ms_i <= '0;
 		tw_lvl <= TW_ROOT; tw_va <= '0; tw_s <= 1'b0; tw_wr <= 1'b0; tw_pt <= 1'b0;
@@ -624,7 +624,7 @@ always_ff @(posedge clk) begin
 		m1_stale <= 1'b0;
 		for (int i = 0; i < 64; i++) begin
 			lv[i] <= 4'd0;
-			for (int j = 0; j < 4; j++) ld[i][j] <= 4'd0;
+			for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
 		end
 	end
 	else begin
@@ -682,7 +682,7 @@ always_ff @(posedge clk) begin
 			dw_way  <= m4.x.way;
 			dw_be   <= wbf_be;
 			dw_data <= wbf_line;
-			ld[m4.x.pa[9:4]][m4.x.way] <= ld[m4.x.pa[9:4]][m4.x.way] | dmask(wbf_be);
+			ld[m4.x.pa[9:4]][m4.x.way] <= 1'b1;
 			st_rdy  <= 1'b1;
 			st_fault <= 1'b0;
 			e_wst_done <= 1'b1;
@@ -795,7 +795,7 @@ always_ff @(posedge clk) begin
 				// MOVE16 destination: a write hit invalidates the line
 				if (e_x.hit) begin
 					lv[e_va[9:4]][e_x.way] <= 1'b0;
-					ld[e_va[9:4]][e_x.way] <= 4'd0;
+					ld[e_va[9:4]][e_x.way] <= 1'b0;
 					e_x.hit <= 1'b0;
 				end
 				e_st <= E_S_NEXT;
@@ -941,7 +941,7 @@ always_ff @(posedge clk) begin
 				dw_be   <= be;
 				dw_data <= l;
 				if (e_x.cm == 2'b01)
-					ld[e_va[9:4]][e_x.way] <= ld[e_va[9:4]][e_x.way] | dmask(be);
+					if (be != 16'd0) ld[e_va[9:4]][e_x.way] <= 1'b1;
 			end
 			if (upd && e_x.cm == 2'b01) begin
 				e_st <= E_W_DONE;            // copyback: no bus write
@@ -1020,7 +1020,7 @@ always_ff @(posedge clk) begin
 					else if (mt_op == MT_CINV && mt_scope == 2'd3) begin
 						for (int i = 0; i < 64; i++) begin
 							lv[i] <= 4'd0;
-							for (int j = 0; j < 4; j++) ld[i][j] <= 4'd0;
+							for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
 						end
 						e_st <= E_M_IC;
 					end
@@ -1074,7 +1074,7 @@ always_ff @(posedge clk) begin
 			m = lv[s][w] && ((mt_scope == 2'd3) ||
 			                 (mt_scope == 2'd1 && tq_b[w] == mt_addr[31:10]) ||
 			                 (mt_scope == 2'd2 && tq_b[w][21:2] == mt_addr[31:12]));
-			if (m && mt_op == MT_CPUSH && ld[s][w] != 4'd0) begin
+			if (m && mt_op == MT_CPUSH && ld[s][w]) begin
 				// push (it is invalidated with the push)
 				f_set  <= s;
 				f_way  <= w;
@@ -1084,7 +1084,7 @@ always_ff @(posedge clk) begin
 			else begin
 				if (m) begin
 					lv[s][w] <= 1'b0;
-					ld[s][w] <= 4'd0;
+					ld[s][w] <= 1'b0;
 				end
 				if ((mt_scope == 2'd1 && w == 2'd3) || ms_i == 8'hFF) e_st <= E_M_IC;
 				else begin
@@ -1130,7 +1130,7 @@ always_ff @(posedge clk) begin
 		end
 		E_FILLW: e_st <= E_FILL_W;
 		E_FILL_W: begin
-			if (lv[f_set][f_way] && ld[f_set][f_way] != 4'd0) begin
+			if (lv[f_set][f_way] && ld[f_set][f_way]) begin
 				pv_v     <= 1'b1;
 				pv_line  <= dq_rn[f_way];
 				pv_lpa   <= {tq_b[f_way], f_set};
@@ -1138,7 +1138,7 @@ always_ff @(posedge clk) begin
 				pv_tln   <= f_way;
 			end
 			lv[f_set][f_way] <= 1'b0;
-			ld[f_set][f_way] <= 4'd0;
+			ld[f_set][f_way] <= 1'b0;
 			bo.line <= 1'b1; bo.rd <= 1'b1; bo.tt <= TT_NORMAL;
 			bo.tm <= m2.r.smode ? TM_SDATA : TM_UDATA;
 			bo.upa <= e_x.upa; bo.ci <= 1'b0; bo.lock <= 1'b0; bo.locke <= 1'b0;
@@ -1160,7 +1160,7 @@ always_ff @(posedge clk) begin
 				tway_b  <= f_way;
 				twd_b   <= f_tag;
 				lv[f_set][f_way] <= 1'b1;
-				ld[f_set][f_way] <= 4'd0;
+				ld[f_set][f_way] <= 1'b0;
 				rrc <= rrc + 2'd1;
 			end
 			else if (pv_v) begin
@@ -1205,7 +1205,7 @@ always_ff @(posedge clk) begin
 		end
 		E_PUSHVW: e_st <= E_PUSHV_W;
 		E_PUSHV_W: begin
-			if (lv[f_set][f_way] && ld[f_set][f_way] != 4'd0) begin
+			if (lv[f_set][f_way] && ld[f_set][f_way]) begin
 				pv_v     <= 1'b1;
 				pv_line  <= dq_rn[f_way];
 				pv_lpa   <= {tq_b[f_way], f_set};
@@ -1215,7 +1215,7 @@ always_ff @(posedge clk) begin
 			end
 			else e_st <= e_sret;
 			lv[f_set][f_way] <= 1'b0;
-			ld[f_set][f_way] <= 4'd0;
+			ld[f_set][f_way] <= 1'b0;
 		end
 		E_PUSHV_B: begin
 			bo.line <= 1'b1; bo.rd <= 1'b0; bo.tt <= TT_NORMAL; bo.tm <= TM_PUSH;
@@ -1401,7 +1401,7 @@ always_ff @(posedge clk) begin
 			for (int i = 0; i < 4; i++)
 				if (lv[tw_da[9:4]][i] && tq_b[i] == tw_da[31:10]) begin
 					lv[tw_da[9:4]][i] <= 1'b0;
-					ld[tw_da[9:4]][i] <= 4'd0;
+					ld[tw_da[9:4]][i] <= 1'b0;
 				end
 			e_wret <= e_ret;
 			e_ret  <= E_TW_UPD_W;

@@ -165,8 +165,17 @@ logic [31:0] dc1_upd, dc1_upd2, dc2_upd, dc2_upd2, ex_upd, ex_upd2;
 //--------------------------------------------------------------------------
 // register files
 //--------------------------------------------------------------------------
-logic [31:0] rf_f [32];       // front: newest values
-logic [31:0] rf_b [32];       // back: architectural
+// Register files (ap68040_rf, MLAB): the front file holds the newest
+// values (AG address updates, EX results), the back file the architectural
+// ones (WB).  fv[r] says the front copy of r is current; a redirect or an
+// exception clears fv, so every register reads the back file again -- no
+// copy.  Five read ports at AG: base, index, upd2 register, A, B.
+logic [31:0] fv;
+logic  [2:0] fwe, bwe;
+logic  [4:0] fwa [3], bwa [3];
+logic [31:0] fwd [3], bwd [3];
+logic  [4:0] rra [5];
+logic [31:0] frd [5], brd [5], rrd [5];
 logic  [4:0] ccr_f, ccr_b;
 
 // special registers (architectural, written at WB)
@@ -178,6 +187,8 @@ logic [31:0] tc_r, itt0_r, itt1_r, dtt0_r, dtt1_r, mmusr_r, urp_r, srp_r;
 // exception information for the exception microroutine
 logic [31:0] xi_pc, xi_addr;
 logic [15:0] xi_sr, xi_vecw, xi_ssw;
+logic [31:0] xi_vaddr, xi_ea, xi_w3a, xi_w3d;
+logic  [1:0] xw_ph;           // exception entry: back-file writes of T5-T13
 
 assign sr   = {sr_r[15:5], ccr_b};
 assign dtt0 = dtt0_r;
@@ -236,14 +247,23 @@ wire ag_interlock = ag_v && (
 
 assign ag_hold = ag_interlock;
 
-wire [31:0] ag_base = ag_u.base_v ? rf_f[ag_u.base] : 32'd0;
-wire [31:0] ag_ix_r = rf_f[ag_u.idx];
+ap68040_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
+ap68040_rf #(.NR(5)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
+assign rra[0] = ag_u.base;
+assign rra[1] = ag_u.idx;
+assign rra[2] = ag_u.upd2_reg;
+assign rra[3] = ag_u.a_reg;
+assign rra[4] = ag_u.b_reg;
+always_comb for (int i = 0; i < 5; i++) rrd[i] = fv[rra[i]] ? frd[i] : brd[i];
+
+wire [31:0] ag_base = ag_u.base_v ? rrd[0] : 32'd0;
+wire [31:0] ag_ix_r = rrd[1];
 wire [31:0] ag_ix   = ag_u.idx_v ? ((ag_u.idx_l ? ag_ix_r : {{16{ag_ix_r[15]}}, ag_ix_r[15:0]})
                                     << ag_u.scale) : 32'd0;
 wire [31:0] ag_ea   = ag_base + ag_ix + ag_u.disp;
 wire [31:0] ag_pinc = ag_base + {{24{ag_u.upd_amt[7]}}, ag_u.upd_amt};
 wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_ea;
-wire [31:0] ag_u2v  = rf_f[ag_u.upd2_reg] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
+wire [31:0] ag_u2v  = rrd[2] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
 // bit field memory transfers sized by the field (see ucode.py _bf_mem_load)
 wire        ag_bfh    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hE);
 wire        ag_bft    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hD);
@@ -264,18 +284,19 @@ logic  [4:0] exw_reg;
 logic [31:0] exw_val;
 
 function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
+                                     input logic [31:0] rv,
                                      input logic [31:0] imm, input logic sxw);
 	logic [31:0] v;
 	case (src)
-		OS_REG:  v = (exw_v && exw_reg == r) ? exw_val : rf_f[r];
+		OS_REG:  v = (exw_v && exw_reg == r) ? exw_val : rv;
 		OS_IMM:  v = imm;
 		default: v = 32'd0;
 	endcase
 	opnd = v;
 endfunction
 
-wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm_b, 1'b0);
+wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
+wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
 
 // memory request to the DMU, issued as the uop leaves AG
 logic s_bit;
@@ -920,6 +941,44 @@ logic        rt_armed;
 logic [31:0] rt_pc;
 wire x_go        = (adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_irq;
 
+// register file write ports.  Front: the AG address updates and the EX
+// result.  Back: the WB commit (a result beats an address update), the
+// address update of a trap after its instruction, and at exception entry
+// the routine's operands (T5-T13, three per cycle).
+always_comb begin
+	logic wcom, wpost;
+	fwe[0] = adv_ag && ag_u.upd_v;  fwa[0] = ag_u.upd_reg;  fwd[0] = ag_updv;
+	fwe[1] = adv_ag && ag_u.upd2_v; fwa[1] = ag_u.upd2_reg; fwd[1] = ag_u2v;
+	fwe[2] = exw_v;                 fwa[2] = exw_reg;       fwd[2] = exw_val;
+	wcom  = wb_commit;
+	wpost = adv_wb && wb_is_exc && wb_post_trap;
+	bwe[0] = (wcom || wpost) && wb_u.upd2_v; bwa[0] = wb_u.upd2_reg; bwd[0] = wb_upd2_val;
+	bwe[1] = (wcom || wpost) && wb_u.upd_v;  bwa[1] = wb_u.upd_reg;  bwd[1] = wb_upd_val;
+	bwe[2] = wcom && wb_dwe;                 bwa[2] = wb_u.d_reg;    bwd[2] = wb_res;
+	case (xw_ph)
+		2'd1: begin
+			bwe = 3'b111;
+			bwa[0] = R_T0 + 5'd8;  bwd[0] = xi_vaddr;
+			bwa[1] = R_T0 + 5'd9;  bwd[1] = xi_pc;
+			bwa[2] = R_T0 + 5'd10; bwd[2] = {16'd0, xi_sr};
+		end
+		2'd2: begin
+			bwe = 3'b111;
+			bwa[0] = R_T0 + 5'd11; bwd[0] = xi_addr;
+			bwa[1] = R_T0 + 5'd12; bwd[1] = {16'd0, xi_vecw};
+			bwa[2] = R_T0 + 5'd13; bwd[2] = {16'd0, xi_ssw};
+		end
+		2'd3: begin
+			bwe = 3'b111;
+			bwa[0] = R_T0 + 5'd5;  bwd[0] = xi_ea;
+			bwa[1] = R_T0 + 5'd6;  bwd[1] = xi_w3a;
+			bwa[2] = R_T0 + 5'd7;  bwd[2] = xi_w3d;
+		end
+		default: ;
+	endcase
+end
+
+
 // WB holds: store not accepted yet; RESET until RSTO is done
 wire wb_reset    = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd1);
 wire wb_mt       = (wb_u.op == OP_MISC) && (wb_u.cond >= 4'd3) && (wb_u.cond <= 4'd5);
@@ -1024,7 +1083,8 @@ always_ff @(posedge clk) begin
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
-		for (int i = 0; i < 32; i++) begin rf_f[i] <= 32'd0; rf_b[i] <= 32'd0; end
+		fv <= 32'd0;
+		xw_ph <= 2'd0;
 		ccr_f   <= 5'd0;
 		ccr_b   <= 5'd0;
 		sr_r    <= 16'h2700;
@@ -1114,8 +1174,6 @@ always_ff @(posedge clk) begin
 			dc1_ea  <= ag_u.ag ? ag_maddr : 32'd0;
 			dc1_upd <= ag_updv;
 			dc1_upd2 <= ag_u2v;
-			if (ag_u.upd_v)  rf_f[ag_u.upd_reg]  <= ag_updv;
-			if (ag_u.upd2_v) rf_f[ag_u.upd2_reg] <= ag_u2v;
 		end
 		if (!stall_dc1) dc1_v <= adv_ag;
 		else begin
@@ -1173,7 +1231,6 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		// EX -> WB
 		//------------------------------------------------------------------
-		if (exw_v) rf_f[exw_reg] <= exw_val;
 		if (adv_ex) begin
 			wb_u        <= ex_u;
 			wb_res      <= exw_val;
@@ -1289,10 +1346,7 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (wb_commit) begin
 			dbg_retire <= wb_u.last;
-			// architectural commit (a result beats an address update)
-			if (wb_u.upd2_v)   rf_b[wb_u.upd2_reg] <= wb_upd2_val;
-			if (wb_u.upd_v)    rf_b[wb_u.upd_reg] <= wb_upd_val;
-			if (wb_dwe)        rf_b[wb_u.d_reg]   <= wb_res;
+			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
 				case (wb_u.imm_b[7:0])
@@ -1323,11 +1377,7 @@ always_ff @(posedge clk) begin
 				flush    <= 1'b1;
 				redir_v  <= 1'b1;
 				redir_pc <= wb_redir_pc;
-				for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
-				// this uop's own writes go to both files
-				if (wb_u.upd2_v) rf_f[wb_u.upd2_reg] <= wb_upd2_val;
-				if (wb_u.upd_v)  rf_f[wb_u.upd_reg] <= wb_upd_val;
-				if (wb_dwe)      rf_f[wb_u.d_reg]   <= wb_res;
+				// the front file restarts from the back one (fv cleared below)
 				ccr_f <= wb_sr_we ? wb_sr_new[4:0] : wb_ccr;
 			end
 			if (wb_bound) trace_defer <= 1'b0;
@@ -1345,7 +1395,6 @@ always_ff @(posedge clk) begin
 			flush    <= 1'b1;
 			redir_v  <= 1'b1;
 			redir_pc <= wb_u.pc;
-			for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
 			ccr_f    <= ccr_b;
 			rt_armed <= 1'b1;
 			rt_pc    <= wb_u.pc;
@@ -1366,7 +1415,7 @@ always_ff @(posedge clk) begin
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			redir_v  <= 1'b0;
-			exc_go   <= 1'b1;
+			xw_ph    <= 2'd1;          // T5-T13 first, then exc_go
 			exc_kind <= x_kind;
 			exc_ssp  <= x_ssp;
 			xi_sr    <= x_osr;
@@ -1388,48 +1437,30 @@ always_ff @(posedge clk) begin
 					trace_addr  <= wb_u.pc;
 				end
 			end
-			for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
-			if (wb_commit) begin
-				if (wb_u.upd2_v) rf_f[wb_u.upd2_reg] <= wb_upd2_val;
-				if (wb_u.upd_v)  rf_f[wb_u.upd_reg] <= wb_upd_val;
-				if (wb_dwe)      rf_f[wb_u.d_reg]   <= wb_res;
-			end
-			else if (adv_wb && wb_is_exc && wb_post_trap) begin
-				// a trap after the instruction completed (CHK, CHK2,
-				// TRAPcc, TRAPV, divide by zero): its address update
-				// stands -- CHK.W (A2)+,D1 that traps leaves A2 advanced
-				if (wb_u.upd2_v) begin
-					rf_b[wb_u.upd2_reg] <= wb_upd2_val;
-					rf_f[wb_u.upd2_reg] <= wb_upd2_val;
-				end
-				if (wb_u.upd_v) begin
-					rf_b[wb_u.upd_reg] <= wb_upd_val;
-					rf_f[wb_u.upd_reg] <= wb_upd_val;
-				end
-			end
-			rf_b[R_T0 + 8]  <= vbr_r + {22'd0, x_vec, 2'b00};
-			rf_b[R_T0 + 9]  <= x_pc;
-			rf_b[R_T0 + 10] <= {16'd0, x_osr};
-			rf_b[R_T0 + 11] <= x_addr;
-			rf_b[R_T0 + 12] <= {16'd0, vw};
-			rf_b[R_T0 + 13] <= {16'd0, x_ssw};
-			rf_f[R_T0 + 8]  <= vbr_r + {22'd0, x_vec, 2'b00};
-			rf_f[R_T0 + 9]  <= x_pc;
-			rf_f[R_T0 + 10] <= {16'd0, x_osr};
-			rf_f[R_T0 + 11] <= x_addr;
-			rf_f[R_T0 + 12] <= {16'd0, vw};
-			rf_f[R_T0 + 13] <= {16'd0, x_ssw};
-			// format $7 write fault: WB3A mirrors the fault address and
-			// WB3D carries the store data (WB3S stays clear: the core
-			// restarts the instruction, nothing is left to write back)
-			// T5: the frame's EA field (the MOVEM EA with CM, else FA)
-			rf_b[R_T0 + 5]  <= x_cm ? x_cm_ea : x_addr;
-			rf_f[R_T0 + 5]  <= x_cm ? x_cm_ea : x_addr;
-			rf_b[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;
-			rf_b[R_T0 + 7]  <= x_wfault ? wb_st_data : 32'd0;
-			rf_f[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;
-			rf_f[R_T0 + 7]  <= x_wfault ? wb_st_data : 32'd0;
+			// the routine's operands, written into the back file by the
+			// xw sequence: T8 vector address, T9 PC, T10 SR, T11 address,
+			// T12 format/vector word, T13 SSW; format $7: T5 the EA field
+			// (the MOVEM EA with CM, else FA), T6/T7 WB3A/WB3D of a write
+			// fault (WB3S stays clear: the instruction restarts)
+			xi_vaddr <= vbr_r + {22'd0, x_vec, 2'b00};
+			xi_ea    <= x_cm ? x_cm_ea : x_addr;
+			xi_w3a   <= x_wfault ? x_addr : 32'd0;
+			xi_w3d   <= x_wfault ? wb_st_data : 32'd0;
 		end
+
+		// exception entry, continued: three cycles of back-file writes
+		if (xw_ph != 2'd0) begin
+			xw_ph <= xw_ph + 2'd1;
+			if (xw_ph == 2'd3) begin
+				xw_ph  <= 2'd0;
+				exc_go <= 1'b1;
+			end
+		end
+
+		// front-valid bits: a front write makes the register's front copy
+		// current; a redirect, a refetch or an exception drops them all
+		for (int i = 0; i < 3; i++) if (fwe[i]) fv[fwa[i]] <= 1'b1;
+		if ((wb_commit && wb_redir) || wb_refetch || x_go) fv <= 32'd0;
 
 		// a store that took a bus error at WB becomes an access fault of
 		// its instruction (WB holds one cycle, then takes it)

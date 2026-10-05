@@ -92,6 +92,46 @@ module ap68040_lutram #(
 	output logic [DW-1:0] q
 );
 	(* ramstyle = "MLAB, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
+	initial for (int i = 0; i < (1 << AW); i++) mem[i] = '0;
 	always_ff @(posedge clk) if (we) mem[waddr] <= wdata;
 	assign q = mem[raddr];
+endmodule
+
+//--------------------------------------------------------------------------
+// ap68040_rf: 32 x 32 register file in MLABs, three write ports and NR
+// asynchronous read ports.  Each write port owns NR copies (one per read
+// port); a live value table records which port wrote each register last,
+// and a read selects that port's copy.  Two ports writing the same
+// register in one cycle: the higher port number wins.
+//--------------------------------------------------------------------------
+module ap68040_rf #(
+	parameter int NR = 5
+)(
+	input  logic        clk,
+	input  logic  [2:0] we,
+	input  logic  [4:0] wa [3],
+	input  logic [31:0] wd [3],
+	input  logic  [4:0] ra [NR],
+	output logic [31:0] rd [NR]
+);
+	logic [1:0]  lvt [32];
+	logic [31:0] q [3][NR];
+	genvar gw, gr;
+	generate
+		for (gw = 0; gw < 3; gw++) begin : g_w
+			for (gr = 0; gr < NR; gr++) begin : g_r
+				ap68040_lutram #(.AW(5), .DW(32)) bank (
+					.clk(clk), .we(we[gw]), .waddr(wa[gw]), .wdata(wd[gw]),
+					.raddr(ra[gr]), .q(q[gw][gr])
+				);
+			end
+		end
+	endgenerate
+	initial for (int i = 0; i < 32; i++) lvt[i] = 2'd0;
+	always_ff @(posedge clk)
+		for (int w = 0; w < 3; w++)
+			if (we[w]) lvt[wa[w]] <= 2'(w);
+	always_comb
+		for (int r = 0; r < NR; r++)
+			rd[r] = q[lvt[ra[r]]][r];
 endmodule

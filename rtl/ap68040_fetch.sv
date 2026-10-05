@@ -95,7 +95,7 @@ module ap68040_fetch
 	input  logic        b_rtci
 );
 
-localparam int QN = 24;
+localparam int QN = 16;
 
 wire tc_e  = tc[15];
 wire tc_p  = tc[14];
