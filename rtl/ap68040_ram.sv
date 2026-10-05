@@ -13,7 +13,7 @@
 
 module ap68040_sdp_be #(
 	parameter int AW = 6,
-	parameter int NB = 16,           // bytes per word
+	parameter int NB = 16,           // bytes per word (1..4, or a multiple of 4)
 	parameter bit OREG = 1           // registered output (one more cycle)
 )(
 	input  logic              clk,
@@ -21,20 +21,29 @@ module ap68040_sdp_be #(
 	input  logic [AW-1:0]     waddr,
 	input  logic [NB-1:0]     wbe,
 	input  logic [NB*8-1:0]   wdata,
-	input  logic [AW-1:0]     raddr,    // registered here
+	input  logic [AW-1:0]     raddr,    // sampled here: data the next cycle
 	input  logic              oce,      // output register enable
 	output logic [NB*8-1:0]   q
 );
-	(* ramstyle = "M10K, no_rw_check" *) logic [NB*8-1:0] mem [0:(1<<AW)-1];
-	logic [AW-1:0] ra;
+	// Intel's byte-enabled simple dual port template (Quartus 17 infers
+	// byte enables for at most four bytes per memory, so a wider word is
+	// built from 32-bit slices).  The read data is registered: a read of
+	// the word written in the same cycle returns the old data (the users
+	// track that case).
+	localparam int SL = (NB > 4) ? 4 : NB;      // bytes per slice
+	localparam int NS = (NB + SL - 1) / SL;     // slices
 	logic [NB*8-1:0] qr;
-	always_ff @(posedge clk) begin
-		if (we)
-			for (int i = 0; i < NB; i++)
-				if (wbe[i]) mem[waddr][i*8 +: 8] <= wdata[i*8 +: 8];
-		ra <= raddr;
-	end
-	assign qr = mem[ra];
+	genvar gs, gb;
+	generate
+		for (gs = 0; gs < NS; gs++) begin : g_sl
+			(* ramstyle = "M10K, no_rw_check" *) logic [SL-1:0][7:0] mem [0:(1<<AW)-1];
+			for (gb = 0; gb < SL; gb++) begin : g_b
+				always_ff @(posedge clk)
+					if (we && wbe[gs*SL + gb]) mem[waddr][gb] <= wdata[(gs*SL + gb)*8 +: 8];
+			end
+			always_ff @(posedge clk) qr[gs*SL*8 +: SL*8] <= mem[raddr];
+		end
+	endgenerate
 	generate
 		if (OREG) begin : g_oreg
 			always_ff @(posedge clk) if (oce) q <= qr;

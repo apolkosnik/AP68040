@@ -92,7 +92,7 @@ m68040_bus_slave #(.AW(20)) mem (
 	.d_mem(d_mem), .ta_n(ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold), .iack_vector(8'd0),
+	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold), .iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),

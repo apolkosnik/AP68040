@@ -19,11 +19,16 @@
 //                                                                          //
 // Every completed beat is published on the ev_* outputs for one clk so a   //
 // bench can implement MMIO and protocol checks.                            //
+//                                                                          //
+// EXT = 1: the bench owns the memory.  Reads return ext_rdata for the      //
+// beat's address (xfer_addr), an address with ext_inmem low ends in TEA,   //
+// and writes are left to the bench (it applies the ev_* write events).     //
 //--------------------------------------------------------------------------//
 
 module m68040_bus_slave #(
 	parameter int  AW   = 24,          // memory size 2**AW bytes at address 0
-	parameter int  SEED = 1
+	parameter int  SEED = 1,
+	parameter bit  EXT  = 0            // memory supplied by the bench
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -50,6 +55,8 @@ module m68040_bus_slave #(
 	input  logic        tci_req,
 	input  logic        hold,          // insert wait states while high
 	input  logic  [7:0] iack_vector,   // 0 = answer with AVEC
+	input  logic [31:0] ext_rdata,     // EXT: the long word at xfer_addr
+	input  logic        ext_inmem,     // EXT: xfer_addr is backed by memory
 
 	// the transfer being answered (valid while xfer_v)
 	output logic        xfer_v,
@@ -102,7 +109,8 @@ endfunction
 
 wire  [1:0] a32   = base[3:2] + beat;
 wire [31:0] baddr = (siz_q == 2'b11) ? {base[31:4], a32, 2'b00} : base;
-wire        inmem = (baddr >> AW) == 0;
+wire        inmem = EXT ? ext_inmem : ((baddr >> AW) == 0);
+wire [31:0] rword = EXT ? ext_rdata : mem[baddr[AW-1:2]];
 
 assign xfer_v    = busy;
 assign xfer_addr = baddr;
@@ -206,9 +214,9 @@ always_ff @(posedge clk) begin
 					d_mem <= {24'd0, iack_vector};
 				end
 				else if (rd_q) begin
-					d_mem <= mem[baddr[AW-1:2]];
+					d_mem <= rword;
 				end
-				else begin
+				else if (!EXT) begin
 					for (int i = 0; i < 4; i++)
 						if (be[3 - i])
 							mem[baddr[AW-1:2]][31 - 8*i -: 8] <= d_cpu[31 - 8*i -: 8];
@@ -226,7 +234,7 @@ always_ff @(posedge clk) begin
 			end
 			ev_rd   <= rd_q;
 			ev_addr <= baddr;
-			ev_data <= rd_q ? mem[baddr[AW-1:2]] : d_cpu;
+			ev_data <= rd_q ? rword : d_cpu;
 			ev_be   <= be;
 			ev_siz  <= siz_q;
 			ev_tt   <= tt_q;
