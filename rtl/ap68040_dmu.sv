@@ -676,6 +676,17 @@ always_ff @(posedge clk) begin
 		end
 	end
 	else begin
+		// the valid/dirty write port: at most one writer per cycle (the
+		// WB fast store runs only with the engine idle, the snoop port
+		// only with it frozen), applied at the end of this block
+		logic [5:0] vp_set;
+		logic [3:0] vp_wm;               // ways written
+		logic       vp_lwe, vp_lv;       // valid: write, value
+		logic       vp_dwe, vp_dv;       // dirty: write, value
+		logic       vp_all;              // invalidate everything
+		vp_set = '0; vp_wm = '0; vp_lwe = 1'b0; vp_lv = 1'b0;
+		vp_dwe = 1'b0; vp_dv = 1'b0; vp_all = 1'b0;
+
 		//--------------------------------------------------------------
 		// stage records
 		//--------------------------------------------------------------
@@ -731,7 +742,7 @@ always_ff @(posedge clk) begin
 			dw_be   <= wbf_be;
 			dw_src  <= 2'd0;
 			dw_word <= wbf_word;
-			ld[m4.x.pa[9:4]][m4.x.way] <= 1'b1;
+			vp_set = m4.x.pa[9:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 			st_rdy  <= 1'b1;
 			st_fault <= 1'b0;
 			e_wst_done <= 1'b1;
@@ -853,8 +864,8 @@ always_ff @(posedge clk) begin
 			else if (move16 && m2.r.mem == M_ST) begin
 				// MOVE16 destination: a write hit invalidates the line
 				if (e_x.hit) begin
-					lv[e_va[9:4]][e_x.way] <= 1'b0;
-					ld[e_va[9:4]][e_x.way] <= 1'b0;
+					vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1;
+					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 					e_x.hit <= 1'b0;
 				end
 				e_st <= E_S_NEXT;
@@ -1001,7 +1012,9 @@ always_ff @(posedge clk) begin
 				dw_src  <= 2'd0;
 				dw_word <= lanes32(e_acc, e_va[1:0]);
 				if (e_x.cm == 2'b01)
-					if (be != 16'd0) ld[e_va[9:4]][e_x.way] <= 1'b1;
+					if (be != 16'd0) begin
+						vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+					end
 			end
 			if (upd && e_x.cm == 2'b01) begin
 				e_st <= E_W_DONE;            // copyback: no bus write
@@ -1078,10 +1091,7 @@ always_ff @(posedge clk) begin
 					// CINV / CPUSH
 					if (!mt_caches[0]) e_st <= E_M_IC;
 					else if (mt_op == MT_CINV && mt_scope == 2'd3) begin
-						for (int i = 0; i < 64; i++) begin
-							lv[i] <= 4'd0;
-							for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
-						end
+						vp_all = 1'b1;
 						e_st <= E_M_IC;
 					end
 					else begin
@@ -1143,8 +1153,8 @@ always_ff @(posedge clk) begin
 			end
 			else begin
 				if (m) begin
-					lv[s][w] <= 1'b0;
-					ld[s][w] <= 1'b0;
+					vp_set = s; vp_wm[w] = 1'b1;
+					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 				end
 				if ((mt_scope == 2'd1 && w == 2'd3) || ms_i == 8'hFF) e_st <= E_M_IC;
 				else begin
@@ -1197,8 +1207,8 @@ always_ff @(posedge clk) begin
 				pv_dirty <= ld[f_set][f_way];
 				pv_tln   <= f_way;
 			end
-			lv[f_set][f_way] <= 1'b0;
-			ld[f_set][f_way] <= 1'b0;
+			vp_set = f_set; vp_wm[f_way] = 1'b1;
+			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 			bo.line <= 1'b1; bo.rd <= 1'b1; bo.tt <= TT_NORMAL;
 			bo.tm <= m2.r.smode ? TM_SDATA : TM_UDATA;
 			bo.upa <= e_x.upa; bo.ci <= 1'b0; bo.lock <= 1'b0; bo.locke <= 1'b0;
@@ -1219,8 +1229,8 @@ always_ff @(posedge clk) begin
 				tset_b  <= f_set;
 				tway_b  <= f_way;
 				twd_b   <= f_tag;
-				lv[f_set][f_way] <= 1'b1;
-				ld[f_set][f_way] <= 1'b0;
+				vp_set = f_set; vp_wm[f_way] = 1'b1;
+				vp_lwe = 1'b1; vp_lv = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b0;
 				rrc <= rrc + 2'd1;
 			end
 			else if (pv_v) begin
@@ -1230,8 +1240,8 @@ always_ff @(posedge clk) begin
 				dw_way  <= f_way;
 				dw_be   <= 16'hFFFF;
 				dw_src  <= 2'd2;
-				lv[f_set][f_way] <= 1'b1;
-				ld[f_set][f_way] <= pv_dirty;
+				vp_set = f_set; vp_wm[f_way] = 1'b1;
+				vp_lwe = 1'b1; vp_lv = 1'b1; vp_dwe = 1'b1; vp_dv = pv_dirty;
 				pv_v <= 1'b0;
 			end
 			if (bo_err) begin
@@ -1274,8 +1284,8 @@ always_ff @(posedge clk) begin
 				e_st     <= E_PUSHV_B;
 			end
 			else e_st <= e_sret;
-			lv[f_set][f_way] <= 1'b0;
-			ld[f_set][f_way] <= 1'b0;
+			vp_set = f_set; vp_wm[f_way] = 1'b1;
+			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 		end
 		E_PUSHV_B: begin
 			bo.line <= 1'b1; bo.rd <= 1'b0; bo.tt <= TT_NORMAL; bo.tm <= TM_PUSH;
@@ -1471,11 +1481,10 @@ always_ff @(posedge clk) begin
 			bo_pa   <= tw_da;
 			bo_left <= 3'd4;
 			bo_wd   <= nd;
+			vp_set = tw_da[9:4];
+			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 			for (int i = 0; i < 4; i++)
-				if (lv[tw_da[9:4]][i] && tq_b[i] == tw_da[31:10]) begin
-					lv[tw_da[9:4]][i] <= 1'b0;
-					ld[tw_da[9:4]][i] <= 1'b0;
-				end
+				if (lv[tw_da[9:4]][i] && tq_b[i] == tw_da[31:10]) vp_wm[i] = 1'b1;
 			e_wret <= e_ret;
 			e_ret  <= E_TW_UPD_W;
 			e_st   <= E_BUS;
@@ -1610,8 +1619,8 @@ always_ff @(posedge clk) begin
 			if (sn_inv) begin
 				case (sn_src)
 				2'd0: begin
-					lv[s][sn_way] <= 1'b0;
-					ld[s][sn_way] <= 1'b0;
+					vp_set = s; vp_wm[sn_way] = 1'b1;
+					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 					// no record keeps a hit on the line that left
 					if (m2.x.hit && m2.x.pa[9:4] == s && m2.x.way == sn_way) m2.x.hit <= 1'b0;
 					if (m2.x1.hit && m2.x1.pa[9:4] == s && m2.x1.way == sn_way) m2.x1.hit <= 1'b0;
@@ -1646,7 +1655,7 @@ always_ff @(posedge clk) begin
 					dw_be   <= sn_wbe;
 					dw_src  <= 2'd0;
 					dw_word <= sn_wword;
-					ld[s][sn_way] <= 1'b1;
+					vp_set = s; vp_wm[sn_way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 				end
 				2'd1: for (int i = 0; i < 16; i++)
 					if (sn_wbe[i]) pv_line[8*i +: 8] <= sn_wword[8*(i % 4) +: 8];
@@ -1658,6 +1667,23 @@ always_ff @(posedge clk) begin
 		end
 		default: sn_ph <= SN_IDLE;   // SN_R: the owner's address is read again
 		endcase
+
+		//--------------------------------------------------------------
+		// the valid/dirty write port
+		//--------------------------------------------------------------
+		if (vp_all) begin
+			for (int i = 0; i < 64; i++) begin
+				lv[i] <= 4'd0;
+				for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
+			end
+		end
+		else begin
+			for (int j = 0; j < 4; j++)
+				if (vp_wm[j]) begin
+					if (vp_lwe) lv[vp_set][j] <= vp_lv;
+					if (vp_dwe) ld[vp_set][j] <= vp_dv;
+				end
+		end
 	end
 end
 
