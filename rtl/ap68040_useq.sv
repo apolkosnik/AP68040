@@ -54,6 +54,11 @@ logic        def_v;             // a deferred source update is pending
 logic  [4:0] def_reg;
 logic  [7:0] def_amt;
 logic  [4:0] ssp;
+// MOVEM loop
+logic        mv_act;            // the loop has started for this instruction
+logic [15:0] mv_mask;           // registers still to transfer
+logic  [4:0] mv_k;              // transfers done
+logic        mv_t11;            // the address is in T11 (base register in the list)
 
 wire         can_emit = !uo_v || uo_rdy;
 
@@ -92,11 +97,12 @@ function automatic logic is_reg(input logic [3:0] m);
 	is_reg = (m == EM_DN) || (m == EM_AN);
 endfunction
 
-function automatic logic [2:0] size_bytes(input logic [1:0] s, input logic is_sp);
+function automatic logic [4:0] size_bytes(input logic [1:0] s, input logic is_sp);
 	case (s)
-		SZ_B:    size_bytes = is_sp ? 3'd2 : 3'd1;
-		SZ_W:    size_bytes = 3'd2;
-		default: size_bytes = 3'd4;
+		SZ_B:    size_bytes = is_sp ? 5'd2 : 5'd1;
+		SZ_W:    size_bytes = 5'd2;
+		SZ_L:    size_bytes = 5'd4;
+		default: size_bytes = 5'd16;      // line (MOVE16)
 	endcase
 endfunction
 
@@ -118,6 +124,8 @@ logic        n_ptr;          // nu is a pointer load (memory indirect)
 logic        n_ptr_ea1;
 logic        n_jump;         // pure jump micro-instruction
 logic  [8:0] n_jt;
+logic        n_mv_pre;       // nu is the MOVEM address copy into T11
+logic [15:0] n_mv_rest;      // mask after this transfer
 logic        n_def_set;      // nu defers its source update
 logic  [4:0] n_def_reg;
 logic  [7:0] n_def_amt;
@@ -127,7 +135,8 @@ always_comb begin
 	ea_t    me;              // the uop's memory EA
 	logic   me_v, me_ea1;
 	logic [1:0] osz, msz;
-	logic [2:0] amt;
+	logic [2:0] mszf;
+	logic [4:0] amt;
 	logic       me_sp;
 	logic [31:0] q, shc;
 	logic [6:0] op;
@@ -144,9 +153,12 @@ always_comb begin
 	n_def_set = 1'b0;
 	n_def_reg = '0;
 	n_def_amt = '0;
+	n_mv_pre  = 1'b0;
+	n_mv_rest = '0;
 
 	osz = (uw.sz  == 2'd0) ? src.sz : (uw.sz  - 2'd1);
-	msz = (uw.msz == 2'd0) ? osz    : (uw.msz - 2'd1);
+	mszf = (uw.msz == 3'd0) ? {1'b0, src.sz} : (uw.msz - 3'd1);
+	msz  = mszf[1:0];
 	q   = (src.opw[11:9] == 3'd0) ? 32'd8 : {29'd0, src.opw[11:9]};
 
 	// pure jump words (a routine's first jump is resolved in D1)
@@ -161,6 +173,7 @@ always_comb begin
 		JC_SZ_L:     jc_true = (src.sz == SZ_L);
 		JC_AY7:      jc_true = (src.opw[2:0] == 3'd7);
 		JC_SUPER:    jc_true = smode;
+		JC_MASK0:    jc_true = (src.ext1 == 16'd0);
 		default:     jc_true = 1'b0;
 	endcase
 	// a micro-instruction with a jump condition is a pure jump
@@ -217,6 +230,14 @@ always_comb begin
 			S_ZERO:  o.src = OS_ZERO;
 			S_LD:    o.src = OS_MEM;
 			S_CREG:  begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {28'd0, src.ext1[11], src.ext1[2:0]}; end
+			S_BFO: begin
+				if (src.ext1[11]) o.r = dreg(src.ext1[8:6]);
+				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[10:6]}; end
+			end
+			S_BFW: begin
+				if (src.ext1[5]) o.r = dreg(src.ext1[2:0]);
+				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[4:0]}; end
+			end
 			S_CREGR: o.r = (src.ext1[2:0] == 3'd0) ? R_USP : (src.ext1[2:0] == 3'd3) ? R_MSP : R_ISP;
 			default: o.v = 1'b0;
 		endcase
@@ -228,9 +249,12 @@ always_comb begin
 	//----------------------------------------------------------------------
 	op  = uw.op_inst ? src.eop : uw.op;
 	case (uw.cond_inst)
-		2'd1:    cnd = src.opw[11:8];
-		2'd2:    cnd = src.econd;
-		2'd3:    cnd = {2'b00, src.ext1[10], src.ext1[11]};
+		3'd1:    cnd = src.opw[11:8];
+		3'd2:    cnd = src.econd;
+		3'd3:    cnd = {2'b00, src.ext1[10], src.ext1[11]};
+		3'd4:    cnd = {1'b0, src.opw[10:8]};     // bit field, register
+		3'd5:    cnd = {1'b1, src.opw[10:8]};     // bit field, memory
+		3'd6:    cnd = {2'b00, !src.ext1[15], src.ext1[11]};  // CHK2/CMP2
 		default: cnd = uw.cond;
 	endcase
 	nu.op     = op;
@@ -243,9 +267,11 @@ always_comb begin
 	nu.a_sxw  = (uw.sxw == 2'd1) || (uw.sxw == 2'd2 && src.sz == SZ_W);
 	nu.b_src  = ob.v ? ob.src : OS_ZERO;
 	nu.b_reg  = ob.r;
-	nu.imm    = oa.imm_v ? oa.imm : ob.imm_v ? ob.imm : {{16{uw.cval[15]}}, uw.cval};
+	nu.imm    = oa.imm_v ? oa.imm : {{16{uw.cval[15]}}, uw.cval};
+	nu.imm_b  = ob.imm;
 	nu.mfc    = uw.mfc;
 	nu.mlock  = uw.lock;
+	nu.mlocke = uw.locke;
 	nu.br     = uw.br;
 	nu.target = src.target;
 	nu.pred   = src.pred && (uw.br == BR_COND || uw.br == BR_IMM);
@@ -275,6 +301,8 @@ always_comb begin
 
 	if (uw.mem != 2'd0)
 		nu.mem = uw.mem;
+	else if (uw.a == S_LD || uw.b == S_LD)
+		nu.mem = M_LD;
 	else if (me_v) begin
 		if ((ob.mem || oa.mem) && od.mem) nu.mem = M_RMW;
 		else if (od.mem)                  nu.mem = M_ST;
@@ -294,11 +322,11 @@ always_comb begin
 			EM_AIP: begin
 				nu.base_v = 1'b1; nu.base = bre;
 				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = bre;
-				nu.upd_amt = {5'd0, amt};
+				nu.upd_amt = {3'd0, amt};
 			end
 			EM_APD: begin
 				nu.base_v = 1'b1; nu.base = bre;
-				nu.disp = -{29'd0, amt};
+				nu.disp = -{27'd0, amt};
 				nu.upd_v = 1'b1; nu.upd_reg = bre;
 			end
 			EM_AD16: begin nu.base_v = 1'b1; nu.base = bre; nu.disp = me.bd; end
@@ -348,7 +376,7 @@ always_comb begin
 				nu.pinc   = 1'b0;
 				n_def_set = 1'b1;
 				n_def_reg = bre;
-				n_def_amt = (me.m == EM_AIP) ? {5'd0, amt} : -{5'd0, amt};
+				n_def_amt = (me.m == EM_AIP) ? {3'd0, amt} : -{3'd0, amt};
 			end
 		end
 		if (uw.upd2 && def_v) begin
@@ -375,6 +403,8 @@ always_comb begin
 		logic [31:0] dsv;
 		rb_v = (uw.agb != S_NONE) && (uw.agb != S_ZERO);
 		case (uw.agb)
+			S_X1R: rb = src.ext1[15] ? areg(src.ext1[14:12], sp_reg) : dreg(src.ext1[14:12]);
+			S_X2R: rb = src.ext2[15] ? areg(src.ext2[14:12], sp_reg) : dreg(src.ext2[14:12]);
 			S_AX:  rb = areg(src.opw[11:9], sp_reg);
 			S_AY:  rb = areg(src.opw[2:0], sp_reg);
 			S_SP:  rb = sp_reg;
@@ -394,23 +424,24 @@ always_comb begin
 			DS_QUICK:  dsv = q;
 			DS_NQUICK: dsv = -q;
 			DS_IMMC:   dsv = src.imm + {{16{uw.cval[15]}}, uw.cval};
+			DS_SZB:    dsv = {27'd0, size_bytes(src.sz, 1'b0)};
 			default:   dsv = {{16{uw.cval[15]}}, uw.cval};
 		endcase
 		case (uw.ag)
 			AGM_PUSH: begin
 				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = sp_reg;
-				nu.disp = -{29'd0, size_bytes(msz, 1'b1)};
+				nu.disp = -{27'd0, size_bytes(msz, 1'b1)};
 				nu.upd_v = 1'b1; nu.upd_reg = sp_reg;
 			end
 			AGM_POP: begin
 				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = sp_reg;
 				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = sp_reg;
-				nu.upd_amt = {5'd0, size_bytes(msz, 1'b1)};
+				nu.upd_amt = {3'd0, size_bytes(msz, 1'b1)};
 			end
 			AGM_POPR: begin
 				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = rb;
 				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = rw;
-				nu.upd_amt = {5'd0, size_bytes(msz, 1'b0)};
+				nu.upd_amt = {3'd0, size_bytes(msz, 1'b0)};
 			end
 			AGM_BASED, AGM_BASEDU: begin
 				nu.ag = 1'b1; nu.base_v = rb_v; nu.base = rb; nu.disp = dsv;
@@ -438,12 +469,94 @@ always_comb begin
 				end
 				nu.upd_v = 1'b1; nu.upd_reg = rw;
 			end
+			AGM_ADDT0: begin
+				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = rb;
+				nu.idx_v = 1'b1; nu.idx = R_T0; nu.idx_l = 1'b1;
+				nu.upd_v = 1'b1; nu.upd_reg = rw;
+			end
 			AGM_LEA0: begin
 				if (uw.agw != S_NONE) begin nu.upd_v = !n_ptr; nu.upd_reg = rw; end
 				nu.mem = M_NONE;
 			end
 			default: ;
 		endcase
+	end
+
+	//----------------------------------------------------------------------
+	// MOVEM: one transfer per set mask bit.  -(An): mask bit 0 is A7 and the
+	// addresses descend from An; other modes ascend from the EA.  An is
+	// updated by the last transfer only.
+	//----------------------------------------------------------------------
+	if (uw.loop) begin
+		logic [15:0] m;
+		logic  [3:0] bi, rn;
+		logic  [4:0] r;
+		logic  [2:0] sb;
+		logic        pd, pi, lastx, base_in;
+		logic  [4:0] an;
+		logic [31:0] off;
+		m  = mv_act ? mv_mask : src.ext1;
+		pd = (src.ea0.m == EM_APD);
+		pi = (src.ea0.m == EM_AIP);
+		bi = 4'd0;
+		for (int i = 15; i >= 0; i--) if (m[i]) bi = 4'(i);
+		rn = pd ? (4'd15 - bi) : bi;
+		r  = rn[3] ? areg(rn[2:0], sp_reg) : dreg(rn[2:0]);
+		n_mv_rest = m & ~(16'd1 << bi);
+		lastx = (n_mv_rest == 16'd0);
+		sb = (src.sz == SZ_L) ? 3'd4 : 3'd2;
+		an = areg(src.ea0.r, sp_reg);
+		// a load list that contains the base register works from a copy
+		base_in = (uw.d == S_MVR) && !pd &&
+		          ((src.ea0.m == EM_AI || pi || src.ea0.m == EM_AD16 ||
+		            src.ea0.m == EM_AX) && !(src.ea0.m == EM_AX && src.ea0.bs)) &&
+		          src.ext1[{1'b1, src.ea0.r}];
+		off = pd ? -({27'd0, mv_k} + 32'd1) * {29'd0, sb} : {27'd0, mv_k} * {29'd0, sb};
+		nu.last = lastx;
+		if (uw.d == S_MVR) begin
+			nu.d_v = 1'b1; nu.d_reg = r;
+		end
+		else begin
+			nu.a_src = OS_REG; nu.a_reg = r;
+			// -(An) storing An itself writes An - size (68020 and later)
+			if (pd && r == an) begin
+				nu.op = OP_SUB; nu.sz = SZ_L;
+				nu.a_src = OS_IMM; nu.imm = {29'd0, sb};
+				nu.b_src = OS_REG; nu.b_reg = an;
+			end
+		end
+		if (base_in && !mv_t11) begin
+			// first: T11 = the address, then the transfers from T11
+			uop_t p;
+			p = '0;
+			p.pc = nu.pc; p.npc = nu.npc; p.first = nu.first;
+			p.ag = 1'b1;
+			p.base_v = nu.base_v; p.base = nu.base;
+			p.idx_v = nu.idx_v; p.idx = nu.idx; p.idx_l = nu.idx_l; p.scale = nu.scale;
+			p.disp = nu.disp; p.mprog = nu.mprog;
+			p.upd_v = 1'b1; p.upd_reg = R_T0 + 5'd11;
+			p.exc = nu.exc;
+			nu = p;
+			n_mv_pre = 1'b1;
+		end
+		else begin
+			if (mv_t11) begin
+				nu.base_v = 1'b1; nu.base = R_T0 + 5'd11;
+				nu.idx_v = 1'b0; nu.disp = 32'd0;
+			end
+			// address of this transfer
+			nu.disp = nu.disp + off;
+			if (pd) nu.disp = off;          // undo the generic -(An) offset
+			nu.pinc = 1'b0;
+			nu.upd_v = 1'b0;
+			if (lastx && pd) begin
+				nu.upd_v = 1'b1; nu.upd_reg = an;          // An = lowest address
+			end
+			if (lastx && pi) begin
+				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = an;
+				nu.upd_amt = 8'({27'd0, mv_k} * {29'd0, sb} + {29'd0, sb});
+			end
+		end
 	end
 
 	// a pointer load replaces the uop this cycle
@@ -485,6 +598,10 @@ always_ff @(posedge clk) begin
 		def_reg <= '0;
 		def_amt <= '0;
 		ssp   <= R_ISP;
+		mv_act <= 1'b0;
+		mv_mask <= '0;
+		mv_k  <= '0;
+		mv_t11 <= 1'b0;
 		uo_v  <= 1'b0;
 		uo    <= '0;
 	end
@@ -497,6 +614,9 @@ always_ff @(posedge clk) begin
 				ind0  <= 1'b0;
 				ind1  <= 1'b0;
 				def_v <= 1'b0;
+				mv_act <= 1'b0;
+				mv_k   <= 5'd0;
+				mv_t11 <= 1'b0;
 			end
 			cur_v <= 1'b1;
 			if (n_jump) begin
@@ -509,6 +629,16 @@ always_ff @(posedge clk) begin
 				if (n_ptr) begin
 					upc <= src_upc;
 					if (n_ptr_ea1) ind1 <= 1'b1; else ind0 <= 1'b1;
+				end
+				else if (n_mv_pre) begin
+					upc    <= src_upc;
+					mv_t11 <= 1'b1;
+				end
+				else if (uw.loop && !nu.last) begin
+					upc     <= src_upc;
+					mv_act  <= 1'b1;
+					mv_mask <= n_mv_rest;
+					mv_k    <= mv_k + 5'd1;
 				end
 				else begin
 					if (n_def_set) begin
@@ -564,6 +694,7 @@ always_comb begin
 		JC_SZ_L:     jc_now = (src.sz == SZ_L);
 		JC_AY7:      jc_now = (src.opw[2:0] == 3'd7);
 		JC_SUPER:    jc_now = smode;
+		JC_MASK0:    jc_now = (src.ext1 == 16'd0);
 		JC_CREG_RF:  jc_now = (src.ext1[11:0] == 12'h800) || (src.ext1[11:0] == 12'h803) ||
 		                      (src.ext1[11:0] == 12'h804);
 		default:     jc_now = 1'b0;

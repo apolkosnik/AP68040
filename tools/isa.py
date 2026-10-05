@@ -18,6 +18,8 @@ Every entry is one opcode pattern:
            'fbcc' (bit 6: 0 word, 1 long)
   priv   privileged (vector 8 in user mode)
   esz    size of an immediate EA (#<data>) if it differs from sz
+  fea    fixed EAs: 1 = (Ay)+,(Ax)+ (CMPM), 2 = -(Ay),-(Ax) (ADDX etc.),
+         3 = MOVE16 operands
 
 The decoder generator checks this table exhaustively against WinUAE's
 per-opcode table (tools-oracle/op040.txt, built from readcpu.cpp and
@@ -41,12 +43,14 @@ AN    = {'An'}
 
 class I:
     def __init__(self, pat, name, rt, sz='U', ea0=None, ea1=None, nfix=0,
-                 imm=None, priv=False, esz=None):
+                 imm=None, priv=False, esz=None, fea=0):
         pat = pat.replace(' ', '')
         assert len(pat) == 16, pat
         self.pat, self.name, self.rt, self.sz = pat, name, rt, sz
         self.ea0, self.ea1, self.nfix, self.imm = ea0, ea1, nfix, imm
         self.priv, self.esz = priv, esz
+        # fixed EAs: 1 (Ay)+,(Ax)+  2 -(Ay),-(Ax)  (registers in 2:0 and 11:9)
+        self.fea = fea
 
     def match(self, op):
         for i, c in enumerate(self.pat):
@@ -205,23 +209,23 @@ for z in ('00', '01', '10'):
     add('1101 ...1 %s.. ....' % z, 'ADD', 'OP_DN_EA', 'z', ea0=MALT)
     add('1011 ...0 %s.. ....' % z, 'CMP', 'CMP_EA_DN', 'z', ea0=ALL - ({'An'} if z == '00' else set()))
     add('1011 ...1 %s.. ....' % z, 'EOR', 'OP_DN_EA', 'z', ea0=DALT)
-    add('1011 ...1 %s00 1...' % z, 'CMPM', 'CMPM', 'z')
+    add('1011 ...1 %s00 1...' % z, 'CMPM', 'CMPM', 'z', fea=1)
     add('1001 ...1 %s00 0...' % z, 'SUBX', 'ADDX_R', 'z')
-    add('1001 ...1 %s00 1...' % z, 'SUBX', 'ADDX_M', 'z')
+    add('1001 ...1 %s00 1...' % z, 'SUBX', 'ADDX_M', 'z', fea=2)
     add('1101 ...1 %s00 0...' % z, 'ADDX', 'ADDX_R', 'z')
-    add('1101 ...1 %s00 1...' % z, 'ADDX', 'ADDX_M', 'z')
+    add('1101 ...1 %s00 1...' % z, 'ADDX', 'ADDX_M', 'z', fea=2)
 add('1000 ...0 11.. ....', 'DIVU', 'DIVW', 'W', ea0=DATA)
 add('1000 ...1 11.. ....', 'DIVS', 'DIVW', 'W', ea0=DATA)
 add('1100 ...0 11.. ....', 'MULU', 'MULW', 'W', ea0=DATA)
 add('1100 ...1 11.. ....', 'MULS', 'MULW', 'W', ea0=DATA)
 add('1000 ...1 0000 0...', 'SBCD', 'ADDX_R', 'B')
-add('1000 ...1 0000 1...', 'SBCD', 'ADDX_M', 'B')
+add('1000 ...1 0000 1...', 'SBCD', 'ADDX_M', 'B', fea=2)
 add('1100 ...1 0000 0...', 'ABCD', 'ADDX_R', 'B')
-add('1100 ...1 0000 1...', 'ABCD', 'ADDX_M', 'B')
+add('1100 ...1 0000 1...', 'ABCD', 'ADDX_M', 'B', fea=2)
 add('1000 ...1 0100 0...', 'PACK', 'PACK_R', 'U', imm='W')
-add('1000 ...1 0100 1...', 'PACK', 'PACK_M', 'U', imm='W')
+add('1000 ...1 0100 1...', 'PACK', 'PACK_M', 'U', imm='W', fea=2)
 add('1000 ...1 1000 0...', 'UNPK', 'UNPK_R', 'U', imm='W')
-add('1000 ...1 1000 1...', 'UNPK', 'UNPK_M', 'U', imm='W')
+add('1000 ...1 1000 1...', 'UNPK', 'UNPK_M', 'U', imm='W', fea=2)
 add('1001 ...0 11.. ....', 'SUBA', 'SUBA', 'W', ea0=ALL)
 add('1001 ...1 11.. ....', 'SUBA', 'SUBA', 'L', ea0=ALL)
 add('1101 ...0 11.. ....', 'ADDA', 'ADDA', 'W', ea0=ALL)
@@ -244,14 +248,14 @@ for k, n in SH.items():
     add('1110 0%s1 11.. ....' % k, n + 'LW', 'SHIFT_M', 'W', ea0=MALT)
 BFR = DN | CTL
 BFW = DN | CALT
-add('1110 1000 11.. ....', 'BFTST',  'BF', 'U', ea0=BFR, nfix=1)
-add('1110 1001 11.. ....', 'BFEXTU', 'BF', 'U', ea0=BFR, nfix=1)
-add('1110 1010 11.. ....', 'BFCHG',  'BF', 'U', ea0=BFW, nfix=1)
-add('1110 1011 11.. ....', 'BFEXTS', 'BF', 'U', ea0=BFR, nfix=1)
-add('1110 1100 11.. ....', 'BFCLR',  'BF', 'U', ea0=BFW, nfix=1)
-add('1110 1101 11.. ....', 'BFFFO',  'BF', 'U', ea0=BFR, nfix=1)
-add('1110 1110 11.. ....', 'BFSET',  'BF', 'U', ea0=BFW, nfix=1)
-add('1110 1111 11.. ....', 'BFINS',  'BF', 'U', ea0=BFW, nfix=1)
+add('1110 1000 11.. ....', 'BFTST',  'BF_TST', 'U', ea0=BFR, nfix=1)
+add('1110 1001 11.. ....', 'BFEXTU', 'BF_EXT', 'U', ea0=BFR, nfix=1)
+add('1110 1010 11.. ....', 'BFCHG',  'BF_MOD', 'U', ea0=BFW, nfix=1)
+add('1110 1011 11.. ....', 'BFEXTS', 'BF_EXT', 'U', ea0=BFR, nfix=1)
+add('1110 1100 11.. ....', 'BFCLR',  'BF_MOD', 'U', ea0=BFW, nfix=1)
+add('1110 1101 11.. ....', 'BFFFO',  'BF_EXT', 'U', ea0=BFR, nfix=1)
+add('1110 1110 11.. ....', 'BFSET',  'BF_MOD', 'U', ea0=BFW, nfix=1)
+add('1110 1111 11.. ....', 'BFINS',  'BF_MOD', 'U', ea0=BFW, nfix=1)
 
 # ---------------------------------------------------------------- line F
 add('1111 0010 00.. ....', 'FPP',     'FPU_GEN', 'U', ea0=ALL, nfix=1)
@@ -277,11 +281,12 @@ add('1111 0101 0001 0...', 'PFLUSHAN', 'PFLUSH', 'U', priv=True)
 add('1111 0101 0001 1...', 'PFLUSHA',  'PFLUSH', 'U', priv=True)
 add('1111 0101 0100 1...', 'PTESTW',   'PTEST',  'U', priv=True)
 add('1111 0101 0110 1...', 'PTESTR',   'PTEST',  'U', priv=True)
-add('1111 0110 0000 0...', 'MOVE16', 'MOVE16_AXABS', 'U', imm='L')
-add('1111 0110 0000 1...', 'MOVE16', 'MOVE16_ABSAX', 'U', imm='L')
-add('1111 0110 0001 0...', 'MOVE16', 'MOVE16_AXABS', 'U', imm='L')
-add('1111 0110 0001 1...', 'MOVE16', 'MOVE16_ABSAX', 'U', imm='L')
-add('1111 0110 0010 0...', 'MOVE16', 'MOVE16_AXAY', 'U', nfix=1)
+# MOVE16: fea=3, D1 builds (Ay)+/(Ay)/abs.L operands; one routine
+add('1111 0110 0000 0...', 'MOVE16', 'MOVE16', 'U', imm='L', fea=3)
+add('1111 0110 0000 1...', 'MOVE16', 'MOVE16', 'U', imm='L', fea=3)
+add('1111 0110 0001 0...', 'MOVE16', 'MOVE16', 'U', imm='L', fea=3)
+add('1111 0110 0001 1...', 'MOVE16', 'MOVE16', 'U', imm='L', fea=3)
+add('1111 0110 0010 0...', 'MOVE16', 'MOVE16', 'U', nfix=1, fea=3)
 
 
 def bits_match(op):

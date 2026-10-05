@@ -232,6 +232,7 @@ function automatic logic jcond(input logic [4:0] jc, input logic [3:0] e0,
 		JC_SZ_L:     jcond = (s == SZ_L);
 		JC_AY7:      jcond = (ry == 3'd7);
 		JC_BOTH_MEM: jcond = m0 && m1;
+		JC_MASK0:    jcond = (ext1 == 16'd0);
 		JC_CREG_RF:  jcond = (ext1[11:0] == 12'h800) || (ext1[11:0] == 12'h803) ||
 		                     (ext1[11:0] == 12'h804);
 		default:     jcond = 1'b0;
@@ -298,6 +299,32 @@ always_comb begin
 		nrec.fimm = {w_p0[2], w_p0[3], w_p0[4], win[3'(p0 + 5)]};
 		nrec.ea1 = mk_ea(pla.ea1v ? i1 : EM_NONE, opw[11:9], p1, 3'd0,
 		                 w_p1[0], w_p1[1], w_p1[2], w_p1[3], w_p1[4]);
+		// fixed operand forms: (Ay)+,(Ax)+ and -(Ay),-(Ax); MOVE16
+		if (pla.fea == 2'd3) begin
+			nrec.ea0 = '0;
+			nrec.ea1 = '0;
+			if (opw[5]) begin
+				// MOVE16 (Ax)+,(Ay)+
+				nrec.ea0.m = EM_AIP; nrec.ea0.r = opw[2:0];
+				nrec.ea1.m = EM_AIP; nrec.ea1.r = win[1][14:12];
+			end
+			else begin
+				ea_t ra, aa;
+				ra = '0; aa = '0;
+				ra.m = opw[4] ? EM_AI : EM_AIP; ra.r = opw[2:0];
+				aa.m = EM_ABSL; aa.bd = {win[1], win[2]};
+				nrec.ea0 = opw[3] ? aa : ra;
+				nrec.ea1 = opw[3] ? ra : aa;
+			end
+		end
+		else if (pla.fea != 2'd0) begin
+			nrec.ea0   = '0;
+			nrec.ea1   = '0;
+			nrec.ea0.m = (pla.fea == 2'd1) ? EM_AIP : EM_APD;
+			nrec.ea1.m = (pla.fea == 2'd1) ? EM_AIP : EM_APD;
+			nrec.ea0.r = opw[2:0];
+			nrec.ea1.r = opw[11:9];
+		end
 
 		if (!legal) begin
 			// illegal / unimplemented operation word

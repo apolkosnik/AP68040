@@ -150,7 +150,10 @@ localparam logic [6:0]
 	OP_BFSET = 7'd53,  // bit field offset/width setup
 	OP_MISC  = 7'd54,  // WB-side operation in cond (RESET, STOP, NOP, CINV...)
 	OP_FPU   = 7'd55,  // floating point, see the FPU interface
-	OP_CHKSR = 7'd56;  // privilege/format checks for RTE etc (cond)
+	OP_CHKSR = 7'd56,  // privilege/format checks for RTE etc (cond)
+	OP_CAS2C = 7'd57,  // CAS2 compare: cond 0 first pair, 1 second (if equal so far)
+	OP_CAS2W = 7'd58,  // CAS2 store: cond 0 A only if equal, 1 equal ? A : B
+	OP_CAS2R = 7'd59;  // CAS2 register: B merged with A unless equal
 
 typedef struct packed {
 	logic [31:0] pc;        // address of the 68040 instruction
@@ -168,7 +171,8 @@ typedef struct packed {
 	logic        a_sxw;     // sign-extend operand A from a word
 	logic  [1:0] b_src;
 	logic  [4:0] b_reg;
-	logic [31:0] imm;
+	logic [31:0] imm;       // operand A immediate (or a constant)
+	logic [31:0] imm_b;     // operand B immediate
 	// address generation: EA = base + idx*scale + disp
 	logic        ag;        // compute an effective address
 	logic        base_v;
@@ -190,6 +194,7 @@ typedef struct packed {
 	logic  [1:0] msz;
 	logic  [1:0] mfc;
 	logic        mlock;
+	logic        mlocke;    // last transfer of the locked sequence
 	logic        mprog;     // program space (PC-relative operand)
 	// result
 	logic        d_v;

@@ -63,6 +63,8 @@ module ap68040_biu
 	output logic  [1:0]       errbeat,
 	output logic              idle,     // no transaction latched or running
 
+	input  logic              unlock,   // abandon an open locked sequence
+
 	// RESET instruction
 	input  logic              rsto_req,  // pulse
 	output logic              rsto_busy,
@@ -158,6 +160,7 @@ wire        can_own  = owner || (!bg_n && bb_n_i);
 
 logic [9:0] rsto_cnt;
 logic       rsto_pend;   // a RESET request waiting for a bus clock
+logic       unlock_pend;
 
 always_ff @(posedge clk) begin
 	gnt    <= '0;
@@ -202,9 +205,15 @@ always_ff @(posedge clk) begin
 		rsto_n    <= 1'b1;
 		rsto_cnt  <= '0;
 		rsto_pend <= 1'b0;
+		unlock_pend <= 1'b0;
 	end
 	else begin
 		if (rsto_req) rsto_pend <= 1'b1;
+		if (unlock) unlock_pend <= 1'b1;
+		if ((unlock || unlock_pend) && st == S_IDLE) begin
+			locked      <= 1'b0;
+			unlock_pend <= 1'b0;
+		end
 		if (bclk_en) begin
 			// RESET instruction: RSTO for 512 bus clocks
 			if (rsto_cnt != 0) begin

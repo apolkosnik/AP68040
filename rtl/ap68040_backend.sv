@@ -61,6 +61,7 @@ module ap68040_backend
 	output logic  [1:0] dm_msz,
 	output logic  [2:0] dm_fc,
 	output logic        dm_lock,
+	output logic        dm_locke,
 	output logic        dm_super,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        adv_dc1,        // DC1 -> DC2
@@ -237,7 +238,7 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 endfunction
 
 wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm, 1'b0);
+wire [31:0] ag_b = opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm_b, 1'b0);
 
 // memory request to the DMU, issued as the uop leaves AG
 logic s_bit;
@@ -247,6 +248,7 @@ assign dm_va      = ag_maddr;
 assign dm_mem     = ag_u.mem;
 assign dm_msz     = ag_u.msz;
 assign dm_lock    = ag_u.mlock;
+assign dm_locke   = ag_u.mlocke;
 assign dm_super   = (ag_u.mfc == MFC_SUP) ? 1'b1 : s_bit;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 always_comb begin
@@ -366,6 +368,81 @@ end
 // latch for CAS / bit fields
 logic [31:0] ex_latch;
 
+//--------------------------------------------------------------------------
+// bit field unit.  BFSET latched the offset (bf_off) and width (bf_w,
+// 1..32).  Register form (cond[3] = 0): the field is in B, numbered from
+// bit 31, wrapping.  Memory form: B is the long word at EA + offset/8 and
+// ex_latch[7:0] the byte after it; the field starts offset & 7 bits in.
+// A is the BFINS source.  Flags come from the field, for BFINS from the
+// inserted value.
+//--------------------------------------------------------------------------
+logic [31:0] bf_off;
+logic  [5:0] bf_w;
+logic  [7:0] bf_lonew;          // memory form: the new byte after the long
+logic [31:0] bf_res;
+logic  [7:0] bf_lo_out;
+logic  [4:0] bf_flags;
+always_comb begin
+	logic [4:0]  o;
+	logic [31:0] top, rot, fld, ins_top, nrot, nreg, zf;
+	logic [39:0] win, mask40, ins40, nwin;
+	logic [5:0]  lz;
+	logic        nflag, zflag;
+	logic [2:0]  t;
+	t   = ex_u.cond[2:0];
+	top = (bf_w == 6'd32) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> bf_w);
+	ins_top = (bf_w == 6'd32) ? ex_av : (ex_av << (6'd32 - bf_w));
+	if (!ex_u.cond[3]) begin
+		o   = bf_off[4:0];
+		rot = (ex_bv << o) | ((o == 5'd0) ? 32'd0 : (ex_bv >> (6'd32 - {1'b0, o})));
+		win = '0; mask40 = '0; ins40 = '0;
+	end
+	else begin
+		o   = {2'b00, bf_off[2:0]};
+		win = {ex_bv, ex_latch[7:0]};
+		rot = win[39:8] << o | ({24'd0, win[7:0]} >> (6'd8 - {1'b0, o}));
+		mask40 = {top, 8'h00} >> o;
+		ins40  = {ins_top, 8'h00} >> o;
+	end
+	fld = (bf_w == 6'd32) ? rot : (rot >> (6'd32 - bf_w));
+	case (t)
+		3'd2: nrot = rot ^ top;                     // BFCHG
+		3'd4: nrot = rot & ~top;                    // BFCLR
+		3'd6: nrot = rot | top;                     // BFSET
+		default: nrot = (rot & ~top) | (ins_top & top);   // BFINS
+	endcase
+	nreg = (nrot >> o) | ((o == 5'd0) ? 32'd0 : (nrot << (6'd32 - {1'b0, o})));
+	case (t)
+		3'd2: nwin = win ^ mask40;
+		3'd4: nwin = win & ~mask40;
+		3'd6: nwin = win | mask40;
+		default: nwin = (win & ~mask40) | (ins40 & mask40);
+	endcase
+	// leading zeros of the field (FFO)
+	zf = rot & top;
+	lz = bf_w;
+	for (int i = 0; i < 32; i++)
+		if (zf[i] && (6'(31 - i) < lz)) lz = 6'(31 - i);
+	if (t == 3'd7) begin
+		nflag = ins_top[31];
+		zflag = (ins_top & top) == 32'd0;
+	end
+	else begin
+		nflag = rot[31];
+		zflag = zf == 32'd0;
+	end
+	bf_flags = {ccr_f[4], nflag, zflag, 1'b0, 1'b0};
+	bf_lo_out = nwin[7:0];
+	case (t)
+		3'd1: bf_res = fld;                                            // BFEXTU
+		3'd3: bf_res = (bf_w == 6'd32) ? fld :                         // BFEXTS
+		               (fld | (rot[31] ? (32'hFFFF_FFFF << bf_w) : 32'd0));
+		3'd5: bf_res = bf_off + {26'd0, lz};                           // BFFFO
+		3'd0: bf_res = ex_bv;                                          // BFTST
+		default: bf_res = ex_u.cond[3] ? nwin[39:8] : nreg;
+	endcase
+end
+
 // CHK2/CMP2 lower-bound result kept between the two uops
 logic        chk2_lo_lt, chk2_lo_eq;
 
@@ -440,29 +517,23 @@ always_comb begin
 		end
 		OP_TRAPCC: if (alu_trap) ex_xvec = 8'd7;
 		OP_CHK:    if (alu_trap) ex_xvec = 8'd6;
-		OP_CHK2A, OP_CHK2B: begin
-			// b = value, a = bound; cond[1] signed compare
-			logic lt, eq, oob;
-			logic [32:0] d;
-			logic [31:0] am2, bm2;
-			am2 = ex_av; bm2 = ex_bv;
+		OP_CHK2B: begin
+			// WinUAE i_CHK2: signed compares of the sign-extended bounds
+			// (lower in ex_latch, upper in A) with B, which is sign-extended
+			// only when it is a data register (cond[1]); the 68040 leaves N, V
+			logic signed [31:0] lo, up, rg;
+			logic z, c;
 			case (ex_u.sz)
-				SZ_B: begin am2 = ex_u.cond[1] ? {{24{ex_av[7]}},  ex_av[7:0]}  : {24'd0, ex_av[7:0]};
-				            bm2 = ex_u.cond[1] ? {{24{ex_bv[7]}},  ex_bv[7:0]}  : {24'd0, ex_bv[7:0]}; end
-				SZ_W: begin am2 = ex_u.cond[1] ? {{16{ex_av[15]}}, ex_av[15:0]} : {16'd0, ex_av[15:0]};
-				            bm2 = ex_u.cond[1] ? {{16{ex_bv[15]}}, ex_bv[15:0]} : {16'd0, ex_bv[15:0]}; end
-				default: ;
+				SZ_B: begin lo = {{24{ex_latch[7]}}, ex_latch[7:0]}; up = {{24{ex_av[7]}}, ex_av[7:0]};
+				            rg = ex_u.cond[1] ? {{24{ex_bv[7]}}, ex_bv[7:0]} : ex_bv; end
+				SZ_W: begin lo = {{16{ex_latch[15]}}, ex_latch[15:0]}; up = {{16{ex_av[15]}}, ex_av[15:0]};
+				            rg = ex_u.cond[1] ? {{16{ex_bv[15]}}, ex_bv[15:0]} : ex_bv; end
+				default: begin lo = ex_latch; up = ex_av; rg = ex_bv; end
 			endcase
-			eq = (am2 == bm2);
-			lt = ex_u.cond[1] ? ($signed(bm2) < $signed(am2)) : (bm2 < am2);
-			ex_res   = ex_bv;
-			ex_dkill = 1'b1;
-			if (ex_u.op == OP_CHK2B) begin
-				// out of bounds: value < lower or value > upper
-				oob = chk2_lo_lt || (!lt && !eq);
-				ex_flags = {ccr_f[4], ccr_f[3], chk2_lo_eq || eq, ccr_f[1], oob};
-				if (oob && ex_u.cond[0]) ex_xvec = 8'd6;
-			end
+			z = (up == rg) || (lo == rg);
+			c = !z && ((lo <= up) ? ((rg < lo) || (rg > up)) : ((rg > up) && (rg < lo)));
+			ex_flags = {ccr_f[4], ccr_f[3], z, ccr_f[1], c};
+			if (ex_u.cond[0] && c) ex_xvec = 8'd6;
 		end
 		OP_CCRLOG: ex_res = ex_bv;
 		OP_SRLOG: begin
@@ -486,6 +557,19 @@ always_comb begin
 		end
 		OP_SPW: ex_res = ex_av;
 		OP_LATCH: ex_res = ex_av;
+		OP_CAS2C: begin
+			if (!ex_u.cond[0] || cas2_eq) ex_flags = cmp_flags;
+			else ex_flags = ccr_f;
+		end
+		OP_CAS2R: begin
+			ex_res   = (ex_av & ex_szm) | (ex_bv & ~ex_szm);
+			ex_dkill = cas2_eq;
+		end
+		OP_BF: begin
+			ex_res   = bf_res;
+			ex_flags = bf_flags;
+		end
+		OP_BFSET: ex_res = ex_u.cond[0] ? {24'd0, bf_lonew} : {{3{ex_av[31]}}, ex_av[31:3]};
 		OP_CAS: begin
 			// compare memory (B) with Dc (latch); equal: store Du (A),
 			// else: Dc = memory and the memory value is written back
@@ -518,12 +602,31 @@ ap68040_alu cas_alu (
 );
 wire cas_eq = cas_flags[2];
 
-// store data
+// compare B - A (CAS2)
+logic [31:0] cmp_res;
+logic  [4:0] cmp_flags;
+logic        cmp_cc, cmp_tr;
+ap68040_alu cmp_alu (
+	.op(OP_CMP), .sz(ex_u.sz), .cond(4'd0),
+	.a(ex_av), .b(ex_bv), .ea(32'd0), .flags_in(ccr_f),
+	.res(cmp_res), .flags_out(cmp_flags), .cc_true(cmp_cc), .trap(cmp_tr)
+);
+logic        cas2_eq;           // CAS2: both pairs equal so far
+wire  [31:0] ex_szm = (ex_u.sz == SZ_B) ? 32'h0000_00FF :
+                      (ex_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
+
+// store data, and stores the EX op cancels
+logic ex_stkill;
 always_comb begin
-	if (ex_u.op == OP_CAS)
-		ex_st = cas_eq ? ex_av : ex_bv;
-	else
-		ex_st = ex_res;
+	ex_stkill = 1'b0;
+	case (ex_u.op)
+		OP_CAS:  ex_st = cas_eq ? ex_av : ex_bv;
+		OP_CAS2W: begin
+			ex_st     = (ex_u.cond[0] && !cas2_eq) ? ex_bv : ex_av;
+			ex_stkill = !ex_u.cond[0] && !cas2_eq;
+		end
+		default: ex_st = ex_res;
+	endcase
 end
 
 // mispredict: the actual path differs from the one the front end took
@@ -536,7 +639,7 @@ wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
 wire ex_d_eff = ex_u.d_v && !ex_dkill && !(ex_u.op == OP_CAS && cas_eq);
 assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && (ex_u.exc == 8'd0);
 assign exw_reg = ex_u.d_reg;
-assign exw_val = (ex_u.op == OP_CAS) ? ex_bv : ex_res;
+assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
 
 //--------------------------------------------------------------------------
 // WB
@@ -588,7 +691,11 @@ always_ff @(posedge clk) begin
 		md_lol  <= 32'd0;
 		md_ovfl <= 1'b0;
 		ex_latch <= 32'd0;
+		bf_off   <= 32'd0;
+		bf_w     <= 6'd32;
+		bf_lonew <= 8'd0;
 		chk2_lo_lt <= 1'b0; chk2_lo_eq <= 1'b0;
+		cas2_eq <= 1'b0;
 		ipl_q   <= 3'd0;
 		nmi_edge <= 1'b0;
 		nmi_seen <= 1'b0;
@@ -679,13 +786,22 @@ always_ff @(posedge clk) begin
 		if (exw_v) rf_f[exw_reg] <= exw_val;
 		if (adv_ex) begin
 			wb_u        <= ex_u;
-			wb_res      <= (ex_u.op == OP_CAS) ? ex_bv : ex_res;
+			wb_res      <= exw_val;
 			wb_dwe      <= ex_d_eff;
 			wb_upd_val  <= ex_upd;
 			wb_upd2_val <= ex_upd2;
-			wb_st       <= (ex_u.mem == M_ST || ex_u.mem == M_RMW);
+			wb_st       <= (ex_u.mem == M_ST || ex_u.mem == M_RMW) && !ex_stkill;
+			if (ex_u.op == OP_CAS2C)
+				cas2_eq <= ex_u.cond[0] ? (cas2_eq && cmp_flags[2]) : cmp_flags[2];
 			wb_st_data  <= ex_st;
-			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we;
+			// a store into the instruction stream just ahead (the fetch
+			// queue and the instructions in flight) refetches after itself:
+			// the 68040 does not promise this, the previous core's AmigaOS
+			// boot depended on it (t_integer 192)
+			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we ||
+			               ((ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
+			                ((ex_ea[31:6] == ex_u.npc[31:6]) ||
+			                 (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1)));
 			wb_redir_pc <= ex_mispred ? ex_next : ex_u.npc;
 			wb_sr_we    <= ex_sr_we;
 			wb_sr_new   <= ex_sr_new;
@@ -714,26 +830,18 @@ always_ff @(posedge clk) begin
 			else wb_ccr <= ccr_f;
 			if (ex_u.op == OP_MDHI)  md_hiin  <= ex_av;
 			if (ex_u.op == OP_LATCH) ex_latch <= ex_av;
-			if (ex_u.op == OP_CHK2A) begin
-				logic [31:0] am2, bm2;
-				am2 = ex_av; bm2 = ex_bv;
-				case (ex_u.sz)
-					SZ_B: begin am2 = ex_u.cond[1] ? {{24{ex_av[7]}},  ex_av[7:0]}  : {24'd0, ex_av[7:0]};
-					            bm2 = ex_u.cond[1] ? {{24{ex_bv[7]}},  ex_bv[7:0]}  : {24'd0, ex_bv[7:0]}; end
-					SZ_W: begin am2 = ex_u.cond[1] ? {{16{ex_av[15]}}, ex_av[15:0]} : {16'd0, ex_av[15:0]};
-					            bm2 = ex_u.cond[1] ? {{16{ex_bv[15]}}, ex_bv[15:0]} : {16'd0, ex_bv[15:0]}; end
-					default: ;
-				endcase
-				chk2_lo_eq <= (am2 == bm2);
-				chk2_lo_lt <= ex_u.cond[1] ? ($signed(bm2) < $signed(am2)) : (bm2 < am2);
+			if (ex_u.op == OP_BFSET && !ex_u.cond[0]) begin
+				bf_off <= ex_av;
+				bf_w   <= (ex_bv[4:0] == 5'd0) ? 6'd32 : {1'b0, ex_bv[4:0]};
 			end
+			if (ex_u.op == OP_BF) bf_lonew <= bf_lo_out;
 		end
 		if (md_done) begin
 			md_rem  <= md_hi;
 			md_lol  <= md_lo;
 		end
 		// overflow of the uop leaving EX (word forms check 16 bits)
-		if (adv_ex && ex_u.op == OP_DIV) md_ovfl <= md_dkill;
+		if (adv_ex && (ex_u.op == OP_DIV || ex_u.op == OP_MUL)) md_ovfl <= (ex_u.op == OP_DIV) && md_dkill;
 		if (!stall_wb) wb_v <= adv_ex;
 
 		//------------------------------------------------------------------
@@ -797,7 +905,7 @@ always_ff @(posedge clk) begin
 				if (wb_dwe)        rf_b[wb_u.d_reg]   <= wb_res;
 				ccr_b <= wb_ccr;
 				if (wb_u.op == OP_SPW) begin
-					case (wb_u.imm[7:0])
+					case (wb_u.imm_b[7:0])
 						8'h00: sfc_r  <= wb_res[2:0];
 						8'h01: dfc_r  <= wb_res[2:0];
 						8'h02: cacr_r <= wb_res & 32'h8000_8000;

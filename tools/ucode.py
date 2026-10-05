@@ -40,12 +40,13 @@ OUT = os.path.join(HERE, '..', 'rtl', 'gen')
 OPS = {n: i for i, n in enumerate("""MOV ADD ADDX SUB SUBX CMP AND OR EOR NOT NEG
 NEGX CLR EXT EXTB SWAP TAS ABCD SBCD NBCD PACK UNPK ASL ASR LSL LSR ROL ROR
 ROXL ROXR BTST BCHG BCLR BSET SCC EA BCC DBCC TRAPCC CHK CHK2A CHK2B CCRLOG
-SRLOG SPR SPW LATCH CAS MUL DIV MDHI MDRES BF BFSET MISC FPU CHKSR""".split())}
+SRLOG SPR SPW LATCH CAS MUL DIV MDHI MDRES BF BFSET MISC FPU CHKSR CAS2C
+CAS2W CAS2R""".split())}
 
 SYM = ['NONE', 'EA0', 'EA1', 'EA1R', 'DX', 'DY', 'AX', 'AY', 'IMM', 'QUICK',
        'MOVEQ', 'SHCNT', 'SP', 'SSP', 'NPC', 'PC', 'ZERO', 'CONST', 'X1R',
        'X1DL', 'X1DH', 'X1DU', 'X2DC', 'X2DU', 'X2R', 'MVR', 'EA0R', 'LD',
-       'CREG', 'CREGR']
+       'CREG', 'CREGR', 'BFO', 'BFW']
 SYMI = {n: i for i, n in enumerate(SYM)}
 assert len(SYM) <= 32
 
@@ -77,18 +78,19 @@ def sel(x):
 #   ADDC     agw = agb + disp
 #   LEA0     agw = address of EA0, no access
 #   MOVEM    MOVEM transfer (offset from the sequencer)
+#   ADDT0    agw = agb + T0 (bit field byte offset)
 AGM = {n: i for i, n in enumerate(
     ['NONE', 'EA0', 'EA1', 'PUSH', 'POP', 'BASED', 'BASEDU', 'VAL0', 'ADDV',
-     'ADDC', 'LEA0', 'MOVEM', 'POPR'])}
+     'ADDC', 'LEA0', 'MOVEM', 'POPR', 'ADDT0'])}
 DSEL = {n: i for i, n in enumerate(['CONST', 'IMM', 'NIMM', 'QUICK', 'NQUICK',
-                                    'IMMC'])}
+                                    'IMMC', 'SZB'])}
 MEM = {None: 0, 'LD': 1, 'ST': 2, 'RMW': 3}
 MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3}
 BR = {None: 0, 'COND': 1, 'IMM': 2, 'EA': 3, 'A': 4, 'B': 5}
 # condition sources: opword cc (11:8), the opcode entry's, the extension
 # word's ({ext[10], ext[11]}: 64-bit, signed), or a constant
-CSRC = {'CC': 1, 'EC': 2, 'X1': 3}
-SZ = {'S': 0, 'B': 1, 'W': 2, 'L': 3}
+CSRC = {'CC': 1, 'EC': 2, 'X1': 3, 'BFR': 4, 'BFM': 5, 'CHK2': 6}
+SZ = {'S': 0, 'B': 1, 'W': 2, 'L': 3, 'Q': 4}
 SXW = {None: 0, 1: 1, 'SW': 2}
 # static sequencer conditions (evaluated in D2 on the decoded instruction)
 JC = {n: i for i, n in enumerate(
@@ -102,7 +104,7 @@ class U:
     FIELDS = dict(op=None, sz='S', msz='S', cond=None, ccr=None,
                   a=None, b=None, d=None, sxw=None,
                   ag=None, agb=None, agw=None, dsel='CONST', const=0,
-                  mem=None, mfc=None, lock=0, br=None, last=0, ser=0,
+                  mem=None, mfc=None, lock=0, locke=0, br=None, last=0, ser=0,
                   noupd=0, upd2=0, jc='NEVER', jt=None, loop=0)
 
     def __init__(self, **kw):
@@ -150,7 +152,7 @@ R('SCC',       U(op='SCC', cond='CC', b='EA0R', d='EA0', last=1))
 R('SWAP',      U(op='SWAP', b='DY', d='DY', ccr='NZVC', last=1))
 R('EXT',       U(op='EXT', b='DY', d='DY', ccr='NZVC', last=1))
 R('EXTB',      U(op='EXTB', b='DY', d='DY', ccr='NZVC', last=1))
-R('TAS',       U(op='TAS', b='EA0', d='EA0', lock=1, ccr='NZVC', last=1))
+R('TAS',       U(op='TAS', b='EA0', d='EA0', lock=1, locke=1, ccr='NZVC', last=1))
 
 # address-register arithmetic: register/immediate sources run in AG
 R('ADDA',
@@ -313,11 +315,115 @@ R('MOVEC_WR',
   U(op='SPW', sz='L', a='X1R', b='CREG', ser=1, last=1),
   U(op='MOV', sz='L', a='X1R', d='CREGR', ser=1, last=1))
 
-for n in ['MOVES', 'CHK2', 'CAS', 'CAS2', 'MOVEP_MR', 'MOVEP_RM', 'MOVEM_RM',
-          'MOVEM_MR', 'RTE', 'RTR', 'BF', 'FPU_GEN',
+# MOVEM: one micro-instruction repeated per register (D2 loop); an empty
+# mask transfers nothing and leaves An alone
+R('MOVEM_RM',
+  U(jc='MASK0', jt='MOVEM_RM.2'),
+  U(op='MOV', a='MVR', d='EA0', loop=1, last=1),
+  U(last=1))
+R('MOVEM_MR',
+  U(jc='MASK0', jt='MOVEM_MR.2'),
+  U(op='MOV', sz='L', msz='S', sxw='SW', a='EA0', d='MVR', loop=1, last=1),
+  U(last=1))
+
+# MOVE16: a line read into the DMU's line buffer, then a line write; the
+# source update is deferred into the write
+R('MOVE16',
+  U(op='MOV', sz='L', msz='Q', a='EA0', noupd=1),
+  U(op='MOV', sz='L', msz='Q', d='EA1', upd2=1, last=1))
+
+# MOVEP: bytes at d16(Ay) + 0, 2 (, 4, 6), most significant first
+def _mpb(k, **kw):
+    return U(op='MOV', sz='B', msz='B', ag='BASED', agb='AY', dsel='IMMC',
+             const=2 * k, **kw)
+R('MOVEP_MR',
+  _mpb(0, a='LD', b='ZERO', d='T0'),
+  U(op='LSL', sz='L', a='CONST', const=8, b='T0', d='T0'),
+  _mpb(1, a='LD', b='T0', d='T0'),
+  U(jc='SZ_L', jt='MOVEP_MR.5'),
+  U(op='MOV', sz='W', a='T0', b='DX', d='DX', last=1),
+  U(op='LSL', sz='L', a='CONST', const=8, b='T0', d='T0'),
+  _mpb(2, a='LD', b='T0', d='T0'),
+  U(op='LSL', sz='L', a='CONST', const=8, b='T0', d='T0'),
+  _mpb(3, a='LD', b='T0', d='T0'),
+  U(op='MOV', sz='L', a='T0', d='DX', last=1))
+R('MOVEP_RM',
+  U(jc='SZ_L', jt='MOVEP_RM.4'),
+  U(op='LSR', sz='L', a='CONST', const=8, b='DX', d='T0'),
+  _mpb(0, a='T0', mem='ST'),
+  _mpb(1, a='DX', mem='ST', last=1),
+  U(op='LSR', sz='L', a='CONST', const=24, b='DX', d='T0'),
+  _mpb(0, a='T0', mem='ST'),
+  U(op='LSR', sz='L', a='CONST', const=16, b='DX', d='T0'),
+  _mpb(1, a='T0', mem='ST'),
+  U(op='LSR', sz='L', a='CONST', const=8, b='DX', d='T0'),
+  _mpb(2, a='T0', mem='ST'),
+  _mpb(3, a='DX', mem='ST', last=1))
+
+# bit fields.  BFSET latches offset (BFO) and width (BFW) in EX and returns
+# the signed byte offset of the field (offset >> 3).  The memory form works
+# on a five-byte window: T2 = long at EA + offset/8, T3 = the next byte.
+# cond 'BFR'/'BFM' = opword 10:8 with the memory flag clear/set.
+_BFSETUP = U(op='BFSET', cond=0, sz='L', a='BFO', b='BFW', d='T0')
+def _bf_mem_load():
+    return [U(ag='LEA0', agw='T1'),
+            U(ag='ADDT0', agb='T1', agw='T1'),
+            U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='T1', const=0),
+            U(op='MOV', sz='B', msz='B', a='LD', b='ZERO', d='T3', ag='BASED', agb='T1', const=4),
+            U(op='LATCH', sz='L', a='T3')]
+R('BF_TST',
+  U(jc='EA0_DN', jt='BF_TST.8'),
+  _BFSETUP, *_bf_mem_load(),
+  U(op='BF', cond='BFM', a='X1DL', b='T2', ccr='NZVC', last=1),
+  _BFSETUP,
+  U(op='BF', cond='BFR', a='X1DL', b='EA0', ccr='NZVC', last=1))
+R('BF_EXT',
+  U(jc='EA0_DN', jt='BF_EXT.8'),
+  _BFSETUP, *_bf_mem_load(),
+  U(op='BF', cond='BFM', a='X1DL', b='T2', d='X1DL', ccr='NZVC', last=1),
+  _BFSETUP,
+  U(op='BF', cond='BFR', a='X1DL', b='EA0', d='X1DL', ccr='NZVC', last=1))
+R('BF_MOD',
+  U(jc='EA0_DN', jt='BF_MOD.11'),
+  _BFSETUP, *_bf_mem_load(),
+  U(op='BF', cond='BFM', a='X1DL', b='T2', d='T2', ccr='NZVC'),
+  U(op='BFSET', cond=1, sz='L', d='T3'),
+  U(op='MOV', sz='L', msz='L', a='T2', mem='ST', ag='BASED', agb='T1', const=0),
+  U(op='MOV', sz='B', msz='B', a='T3', mem='ST', ag='BASED', agb='T1', const=4, last=1),
+  _BFSETUP,
+  U(op='BF', cond='BFR', a='X1DL', b='EA0', d='EA0', ccr='NZVC', last=1))
+
+# CAS Dc,Du,<ea>: a locked read-modify-write.  The 68040 always writes:
+# Du on a match, the value read on a mismatch (then Dc = that value).
+R('CAS',
+  U(op='LATCH', sz='L', a='X1DH'),
+  U(op='CAS', a='X1DU', b='EA0', d='X1DH', mem='RMW', ag='EA0', lock=1, locke=1,
+    ccr='NZVC', last=1))
+# CAS2: two locked reads, the compare leaves eq in EX; the first write
+# only on a match, the second always (Du2 or the second value read, with
+# LOCKE); on a mismatch Dc1/Dc2 take the values read
+R('CAS2',
+  U(op='MOV', a='LD', d='T0', ag='BASED', agb='X1R', lock=1),
+  U(op='MOV', a='LD', d='T1', ag='BASED', agb='X2R', lock=1),
+  U(op='CAS2C', cond=0, a='X1DH', b='T0', ccr='NZVC'),
+  U(op='CAS2C', cond=1, a='X2DC', b='T1', ccr='NZVC'),
+  U(op='CAS2W', cond=0, a='X1DU', mem='ST', ag='BASED', agb='X1R', lock=1),
+  U(op='CAS2W', cond=1, a='X2DU', b='T1', mem='ST', ag='BASED', agb='X2R', lock=1, locke=1),
+  U(op='CAS2R', a='T0', b='X1DH', d='X1DH'),
+  U(op='CAS2R', a='T1', b='X2DC', d='X2DC', last=1))
+
+# CHK2/CMP2 <ea>,Rn: bounds at EA and EA + size; cond 'CHK2' carries
+# {Rn is a data register, CHK2}
+R('CHK2',
+  U(ag='LEA0', agw='T1'),
+  U(op='MOV', sz='L', a='LD', d='T0', ag='BASED', agb='T1', const=0),
+  U(op='MOV', sz='L', a='LD', d='T2', ag='BASED', agb='T1', dsel='SZB'),
+  U(op='LATCH', sz='L', a='T0'),
+  U(op='CHK2B', cond='CHK2', a='T2', b='X1R', ccr='ZC', last=1))
+
+for n in ['MOVES', 'RTE', 'RTR', 'FPU_GEN',
           'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC', 'FSAVE', 'FRESTORE',
-          'CACHE_OP', 'PFLUSH', 'PTEST', 'MOVE16_AXABS', 'MOVE16_ABSAX',
-          'MOVE16_AXAY']:
+          'CACHE_OP', 'PFLUSH', 'PTEST']:
     R(n, U(last=1))
 
 # exception routines.  At entry the back end has set S, cleared T, and
@@ -423,16 +529,18 @@ def val(u, name):
         a=sel(f['a']), b=sel(f['b']), d=sel(f['d']), sxw=SXW[f['sxw']],
         ag=AGM[f['ag'] or 'NONE'], agb=sel(f['agb']), agw=sel(f['agw']),
         dsel=DSEL[f['dsel']], cval=f['const'] & 0xFFFF,
-        mem=MEM[f['mem']], mfc=MFC[f['mfc']], lock=f['lock'], br=BR[f['br']],
+        mem=MEM[f['mem']], mfc=MFC[f['mfc']], lock=f['lock'], locke=f['locke'],
+        br=BR[f['br']],
         last=f['last'], ser=f['ser'], noupd=f['noupd'], upd2=f['upd2'],
         jc=JC[f['jc']], jt=jt, loop=f['loop'])
     return v
 
 
-LAYOUT = [('op_inst', 1), ('op', 7), ('sz', 2), ('msz', 2), ('cond_inst', 2),
+LAYOUT = [('op_inst', 1), ('op', 7), ('sz', 2), ('msz', 3), ('cond_inst', 3),
           ('cond', 4), ('ccr_inst', 1), ('ccr', 5), ('a', 6), ('b', 6),
           ('d', 6), ('sxw', 2), ('ag', 4), ('agb', 6), ('agw', 6),
           ('dsel', 3), ('cval', 16), ('mem', 2), ('mfc', 2), ('lock', 1),
+          ('locke', 1),
           ('br', 3), ('last', 1), ('ser', 1), ('noupd', 1), ('upd2', 1),
           ('jc', 5), ('jt', 9), ('loop', 1)]
 WIDTH = sum(w for _, w in LAYOUT)
@@ -495,7 +603,7 @@ def emit():
                 '\tlogic [4:0] ccr;\n'
                 '\tlogic [1:0] szc;\n\tlogic [11:0] ea0m;\n\tlogic [11:0] ea1m;\n'
                 '\tlogic [1:0] nfix;\n\tlogic [2:0] immk;\n\tlogic priv;\n'
-                '\tlogic [4:0] jc0;\n\tlogic [8:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n'
+                '\tlogic [4:0] jc0;\n\tlogic [8:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n\tlogic [1:0] fea;\n'
                 '} pla_t;\n')
         f.write('function automatic pla_t dec_pla(input logic [15:0] op);\n')
         f.write("\tdec_pla = '0;\n\tcasez (op)\n")
@@ -514,11 +622,11 @@ def emit():
             if u0['jt'] is not None:
                 rn, k = u0['jt'].split('.')
                 jt0 = ENTRY[rn] + int(k)
-            f.write("\t\t16'b%s: dec_pla = '{1'b1, 9'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 5'd%d, 9'd%d, 1'b%d, 1'b%d};  // %s %s\n"
+            f.write("\t\t16'b%s: dec_pla = '{1'b1, 9'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 5'd%d, 9'd%d, 1'b%d, 1'b%d, 2'd%d};  // %s %s\n"
                     % (pat, ENTRY[e.rt], eop, ec or 0, 1 if ec is not None else 0,
                        ccr, SZC[e.sz], mask0, mask1, e.nfix, IMMK[e.imm],
                        1 if e.priv else 0, jc0, jt0, e.ea0 is not None,
-                       e.ea1 is not None, e.name, e.rt))
+                       e.ea1 is not None, e.fea, e.name, e.rt))
         f.write('\t\tdefault: ;\n\tendcase\nendfunction\n')
     print('ucode: %d words of %d bits, %d routines' % (len(ROM), WIDTH, len(ORDER)))
 

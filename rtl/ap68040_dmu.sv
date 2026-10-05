@@ -28,6 +28,7 @@ module ap68040_dmu
 	input  logic  [1:0] dm_msz,
 	input  logic  [2:0] dm_fc,
 	input  logic        dm_lock,
+	input  logic        dm_locke,
 	input  logic        dm_super,
 	input  logic        dm_noalloc,
 	input  logic        adv_dc1,
@@ -60,7 +61,8 @@ module ap68040_dmu
 	input  logic        b_done,
 	input  logic        b_err,
 	input  logic        b_rvalid,
-	input  logic [31:0] b_rdata
+	input  logic [31:0] b_rdata,
+	input  logic  [1:0] b_rbeat
 );
 
 //--------------------------------------------------------------------------
@@ -73,6 +75,7 @@ typedef struct packed {
 	logic  [1:0] msz;
 	logic  [2:0] fc;
 	logic        lock;
+	logic        locke;
 	logic        smode;
 	logic        noalloc;
 	logic  [1:0] cm;      // cache mode: 0 WT, 1 CB, 2 CI serialized, 3 CI
@@ -133,6 +136,8 @@ logic        q_err;
 logic        q_ld_done;     // DC2 load complete, data in ld_q
 logic [31:0] ld_q;
 logic        ld_fault;
+logic        q_line;        // the transfer is a MOVE16 line
+logic [31:0] lbuf [4];      // MOVE16 line buffer, by long word of the line
 
 logic  [1:0] p_siz;
 logic  [2:0] p_n;
@@ -175,22 +180,24 @@ logic st_done_q;
 always_comb begin
 	b_req  = (q_st == Q_REQ);
 	b_breq = '0;
-	b_breq.addr  = q_a;
-	b_breq.siz   = p_siz;
+	b_breq.addr  = q_line ? {q_a[31:4], 4'd0} : q_a;
+	b_breq.siz   = q_line ? SIZ_LINE : p_siz;
 	b_breq.rd    = !q_wr;
-	b_breq.tt    = (q_fc == 3'd1 || q_fc == 3'd2 || q_fc == 3'd5 || q_fc == 3'd6) ?
+	b_breq.tt    = q_line ? TT_MOVE16 :
+	               (q_fc == 3'd1 || q_fc == 3'd2 || q_fc == 3'd5 || q_fc == 3'd6) ?
 	               TT_NORMAL : TT_ALT;
 	b_breq.tm    = q_fc;
 	b_breq.upa   = q_upa;
 	b_breq.ci    = q_cm[1];
 	b_breq.lock  = q_lock;
-	b_breq.locke = q_lock && q_wr && (q_left == p_n);
-	b_wdata      = {96'd0, place(q_acc, p_n, q_a[1:0])};
+	b_breq.locke = q_lock && q_locke && q_wr && (q_left == p_n);
+	b_wdata      = q_line ? {lbuf[0], lbuf[1], lbuf[2], lbuf[3]} :
+	               {96'd0, place(q_acc, p_n, q_a[1:0])};
 end
 
 logic  [2:0] q_fc;
 logic  [1:0] q_upa, q_cm;
-logic        q_lock;
+logic        q_lock, q_locke;
 
 always_ff @(posedge clk) begin
 	st_rdy <= 1'b0;
@@ -208,7 +215,8 @@ always_ff @(posedge clk) begin
 		ld_fault <= 1'b0;
 		st_done_q <= 1'b0;
 		st_fault <= 1'b0;
-		q_fc <= '0; q_upa <= '0; q_cm <= '0; q_lock <= 1'b0;
+		q_fc <= '0; q_upa <= '0; q_cm <= '0; q_lock <= 1'b0; q_locke <= 1'b0;
+		q_line <= 1'b0;
 	end
 	else begin
 		//--------------------------------------------------------------
@@ -221,6 +229,7 @@ always_ff @(posedge clk) begin
 			m1.msz     <= dm_msz;
 			m1.fc      <= dm_fc;
 			m1.lock    <= dm_lock;
+			m1.locke   <= dm_locke;
 			m1.smode   <= dm_super;
 			m1.noalloc <= dm_noalloc;
 			m1.cm      <= req_cm;
@@ -256,6 +265,7 @@ always_ff @(posedge clk) begin
 		case (q_st)
 		Q_IDLE: begin
 			if (start_st) begin
+				q_line <= (m4.msz == SZ_Q);
 				q_wr   <= 1'b1;
 				q_a    <= m4.a;
 				q_left <= nbytes(m4.msz);
@@ -269,10 +279,12 @@ always_ff @(posedge clk) begin
 				q_upa  <= m4.upa;
 				q_cm   <= m4.cm;
 				q_lock <= m4.lock;
+				q_locke <= m4.locke;
 				q_err  <= 1'b0;
 				q_st   <= Q_REQ;
 			end
 			else if (start_ld) begin
+				q_line <= (m2.msz == SZ_Q);
 				q_wr   <= 1'b0;
 				q_a    <= m2.a;
 				q_left <= nbytes(m2.msz);
@@ -281,6 +293,7 @@ always_ff @(posedge clk) begin
 				q_upa  <= m2.upa;
 				q_cm   <= m2.cm;
 				q_lock <= m2.lock;
+				q_locke <= 1'b0;
 				q_err  <= 1'b0;
 				q_st   <= Q_REQ;
 			end
@@ -292,11 +305,16 @@ always_ff @(posedge clk) begin
 			end
 		end
 		Q_WAIT: begin
-			if (b_rvalid && !q_wr)
+			if (b_rvalid && !q_wr && q_line)
+				lbuf[b_rbeat] <= b_rdata;
+			else if (b_rvalid && !q_wr)
 				q_acc <= (q_acc << (8 * q_n)) | grab(b_rdata, q_n, q_a[1:0]);
 			if (b_err) begin
 				q_err <= 1'b1;
 				q_st  <= Q_DONE;
+			end
+			else if (b_done && q_line) begin
+				q_st <= Q_DONE;
 			end
 			else if (b_done) begin
 				if (q_wr) q_acc <= q_acc << (8 * q_n);
