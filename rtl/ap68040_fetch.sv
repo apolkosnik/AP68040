@@ -180,17 +180,17 @@ logic  [5:0]   c_raddr;
 logic          c_we;
 logic  [5:0]   c_waddr;
 logic  [1:0]   c_wway;
-logic [127:0]  c_wdata;
 logic [21:0]   c_wtag;
 logic [127:0]  cd [4];
 logic [23:0]   ct [4];
 
+logic [127:0] m_line;            // the line being filled (and the line buffer)
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
 		ap68040_sdp_be #(.AW(6), .NB(16), .OREG(0)) dram (
 			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
-			.wbe(16'hFFFF), .wdata(c_wdata), .raddr(c_raddr), .oce(1'b1), .q(cd[gw])
+			.wbe(16'hFFFF), .wdata(m_line), .raddr(c_raddr), .oce(1'b1), .q(cd[gw])
 		);
 		ap68040_sdp_be #(.AW(6), .NB(3), .OREG(0)) tram (
 			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
@@ -221,9 +221,8 @@ logic        f1_hit;
 atce_t       f1_e;
 
 // line buffer: the last line filled (it also serves TCI lines)
-logic        lb_v;
-logic [27:0] lb_pa;
-logic [127:0] lb_d;
+logic        lb_v;             // m_line holds the line at lb_pa (the last fill):
+logic [27:0] lb_pa;            // it is also the cache's write data
 
 // miss engine
 logic        b_req_r;          // request pending (not granted yet)
@@ -234,7 +233,6 @@ logic [31:0] m_pa;
 logic  [1:0] m_upa;
 logic        m_s, m_dem, m_ci, m_alloc;
 logic  [1:0] m_way;
-logic [127:0] m_line;
 
 // invalidation
 logic        inv_busy, inv_hold, inv_ph;
@@ -283,7 +281,7 @@ always_comb begin
 		if (iv[f1_pc[9:4]][i] && ct[i][21:0] == tg) begin x_hit = 1'b1; x_way = 2'(i); end
 	x_hit  = x_hit && x_cach;
 	x_lb   = x_cach && lb_v && lb_pa == x_pa[31:4];
-	x_chunk = x_lb ? lb_d[127 - 32 * f1_pc[3:2] -: 32]
+	x_chunk = x_lb ? m_line[127 - 32 * f1_pc[3:2] -: 32]
 	               : cd[x_way][127 - 32 * f1_pc[3:2] -: 32];
 end
 wire f1_go      = f1_v && !redir_any;
@@ -344,12 +342,12 @@ always_ff @(posedge clk) begin
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
 		for (int i = 0; i < 2; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
-		lb_v  <= 1'b0; lb_pa <= '0; lb_d <= '0;
+		lb_v  <= 1'b0; lb_pa <= '0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
 		m_alloc <= 1'b0; m_way <= '0; m_line <= '0;
 		iw_req <= 1'b0;
-		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wdata <= '0; c_wtag <= '0;
+		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
 		inv_busy <= 1'b0; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
 		inv_sn <= 1'b0; inv_scope <= '0; inv_pa <= '0;
@@ -446,6 +444,7 @@ always_ff @(posedge clk) begin
 				logic [3:0] vv;
 				vv = iv[f1_pc[9:4]];
 				st      <= S_FILL;
+				lb_v    <= 1'b0;          // its beats go into m_line
 				m_alloc <= 1'b1;
 				m_way   <= !vv[0] ? 2'd0 : !vv[1] ? 2'd1 : !vv[2] ? 2'd2 : !vv[3] ? 2'd3 : rr;
 				b_req_r <= 1'b1;
@@ -484,14 +483,12 @@ always_ff @(posedge clk) begin
 					c_we    <= 1'b1;
 					c_waddr <= m_pa[9:4];
 					c_wway  <= m_way;
-					c_wdata <= ln;
 					c_wtag  <= m_pa[31:10];
 					iv[m_pa[9:4]][m_way] <= 1'b1;
 					if (iv[m_pa[9:4]] == 4'hF) rr <= rr + 2'd1;
 				end
 				lb_v  <= 1'b1;
 				lb_pa <= m_pa[31:4];
-				lb_d  <= ln;
 				st    <= S_RUN;
 			end
 			if (busy && b_err) begin

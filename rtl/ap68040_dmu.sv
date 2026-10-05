@@ -148,11 +148,11 @@ module ap68040_dmu
 	output logic        sn_look,        // pulse: sn_hit/sn_dirty/sn_line valid
 	output logic        sn_hit,
 	output logic        sn_dirty,
-	output logic [127:0] sn_line,
+	output logic [127:0] sn_line,        // with sn_look: the line found
 	input  logic        sn_inv,         // pulse: invalidate what was found
 	input  logic        sn_wr,          // pulse: write into what was found
-	input  logic [15:0] sn_wbe,
-	input  logic [127:0] sn_wdata
+	input  logic [15:0] sn_wbe,         // the bytes, of...
+	input  logic [31:0] sn_wword        // ...this long word on every long word
 );
 
 localparam logic [2:0] MT_CINV = 3'd1, MT_CPUSH = 3'd2, MT_PFLUSH = 3'd3, MT_PTEST = 3'd4;
@@ -234,16 +234,22 @@ function automatic logic [31:0] take(input logic [127:0] line, input logic [3:0]
 	take = v;
 endfunction
 
-// n bytes from the top of d (left aligned) placed at offset o of a line
-function automatic void put(input logic [31:0] d, input logic [3:0] o, input logic [2:0] n,
-                            output logic [127:0] line, output logic [15:0] be);
-	line = '0;
-	be   = '0;
-	for (int i = 0; i < 4; i++)
-		if (3'(i) < n) begin
-			line[127 - 8*(o + i) -: 8] = d[31 - 8*i -: 8];
-			be[15 - (o + i)] = 1'b1;
-		end
+// A write of n bytes from the top of d (left aligned) at offset o of a
+// line: the operand rotated onto the byte lanes, as the bus would carry
+// it, is replicated over the line's four long words, and the byte enables
+// pick the bytes (byte o+i is on lane (o+i) mod 4, which holds byte i).
+function automatic logic [31:0] lanes32(input logic [31:0] d, input logic [1:0] o);
+	case (o)
+		2'd0:    lanes32 = d;
+		2'd1:    lanes32 = {d[7:0], d[31:8]};
+		2'd2:    lanes32 = {d[15:0], d[31:16]};
+		default: lanes32 = {d[23:0], d[31:24]};
+	endcase
+endfunction
+function automatic logic [15:0] bmask(input logic [3:0] o, input logic [2:0] n);
+	logic [3:0] m;
+	m = 4'b1111 << (3'd4 - n);
+	bmask = {m, 12'd0} >> o;
 endfunction
 
 function automatic logic [3:0] dmask(input logic [15:0] be);
@@ -277,7 +283,7 @@ logic  [5:0] st_set;               // engine data/tag set
 typedef enum logic [2:0] { SN_IDLE, SN_A, SN_B, SN_H, SN_R } snph_t;
 snph_t       sn_ph;
 wire         sn_frz  = (sn_ph != SN_IDLE);
-wire         sn_rset = (sn_ph == SN_A);
+wire         sn_rset = (sn_ph == SN_A) || (sn_ph == SN_B);   // B: the line stays readable in H
 logic  [1:0] sn_src;               // found in: 0 a cache way, 1 push buffer, 2 queued push
 logic  [1:0] sn_way;
 logic        bo_cancel;            // the queued push was invalidated by a snoop
@@ -300,7 +306,9 @@ logic         dw;
 logic  [5:0]  dw_set;
 logic  [1:0]  dw_way;
 logic [15:0]  dw_be;
-logic [127:0] dw_data;
+logic  [1:0]  dw_src;              // 0 dw_word on every long word, 1 bo_line, 2 pv_line
+logic [31:0]  dw_word;
+logic [127:0] dw_wdata;
 
 genvar gw;
 generate
@@ -312,7 +320,7 @@ generate
 		);
 		ap68040_sdp_be #(.AW(6), .NB(16), .OREG(0)) dat (
 			.clk(clk),
-			.we(dw && dw_way == 2'(gw)), .waddr(dw_set), .wbe(dw_be), .wdata(dw_data),
+			.we(dw && dw_way == 2'(gw)), .waddr(dw_set), .wbe(dw_be), .wdata(dw_wdata),
 			.raddr(la_set_n), .oce(1'b1), .q(dq_rn[gw])
 		);
 		always_ff @(posedge clk) if (adv_dc1) dq_r[gw] <= dq_rn[gw];
@@ -501,6 +509,10 @@ logic        pv_dirty;
 logic  [1:0] pv_tln;
 logic [127:0] mv_line;            // MOVE16 line buffer
 
+// the RAM write data: a fill or a restored victim (the buffers hold until
+// the write cycle), else a word on every long word with byte enables
+assign dw_wdata = (dw_src == 2'd1) ? bo_line : (dw_src == 2'd2) ? pv_line : {4{dw_word}};
+
 // maintenance scan
 logic  [7:0] ms_i;                // set*4 + way
 
@@ -580,9 +592,8 @@ wire wb_st   = m4.r.v && st_v && (m4.r.mem == M_ST || m4.r.mem == M_RMW);
 wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
                m4.x.cm == 2'b01 && dc_en && !m4.r.lock && (m4.r.msz != SZ_Q) &&
                (e_st == E_IDLE) && !e_wst_done;
-logic [127:0] wbf_line;
-logic [15:0]  wbf_be;
-always_comb put(lalign(st_data, m4.r.msz), m4.r.a[3:0], nbytes(m4.r.msz), wbf_line, wbf_be);
+wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
+wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
 
 wire dc2_slow = m2.r.v && !fast_now && !(st_simple && !e_job) && !e_dc2_done && !e_job;
 wire wb_slow  = wb_st && !wb_fast && !e_wst_done;
@@ -645,7 +656,7 @@ always_ff @(posedge clk) begin
 		tw_i <= 1'b0; tw_da <= '0; tw_d <= '0; tw_wp <= 1'b0; tw_fail <= 1'b0;
 		tw_berr <= 1'b0; tw_pd <= '0;
 		tset_b <= '0; tway_b <= '0; twd_b <= '0;
-		dw_set <= '0; dw_way <= '0; dw_be <= '0; dw_data <= '0;
+		dw_set <= '0; dw_way <= '0; dw_be <= '0; dw_src <= '0; dw_word <= '0;
 		ic_inv <= 1'b0; ic_inv_scope <= '0; ic_inv_pa <= '0;
 		rrc <= 2'd0;
 		st_fault <= 1'b0; st_fssw <= '0; st_faddr <= '0;
@@ -658,7 +669,7 @@ always_ff @(posedge clk) begin
 		e_job <= 1'b0;
 		m1_stale <= 1'b0;
 		sn_ph <= SN_IDLE; sn_src <= '0; sn_way <= '0; bo_cancel <= 1'b0;
-		sn_look <= 1'b0; sn_hit <= 1'b0; sn_dirty <= 1'b0; sn_line <= '0;
+		sn_look <= 1'b0; sn_hit <= 1'b0; sn_dirty <= 1'b0;
 		for (int i = 0; i < 64; i++) begin
 			lv[i] <= 4'd0;
 			for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
@@ -718,7 +729,8 @@ always_ff @(posedge clk) begin
 			dw_set  <= m4.x.pa[9:4];
 			dw_way  <= m4.x.way;
 			dw_be   <= wbf_be;
-			dw_data <= wbf_line;
+			dw_src  <= 2'd0;
+			dw_word <= wbf_word;
 			ld[m4.x.pa[9:4]][m4.x.way] <= 1'b1;
 			st_rdy  <= 1'b1;
 			st_fault <= 1'b0;
@@ -978,15 +990,16 @@ always_ff @(posedge clk) begin
 			e_st   <= E_W_PART;
 		end
 		E_W_PART: begin
-			logic [127:0] l; logic [15:0] be; logic upd;
-			put(e_acc, e_va[3:0], e_n, l, be);
+			logic [15:0] be; logic upd;
+			be  = bmask(e_va[3:0], e_n);
 			upd = e_x.hit && dc_en && !e_x.cm[1] && !m4.r.lock && (m4.r.msz != SZ_Q);
 			if (upd) begin
 				dw      <= 1'b1;
 				dw_set  <= e_va[9:4];
 				dw_way  <= e_x.way;
 				dw_be   <= be;
-				dw_data <= l;
+				dw_src  <= 2'd0;
+				dw_word <= lanes32(e_acc, e_va[1:0]);
 				if (e_x.cm == 2'b01)
 					if (be != 16'd0) ld[e_va[9:4]][e_x.way] <= 1'b1;
 			end
@@ -1201,7 +1214,7 @@ always_ff @(posedge clk) begin
 				dw_set  <= f_set;
 				dw_way  <= f_way;
 				dw_be   <= 16'hFFFF;
-				dw_data <= bo_line;
+				dw_src  <= 2'd1;
 				tw_b    <= 1'b1;
 				tset_b  <= f_set;
 				tway_b  <= f_way;
@@ -1216,7 +1229,7 @@ always_ff @(posedge clk) begin
 				dw_set  <= f_set;
 				dw_way  <= f_way;
 				dw_be   <= 16'hFFFF;
-				dw_data <= pv_line;
+				dw_src  <= 2'd2;
 				lv[f_set][f_way] <= 1'b1;
 				ld[f_set][f_way] <= pv_dirty;
 				pv_v <= 1'b0;
@@ -1571,14 +1584,12 @@ always_ff @(posedge clk) begin
 				sn_src   <= 2'd0;
 				sn_hit   <= 1'b1;
 				sn_dirty <= ld[s][w];
-				sn_line  <= dq_rn[w];
 			end
 			else if (pv_v && pv_lpa == sn_pa[31:4]) begin
 				// the dirty victim waiting for its push (4.7.2)
 				sn_src   <= 2'd1;
 				sn_hit   <= 1'b1;
 				sn_dirty <= 1'b1;
-				sn_line  <= pv_line;
 			end
 			else if ((e_st == E_BUS || e_st == E_BUS_W) && bo.line && !bo.rd &&
 			         bo.tm == TM_PUSH && !bo_cancel && bo_pa[31:4] == sn_pa[31:4]) begin
@@ -1586,7 +1597,6 @@ always_ff @(posedge clk) begin
 				sn_src   <= 2'd2;
 				sn_hit   <= 1'b1;
 				sn_dirty <= 1'b1;
-				sn_line  <= bo_line;
 			end
 			else begin
 				sn_hit   <= 1'b0;
@@ -1634,13 +1644,14 @@ always_ff @(posedge clk) begin
 					dw_set  <= s;
 					dw_way  <= sn_way;
 					dw_be   <= sn_wbe;
-					dw_data <= sn_wdata;
+					dw_src  <= 2'd0;
+					dw_word <= sn_wword;
 					ld[s][sn_way] <= 1'b1;
 				end
 				2'd1: for (int i = 0; i < 16; i++)
-					if (sn_wbe[i]) pv_line[8*i +: 8] <= sn_wdata[8*i +: 8];
+					if (sn_wbe[i]) pv_line[8*i +: 8] <= sn_wword[8*(i % 4) +: 8];
 				default: for (int i = 0; i < 16; i++)
-					if (sn_wbe[i]) bo_line[8*i +: 8] <= sn_wdata[8*i +: 8];
+					if (sn_wbe[i]) bo_line[8*i +: 8] <= sn_wword[8*(i % 4) +: 8];
 				endcase
 			end
 			if (!sn_req) sn_ph <= SN_R;
@@ -1649,6 +1660,10 @@ always_ff @(posedge clk) begin
 		endcase
 	end
 end
+
+// snoop: the line found, valid with sn_look (the RAM still reads the
+// snooped set in the first H cycle)
+assign sn_line = (sn_src == 2'd0) ? dq_rn[sn_way] : (sn_src == 2'd1) ? pv_line : bo_line;
 
 // DC2 answer
 // once the engine has taken the DC2 uop, only its completion releases it

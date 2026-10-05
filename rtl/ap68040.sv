@@ -119,7 +119,8 @@ ap68040_biu #(.NC(NC)) biu (
 //--------------------------------------------------------------------------
 logic        sn_req, sn_look, sn_hit, sn_dirty, sn_inv, sn_wr;
 logic [31:0] sn_pa;
-logic [127:0] sn_line, sn_wdata;
+logic [127:0] sn_line;
+logic [31:0] sn_wword;
 logic [15:0] sn_wbe;
 logic        sn_ic, sn_ic_all, sn_ic_done;
 logic [31:0] sn_ic_pa;
@@ -131,7 +132,7 @@ ap68040_snoop snoop (
 	.mi_n(mi_n), .ta_n_o(ta_n_o), .ta_oe(ta_oe), .d_o(sn_d_o), .d_oe(sn_d_oe),
 	.dc_req(sn_req), .dc_pa(sn_pa), .dc_look(sn_look), .dc_hit(sn_hit),
 	.dc_dirty(sn_dirty), .dc_line(sn_line), .dc_inv(sn_inv), .dc_wr(sn_wr),
-	.dc_wbe(sn_wbe), .dc_wdata(sn_wdata),
+	.dc_wbe(sn_wbe), .dc_wword(sn_wword),
 	.ic_req(sn_ic), .ic_pa(sn_ic_pa), .ic_all(sn_ic_all), .ic_done(sn_ic_done)
 );
 
@@ -228,7 +229,7 @@ ap68040_dmu dmu (
 	.b_ravec(b_ravec), .b_rtci(b_rtci),
 	.sn_req(sn_req), .sn_pa(sn_pa), .sn_look(sn_look), .sn_hit(sn_hit),
 	.sn_dirty(sn_dirty), .sn_line(sn_line), .sn_inv(sn_inv), .sn_wr(sn_wr),
-	.sn_wbe(sn_wbe), .sn_wdata(sn_wdata)
+	.sn_wbe(sn_wbe), .sn_wword(sn_wword)
 );
 
 // instruction side <-> DMU

@@ -23,8 +23,9 @@
 // bclk_en high; inputs are sampled only in such cycles.                    //
 //                                                                          //
 // Requester interface (per client c):                                      //
-//   req[c]      level; breq[c] and wdata[c] must be stable while req[c]    //
-//               is high and gnt[c] has not pulsed                          //
+//   req[c]      level; breq[c] must be stable while req[c] is high and    //
+//               gnt[c] has not pulsed; wdata[c] from the request until    //
+//               done[c] or err[c] (the BIU drives the bus from it)         //
 //   gnt[c]      pulse: the transaction is latched, req may drop or change  //
 //   rvalid      pulse per read beat for the client in rclient; rdata,      //
 //               rbeat (A3:A2 of the long word), avec (AVEC with TA)        //
@@ -113,7 +114,7 @@ typedef enum logic [2:0] {
 state_t      st;
 busreq_t     cur;
 logic [CW-1:0] cur_c;
-logic [127:0] cur_wd;
+wire  [127:0] cur_wd = wdata[cur_c];   // stable until done/err (contract)
 logic  [1:0] beat;        // beats completed so far in a line
 logic        inhibited;   // line continued as long-word transfers
 logic        owner;       // we hold BB
@@ -175,7 +176,6 @@ always_ff @(posedge clk) begin
 		st        <= S_IDLE;
 		cur       <= '0;
 		cur_c     <= '0;
-		cur_wd    <= '0;
 		beat      <= 2'd0;
 		inhibited <= 1'b0;
 		owner     <= 1'b0;
@@ -238,7 +238,6 @@ always_ff @(posedge clk) begin
 					bb_oe   <= 1'b1;
 					cur     <= breq[pick_c];
 					cur_c   <= pick_c;
-					cur_wd  <= wdata[pick_c];
 					gnt[pick_c] <= 1'b1;
 					beat    <= 2'd0;
 					inhibited <= 1'b0;

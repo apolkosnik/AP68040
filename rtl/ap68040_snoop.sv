@@ -72,7 +72,7 @@ module ap68040_snoop
 	output logic        dc_inv,
 	output logic        dc_wr,
 	output logic [15:0] dc_wbe,
-	output logic [127:0] dc_wdata,
+	output logic [31:0] dc_wword,       // on every long word, dc_wbe picks
 
 	// instruction cache: line invalidation in the fetch unit
 	output logic        ic_req,
@@ -147,7 +147,7 @@ always_ff @(posedge clk) begin
 		dc_req  <= 1'b0;
 		dc_pa   <= '0;
 		dc_wbe  <= '0;
-		dc_wdata <= '0;
+		dc_wword <= '0;
 		ic_req  <= 1'b0;
 		ic_pa   <= '0;
 		ic_all  <= 1'b0;
@@ -241,7 +241,7 @@ always_ff @(posedge clk) begin
 				logic [3:0] be;
 				be = lanes(s_siz, s_a[1:0]);
 				dc_wbe   <= {12'd0, be} << (4 * (2'd3 - s_a[3:2]));
-				dc_wdata <= {4{d_i}};
+				dc_wword <= d_i;
 				dc_wr    <= 1'b1;
 				dc_req   <= 1'b0;
 				ta_n_o   <= 1'b1;
