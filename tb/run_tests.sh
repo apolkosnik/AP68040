@@ -3,10 +3,11 @@
 # Usage: run_tests.sh [program ...]   (default: the passing set)
 set -e
 cd "$(dirname "$0")"
-PROGS=${*:-"smoke t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume"}
+PROGS=${*:-"smoke t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_snoop"}
+WORK=${WORK:-$(cd .. && pwd)/obj}; export WORK
 ./build_asm.sh $PROGS
 ./build_sim.sh > build/sim_build.log 2>&1 || { tail -30 build/sim_build.log; exit 1; }
-SIM=$(cd .. && pwd)/obj/obj_prog/tb_ap68040
+SIM=$WORK/obj_prog/tb_ap68040
 fail=0
 for p in $PROGS; do
 	for cfg in "" "+waits" "+waits +tbi=2 +retry=10" "+bclk2" "+bclk2 +waits +tbi=1 +retry=20"; do

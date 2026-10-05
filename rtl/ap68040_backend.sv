@@ -65,6 +65,7 @@ module ap68040_backend
 	output logic        dm_lock,
 	output logic        dm_locke,
 	output logic        dm_super,
+	output logic        dm_older,       // uops older than DC2 are in EX or WB
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        dm_iack,        // interrupt acknowledge cycle
 	input  logic        dm_hold1,       // the DMU holds DC1
@@ -329,6 +330,7 @@ assign dm_locke   = ag_u.mlocke;
 // FC2 of the access selects the root and the supervisor checks: MOVES
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
+assign dm_older   = ex_v || wb_v;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 assign dm_iack    = (ag_u.mfc == MFC_IACK);
 always_comb begin

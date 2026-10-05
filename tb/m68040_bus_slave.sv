@@ -16,6 +16,11 @@
 //   tea_req    asserted by the bench while it wants the transfer that is   //
 //              being answered to end in TEA (sampled when the beat would   //
 //              be acknowledged)                                            //
+//   hold       no answer while high: wait states (the benches tie the      //
+//              68040's MI here, so memory waits for the snooper, 7.9)     //
+//   oth_ta_n   TA from another responder (a snooping 68040 that inhibited //
+//              memory and answers itself): counts the transfer's beats    //
+//              so this slave follows it to its end                         //
 //                                                                          //
 // Every completed beat is published on the ev_* outputs for one clk so a   //
 // bench can implement MMIO and protocol checks.                            //
@@ -54,6 +59,7 @@ module m68040_bus_slave #(
 	input  logic        tea_req,
 	input  logic        tci_req,
 	input  logic        hold,          // insert wait states while high
+	input  logic        oth_ta_n,      // another responder's TA
 	input  logic  [7:0] iack_vector,   // 0 = answer with AVEC
 	input  logic [31:0] ext_rdata,     // EXT: the long word at xfer_addr
 	input  logic        ext_inmem,     // EXT: xfer_addr is backed by memory
@@ -158,6 +164,11 @@ always_ff @(posedge clk) begin
 				burst <= (siz == 2'b11);
 				waits <= pick_waits();
 			end
+		end
+		else if (!oth_ta_n) begin
+			// the transfer (this beat) was answered by another device
+			if (burst && beat != 2'd3) beat <= beat + 1'd1;
+			else busy <= 1'b0;
 		end
 		else if (ta_n == 1'b0 || tea_n == 1'b0) begin
 			// the edge on which the CPU sampled our termination

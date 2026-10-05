@@ -21,7 +21,8 @@
 // and its mailbox.  Other addresses read zero and ignore writes.          //
 //                                                                          //
 // Plusargs: +job= +lmem= +tmem= +mon= (the monitor binary), +limit=N,      //
-// +waits, +trace_round=N, +report=N (mismatch lines printed, default 40). //
+// +waits, +trace_round=N, +report=N (mismatch lines printed, default 40), //
+// +watch=<hex address> (report the bench's writes to that byte).          //
 //--------------------------------------------------------------------------//
 
 `timescale 1ns/1ps
@@ -59,10 +60,16 @@ logic        br_n, bb_n_o, bb_oe, rsto_n;
 logic  [2:0] ipl;
 logic [31:0] dbg_pc;
 logic        dbg_retire, dbg_halted;
+logic        mi_n, cpu_ta_n, cpu_ta_oe;
 
+// no other master on this bus: the snoop inputs stay idle, and memory
+// still waits for MI as the 68040 bus requires
 ap68040 dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
-	.a_o(a_o), .a_oe(a_oe), .d_i(d_i), .d_o(d_o), .d_oe(d_oe),
+	.a_o(a_o), .a_oe(a_oe),
+	.a_i(a_o), .ts_n_i(1'b1), .rw_n_i(1'b1), .siz_i(2'd0), .tt_i(2'd0), .sc(2'd0),
+	.mi_n(mi_n), .ta_n_o(cpu_ta_n), .ta_oe(cpu_ta_oe),
+	.d_i(d_i), .d_o(d_o), .d_oe(d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
 	.ts_n(ts_n), .tip_n(tip_n), .ta_n(ta_n), .tea_n(tea_n),
@@ -89,7 +96,7 @@ m68040_bus_slave #(.AW(24), .SEED(7), .EXT(1)) mem (
 	.a(a_o), .d_cpu(d_o), .rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .ts_n(ts_n),
 	.d_mem(d_i), .ta_n(ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n), .avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(2'd0), .retry_pct(0), .tea_req(1'b0), .tci_req(1'b0),
-	.hold(1'b0), .iack_vector(8'd0), .ext_rdata(ext_rdata), .ext_inmem(1'b1),
+	.hold(!mi_n), .oth_ta_n(1'b1), .iack_vector(8'd0), .ext_rdata(ext_rdata), .ext_inmem(1'b1),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
@@ -124,7 +131,11 @@ function automatic logic [7:0] rd8(input logic [31:0] a);
 	return 8'h00;
 endfunction
 
+int          jr;                // the record (round) being run
+logic [31:0] watch_addr;        // +watch=: report every write to this byte
 task automatic wr8(input logic [31:0] a, input logic [7:0] v);
+	if (a == watch_addr)
+		$display("%0t WATCH j%0d %08x <= %02x (was %02x)", $time, jr, a, v, rd8(a));
 	if (a[31:15] == 17'd0) lmem[a[14:0]] = v;
 	else if (a >= TBASE && a < TBASE + TSIZE) tmem[a - TBASE] = v;
 	else if (a >= MONB && a < MONB + MONN) mon[a - MONB] = v;
@@ -171,6 +182,9 @@ always @(posedge clk) begin
 		$display("%0t WB pc=%08x op=%0d last=%b exc=%0d bound=%b tr=%b sr=%04x take_trace=%b",
 		         $time, dut.be.wb_u.pc, dut.be.wb_u.op, dut.be.wb_u.last, dut.be.wb_exc,
 		         dut.be.wb_bound, dut.be.tr_now, dut.be.sr_r, dut.be.take_trace);
+	if (jr == trace_round && ev)
+		$display("%0t BUS %s %08x data=%08x be=%b tt=%0d tm=%0d err=%b", $time, ev_rd ? "RD" : "WR",
+		         ev_addr, ev_data, ev_be, ev_tt, ev_tm, ev_err);
 	if (jr == trace_round && dut.be.x_go)
 		$display("%0t EXC vec=%0d pc=%08x", $time, dut.be.x_vec, dut.be.x_pc);
 end
@@ -178,7 +192,7 @@ end
 //--------------------------------------------------------------------------
 // APR2 input
 //--------------------------------------------------------------------------
-int jf, jn, jr;
+int jf, jn;
 int errors, ran, mism, skipped, report_lim, trace_round;
 logic [31:0] flags, test_idx, round_idx;
 
@@ -382,6 +396,15 @@ task automatic run_round();
 	wrv(MBOX + 32'h0C0, 8'd2, i_fpcr);
 	wrv(MBOX + 32'h0C4, 8'd2, i_fpsr);
 	wrv(MBOX + 32'h0C8, 8'd2, i_fpiar);
+	if (jr == trace_round) begin
+		$display("ROUND j%0d t%0d r%0d flags=%08x sr=%04x pc=%08x ssp=%08x msp=%08x",
+		         jr, test_idx, round_idx, flags, i_sr[15:0], i_pc, i_ssp, i_msp);
+		for (int i = 0; i < 16; i++)
+			$display("  %s%0d=%08x", i < 8 ? "D" : "A", i % 8, i_regs[i]);
+		for (int i = 0; i < 8; i++)
+			$display("  FP%0d=%04x_%016x", i, i_fe[i][15:0], i_fm[i]);
+		$display("  FPCR=%08x FPSR=%08x FPIAR=%08x", i_fpcr, i_fpsr, i_fpiar);
+	end
 	// the native runner raises the interrupt before its entry RTE
 	ipl = i_level[2:0];
 	evt0  = evt_cnt;
@@ -475,6 +498,7 @@ initial begin
 	if (!$value$plusargs("report=%d", report_lim)) report_lim = 40;
 	if (!$value$plusargs("trace_round=%d", trace_round)) trace_round = -1;
 	if (!$value$plusargs("limit=%d", limit)) limit = 32'h7FFF_FFFF;
+	if (!$value$plusargs("watch=%h", watch_addr)) watch_addr = 32'hFFFF_FFFF;
 	if (!$value$plusargs("job=%s", job_file) || !$value$plusargs("lmem=%s", lmem_file) ||
 	    !$value$plusargs("tmem=%s", tmem_file) || !$value$plusargs("mon=%s", mon_file)) begin
 		$display("FAIL: require +job= +lmem= +tmem= +mon=");

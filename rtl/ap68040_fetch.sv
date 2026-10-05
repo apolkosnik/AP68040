@@ -33,7 +33,9 @@
 // end refetches it on demand before it becomes an access error.           //
 //                                                                          //
 // CINV/CPUSH of the instruction cache arrive from the DMU (ic_inv): all   //
-// in one cycle, a line in two, a page by a scan of the 64 sets.          //
+// in one cycle, a line in two, a page by a scan of the 64 sets.  Bus     //
+// snooping (sn_inv) invalidates a line the same way (MC68040UM table   //
+// 4-3, V5/V6).                                                            //
 //--------------------------------------------------------------------------//
 
 module ap68040_fetch
@@ -83,6 +85,10 @@ module ap68040_fetch
 	input  logic  [1:0] ic_inv_scope,  // 1 line, 2 page, 3 all
 	input  logic [31:0] ic_inv_pa,
 	output logic        ic_inv_done,
+	input  logic        sn_inv,        // snooper: invalidate the line at sn_inv_pa
+	input  logic [31:0] sn_inv_pa,
+	input  logic        sn_inv_all,    // ... or every line
+	output logic        sn_inv_done,
 
 	// BIU client
 	output logic        b_req,
@@ -233,6 +239,9 @@ logic [127:0] m_line;
 // invalidation
 logic        inv_busy, inv_hold, inv_ph;
 logic  [6:0] inv_i;
+logic        inv_sn;           // the running invalidation is the snooper's
+logic  [1:0] inv_scope;
+logic [31:0] inv_pa;
 
 wire        redir_any = redir_v || d_redir_v;
 wire [31:0] redir_npc = redir_v ? redir_pc : d_redir_pc;
@@ -285,8 +294,9 @@ wire f1_deliver = f1_go && (x_hit || x_lb);
 //--------------------------------------------------------------------------
 wire [5:0] inflight = (f1_v ? 6'd2 : 6'd0) + {4'd0, f2_n} + {4'd0, f3_n};
 wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 2);
+// a snooped invalidation goes first (the snooper has priority, 4.5)
 wire       f0_go    = (st == S_RUN) && !odd && !stop && !redir_any &&
-                      !iatc_flush_page && !inv_busy && room;
+                      !iatc_flush_page && !inv_busy && !sn_inv && room;
 
 assign c_raddr = inv_busy ? inv_i[5:0] : fpc[9:4];
 
@@ -342,7 +352,9 @@ always_ff @(posedge clk) begin
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wdata <= '0; c_wtag <= '0;
 		rr    <= '0;
 		inv_busy <= 1'b0; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
+		inv_sn <= 1'b0; inv_scope <= '0; inv_pa <= '0;
 		ic_inv_done <= 1'b0;
+		sn_inv_done <= 1'b0;
 		for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
 		for (int i = 0; i < QN; i++) begin qw[i] <= '0; qp[i] <= '0; end
 	end
@@ -350,6 +362,7 @@ always_ff @(posedge clk) begin
 		logic [4:0] keep;
 		c_we        <= 1'b0;
 		ic_inv_done <= 1'b0;
+		sn_inv_done <= 1'b0;
 		inv_hold    <= 1'b0;
 
 		//------------------------------------------------------------------
@@ -565,40 +578,46 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		// CINV/CPUSH of the instruction cache
 		//------------------------------------------------------------------
-		if (ic_inv && !inv_busy && !inv_hold && st != S_FILL && !c_we) begin
+		if ((ic_inv || sn_inv) && !inv_busy && !inv_hold && st != S_FILL && !c_we) begin
 			lb_v <= 1'b0;
-			if (ic_inv_scope == 2'd3) begin
+			inv_sn    <= !ic_inv;
+			inv_scope <= ic_inv ? ic_inv_scope : 2'd1;
+			inv_pa    <= ic_inv ? ic_inv_pa : sn_inv_pa;
+			if (ic_inv ? (ic_inv_scope == 2'd3) : sn_inv_all) begin
 				for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
-				ic_inv_done <= 1'b1;
+				ic_inv_done <= ic_inv;
+				sn_inv_done <= !ic_inv;
 				inv_hold    <= 1'b1;
 			end
 			else begin
 				inv_busy <= 1'b1;
 				inv_ph   <= 1'b0;
-				inv_i    <= (ic_inv_scope == 2'd1) ? {1'b0, ic_inv_pa[9:4]} : 7'd0;
+				inv_i    <= (!ic_inv || ic_inv_scope == 2'd1) ?
+				            {1'b0, (ic_inv ? ic_inv_pa[9:4] : sn_inv_pa[9:4])} : 7'd0;
 			end
 		end
 		if (inv_busy) begin
 			// this cycle reads set inv_i; the previous set's tags compare
 			if (inv_ph) begin
 				logic [5:0] s;
-				s = (ic_inv_scope == 2'd1) ? ic_inv_pa[9:4] : 6'(inv_i - 7'd1);
+				s = (inv_scope == 2'd1) ? inv_pa[9:4] : 6'(inv_i - 7'd1);
 				for (int w = 0; w < 4; w++) begin
 					logic m;
-					if (ic_inv_scope == 2'd1)
-						m = ct[w][21:0] == ic_inv_pa[31:10];
+					if (inv_scope == 2'd1)
+						m = ct[w][21:0] == inv_pa[31:10];
 					else if (tc_p)
-						m = ct[w][21:3] == ic_inv_pa[31:13];
+						m = ct[w][21:3] == inv_pa[31:13];
 					else
-						m = ct[w][21:2] == ic_inv_pa[31:12];
+						m = ct[w][21:2] == inv_pa[31:12];
 					if (m) iv[s][w] <= 1'b0;
 				end
 			end
 			inv_ph <= 1'b1;
-			if (ic_inv_scope == 2'd1) begin
+			if (inv_scope == 2'd1) begin
 				if (inv_ph) begin
 					inv_busy    <= 1'b0;
-					ic_inv_done <= 1'b1;
+					ic_inv_done <= !inv_sn;
+					sn_inv_done <= inv_sn;
 					inv_hold    <= 1'b1;
 				end
 			end

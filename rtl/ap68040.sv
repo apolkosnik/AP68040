@@ -5,7 +5,10 @@
 //                                                                          //
 // clk is the processor clock (PCLK); bclk_en marks the processor clocks    //
 // that end a bus clock (BCLK rising edge).  Bidirectional pins are split   //
-// into _i/_o/_oe.                                                          //
+// into _i/_o/_oe: a_i, ts_n_i, rw_n_i, siz_i and tt_i are the bus as an    //
+// alternate master drives it (snooped, with SC1/SC0), d_i the data bus    //
+// in either direction, ta_n the bus TA; the 68040 drives TA (ta_n_o,      //
+// ta_oe) and D31-D0 only as a snooping slave.                             //
 //--------------------------------------------------------------------------//
 
 module ap68040
@@ -20,6 +23,15 @@ module ap68040
 
 	output logic [31:0] a_o,
 	output logic        a_oe,
+	input  logic [31:0] a_i,
+	input  logic        ts_n_i,
+	input  logic        rw_n_i,
+	input  logic  [1:0] siz_i,
+	input  logic  [1:0] tt_i,
+	input  logic  [1:0] sc,
+	output logic        mi_n,
+	output logic        ta_n_o,
+	output logic        ta_oe,
 	input  logic [31:0] d_i,
 	output logic [31:0] d_o,
 	output logic        d_oe,
@@ -71,6 +83,9 @@ always_ff @(posedge clk)
 //--------------------------------------------------------------------------
 localparam int NC = 2;
 logic [NC-1:0] b_req, b_gnt, b_done, b_err;
+logic          b_own;
+logic [31:0]   b_d_o, sn_d_o;
+logic          b_d_oe, sn_d_oe;
 busreq_t       b_breq [NC];
 logic [127:0]  b_wdata [NC];
 logic          b_rvalid;
@@ -87,10 +102,10 @@ ap68040_biu #(.NC(NC)) biu (
 	.req(b_req), .breq(b_breq), .wdata(b_wdata),
 	.gnt(b_gnt), .done(b_done), .err(b_err),
 	.rvalid(b_rvalid), .rclient(b_rclient), .rdata(b_rdata), .rbeat(b_rbeat),
-	.ravec(b_ravec), .rtci(b_rtci), .errbeat(b_errbeat), .idle(b_idle),
+	.ravec(b_ravec), .rtci(b_rtci), .errbeat(b_errbeat), .idle(b_idle), .own(b_own),
 	.unlock(kill_now),
 	.rsto_req(rsto_req), .rsto_busy(rsto_busy),
-	.a_o(a_o), .a_oe(a_oe), .d_i(d_i), .d_o(d_o), .d_oe(d_oe),
+	.a_o(a_o), .a_oe(a_oe), .d_i(d_i), .d_o(b_d_o), .d_oe(b_d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
 	.ts_n(ts_n), .tip_n(tip_n), .ta_n(ta_n), .tea_n(tea_n),
@@ -98,6 +113,30 @@ ap68040_biu #(.NC(NC)) biu (
 	.br_n(br_n), .bg_n(bg_n), .bb_n_i(bb_n_i), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n)
 );
+
+//--------------------------------------------------------------------------
+// bus snooper
+//--------------------------------------------------------------------------
+logic        sn_req, sn_look, sn_hit, sn_dirty, sn_inv, sn_wr;
+logic [31:0] sn_pa;
+logic [127:0] sn_line, sn_wdata;
+logic [15:0] sn_wbe;
+logic        sn_ic, sn_ic_all, sn_ic_done;
+logic [31:0] sn_ic_pa;
+
+ap68040_snoop snoop (
+	.clk(clk), .nreset(nreset), .bclk_en(bclk_en), .own(b_own),
+	.a_i(a_i), .ts_n_i(ts_n_i), .rw_n_i(rw_n_i), .siz_i(siz_i), .tt_i(tt_i), .sc(sc),
+	.d_i(d_i), .ta_n_i(ta_n), .tea_n_i(tea_n), .tbi_n_i(tbi_n),
+	.mi_n(mi_n), .ta_n_o(ta_n_o), .ta_oe(ta_oe), .d_o(sn_d_o), .d_oe(sn_d_oe),
+	.dc_req(sn_req), .dc_pa(sn_pa), .dc_look(sn_look), .dc_hit(sn_hit),
+	.dc_dirty(sn_dirty), .dc_line(sn_line), .dc_inv(sn_inv), .dc_wr(sn_wr),
+	.dc_wbe(sn_wbe), .dc_wdata(sn_wdata),
+	.ic_req(sn_ic), .ic_pa(sn_ic_pa), .ic_all(sn_ic_all), .ic_done(sn_ic_done)
+);
+
+assign d_o  = sn_d_oe ? sn_d_o : b_d_o;
+assign d_oe = sn_d_oe || b_d_oe;
 
 //--------------------------------------------------------------------------
 // back end and front end
@@ -125,7 +164,7 @@ logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
-logic        dm_lock, dm_locke, dm_super, dm_noalloc;
+logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
 logic [31:0] dm_ldata, dm_faddr, dm_st_data;
 logic  [7:0] dm_fvec;
@@ -143,7 +182,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
@@ -164,6 +203,7 @@ ap68040_dmu dmu (
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
 	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
+	.dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
 	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .fault(dm_fault), .fvec(dm_fvec),
@@ -185,7 +225,10 @@ ap68040_dmu dmu (
 	.b_req(b_req[0]), .b_breq(b_breq[0]), .b_wdata(b_wdata[0]),
 	.b_gnt(b_gnt[0]), .b_done(b_done[0]), .b_err(b_err[0]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b0), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
-	.b_ravec(b_ravec), .b_rtci(b_rtci)
+	.b_ravec(b_ravec), .b_rtci(b_rtci),
+	.sn_req(sn_req), .sn_pa(sn_pa), .sn_look(sn_look), .sn_hit(sn_hit),
+	.sn_dirty(sn_dirty), .sn_line(sn_line), .sn_inv(sn_inv), .sn_wr(sn_wr),
+	.sn_wbe(sn_wbe), .sn_wdata(sn_wdata)
 );
 
 // instruction side <-> DMU
@@ -229,6 +272,7 @@ ap68040_fetch fetch (
 	.iatc_flush_fc2(iatc_flush_fc2),
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
+	.sn_inv(sn_ic), .sn_inv_pa(sn_ic_pa), .sn_inv_all(sn_ic_all), .sn_inv_done(sn_ic_done),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b1), .b_rdata(b_rdata), .b_rbeat(b_rbeat),

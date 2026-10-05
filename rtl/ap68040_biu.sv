@@ -15,7 +15,8 @@
 //   * locked sequences: the arbiter stays with the locking requester       //
 //     from its first LOCK transfer until the LOCKE transfer completes      //
 //   * bus arbitration BR/BG/BB (7.8): ownership is taken when BG is        //
-//     asserted and BB is free, and kept while BG stays asserted            //
+//     asserted and BB is free; a negated BG gives the bus up at the end   //
+//     of the transfer in progress, unless a locked sequence is open        //
 //   * RSTO for 512 bus clocks (RESET instruction, 7.10)                    //
 //                                                                          //
 // Every bus output is a flip-flop that changes only in a clk cycle with    //
@@ -62,6 +63,7 @@ module ap68040_biu
 	output logic              rtci,
 	output logic  [1:0]       errbeat,
 	output logic              idle,     // no transaction latched or running
+	output logic              own,      // we are the bus master (BB ours)
 
 	input  logic              unlock,   // abandon an open locked sequence
 
@@ -155,8 +157,9 @@ wire        is_line  = (cur.siz == SIZ_LINE);
 wire        ta       = !ta_n;
 wire        tea      = !tea_n;
 
-// ownership: BG asserted and the bus free, or already ours
-wire        can_own  = owner || (!bg_n && bb_n_i);
+// ownership: BG asserted and the bus free, or already ours and BG still
+// asserted (or a locked sequence open: it keeps the bus)
+wire        can_own  = (owner && (!bg_n || locked)) || (!bg_n && bb_n_i);
 
 logic [9:0] rsto_cnt;
 logic       rsto_pend;   // a RESET request waiting for a bus clock
@@ -361,6 +364,7 @@ always_ff @(posedge clk) begin
 end
 
 assign idle      = (st == S_IDLE);
+assign own       = owner;
 assign rsto_busy = !rsto_n || rsto_pend;
 
 endmodule

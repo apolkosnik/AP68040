@@ -22,6 +22,19 @@
 //   $F154 word  arm a one-shot bus error on an instruction fetch at the   //
 //               written address (0 disarms)                               //
 //   $F160 word  (read) bench capability word, +cap=<n> (default 7)        //
+//   $F200 + 32k (k = 0..3): alternate-master transfer k: +0 address,     //
+//               +4 word: bit 0 read, 2:1 SIZ, 4:3 SC1/SC0; +8..+$17 data //
+//               (write data in, read data back: a line's four long words,//
+//               or one long word as it is on D31-D0 at +8)                //
+//   $F280 word  run transfers 0..n-1 as an alternate bus master: bits 2:0 //
+//               n, bit 8 wait first for a 68040 line read of the line at //
+//               $F284 (it takes the bus right after it)                   //
+//   $F288 word  bus clocks the alternate master holds the bus before its  //
+//               first transfer                                             //
+//   $F28C word  (read) alternate master: 0 busy, 1 done, 2 bus error      //
+//   $F294 long  copied to $F2A8 when written (a read of $F2A8, another   //
+//               line, shows whether the write reached the bus first)      //
+//   $F2B0 long  (read) counts its own bus reads into $F2B4              //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -60,14 +73,34 @@ logic  [2:0] ipl_lvl;
 logic [31:0] dbg_pc;
 logic        dbg_retire, dbg_halted;
 
+// the bus: the 68040 or the alternate master drives it
+logic        mi_n, cpu_ta_n, cpu_ta_oe, slv_ta_n;
+logic        am_drive, am_rw_n, am_ts_n, am_bb_n, am_d_oe, am_bg_n;
+logic [31:0] am_a, am_d;
+logic  [1:0] am_siz, am_tt, am_sc;
+logic  [2:0] am_tm;
+wire  [31:0] bus_a    = am_drive ? am_a : a_o;
+wire         bus_ts_n = am_drive ? am_ts_n : ts_n;
+wire         bus_rw_n = am_drive ? am_rw_n : rw_n;
+wire   [1:0] bus_siz  = am_drive ? am_siz : siz;
+wire   [1:0] bus_tt   = am_drive ? am_tt : tt;
+wire   [2:0] bus_tm   = am_drive ? am_tm : tm;
+wire  [31:0] bus_dw   = am_d_oe ? am_d : d_o;            // write data
+wire  [31:0] bus_dr   = d_oe ? d_o : d_mem;              // read data (snoop-supplied)
+assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
+
 ap68040 dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
-	.a_o(a_o), .a_oe(a_oe), .d_i(d_mem), .d_o(d_o), .d_oe(d_oe),
+	.a_o(a_o), .a_oe(a_oe),
+	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
+	.tt_i(bus_tt), .sc(am_drive ? am_sc : 2'd0),
+	.mi_n(mi_n), .ta_n_o(cpu_ta_n), .ta_oe(cpu_ta_oe),
+	.d_i(am_d_oe ? am_d : d_mem), .d_o(d_o), .d_oe(d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
 	.ts_n(ts_n), .tip_n(tip_n), .ta_n(ta_n), .tea_n(tea_n),
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_lvl), .avec_n(avec_n),
-	.br_n(br_n), .bg_n(1'b0), .bb_n_i(bb_oe ? bb_n_o : 1'b1),
+	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted)
 );
@@ -88,11 +121,12 @@ logic  [2:0] ev_tm;
 
 m68040_bus_slave #(.AW(20)) mem (
 	.clk(clk), .nreset(rsti_n), .bclk_en(bclk_en),
-	.a(a_o), .d_cpu(d_o), .rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .ts_n(ts_n),
-	.d_mem(d_mem), .ta_n(ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
+	.a(bus_a), .d_cpu(bus_dw), .rw_n(bus_rw_n), .siz(bus_siz), .tt(bus_tt), .tm(bus_tm), .ts_n(bus_ts_n),
+	.d_mem(d_mem), .ta_n(slv_ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold), .iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
+	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
+	.iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
@@ -134,6 +168,61 @@ logic  [1:0] irq_exc_armed;   // $F144
 logic  [2:0] fetch_stall;     // hold the next instruction fetch this many clocks
 logic        fetch_hold;
 assign fetch_hold = (fetch_stall != 0) && xfer_v && (xfer_tm == 3'd2 || xfer_tm == 3'd6);
+
+// alternate bus master (and arbiter)
+logic        am_go, am_trig_en, am_trig;
+logic  [2:0] am_n;
+logic [15:0] am_delay;
+logic [31:0] am_trig_a;
+logic [31:0] am_x_addr [4];
+logic  [4:0] am_x_ctl  [4];
+logic [127:0] am_x_wd  [4];
+logic [127:0] am_x_rd  [4];
+logic  [1:0] am_status, am_status_q;
+
+m68040_alt_master am (
+	.clk(clk), .nreset(rsti_n), .bclk_en(bclk_en),
+	.go(am_go), .n(am_n), .trig_en(am_trig_en), .trig(am_trig), .delay(am_delay),
+	.x_addr(am_x_addr), .x_ctl(am_x_ctl), .x_wd(am_x_wd), .x_rd(am_x_rd), .status(am_status),
+	.cpu_bg_n(am_bg_n), .cpu_bb_n(bb_oe ? bb_n_o : 1'b1),
+	.drive(am_drive), .a(am_a), .rw_n(am_rw_n), .siz(am_siz), .tt(am_tt), .tm(am_tm),
+	.sc(am_sc), .ts_n(am_ts_n), .bb_n(am_bb_n), .d(am_d), .d_oe(am_d_oe),
+	.d_bus(bus_dr), .ta_n(ta_n), .tea_n(tea_n), .tbi_n(tbi_n)
+);
+
+// the trigger: the 68040 starts a line read of the armed line
+assign am_trig = bclk_en && !ts_n && a_oe && !am_drive && rw_n && siz == 2'b11 &&
+                 a_o[31:4] == am_trig_a[31:4];
+
+// +amtrace: every bus transfer beat, by either master
+logic amtrace;
+initial amtrace = $test$plusargs("amtrace");
+always_ff @(posedge clk)
+	if (amtrace && bclk_en) begin
+		if (!bus_ts_n)
+			$display("%8d %s TS %08x %s siz=%0d sc=%0d mi_n=%b", cycles, am_drive ? "ALT" : "CPU",
+			         bus_a, bus_rw_n ? "RD" : "WR", bus_siz, am_sc, mi_n);
+		if (!ta_n || !tea_n)
+			$display("%8d %s %s%s d=%08x (cpu ta_oe=%b mi_n=%b)", cycles, am_drive ? "ALT" : "CPU",
+			         !ta_n ? "TA" : "", !tea_n ? "TEA" : "", bus_rw_n ? bus_dr : bus_dw, cpu_ta_oe, mi_n);
+	end
+
+always_ff @(posedge clk)
+	if (amtrace && dut.dmu.sn_look)
+		$display("%8d SNOOP %08x hit=%b dirty=%b src=%0d way=%0d", cycles, dut.dmu.sn_pa,
+		         dut.dmu.sn_hit, dut.dmu.sn_dirty, dut.dmu.sn_src, dut.dmu.sn_way);
+
+// results back into the register block the program reads
+always_ff @(posedge clk) begin
+	am_status_q <= am_status;
+	if (am_status != am_status_q && am_status != 2'd0) begin
+		mem.mem[16'hF28C >> 2] <= {14'd0, am_status, 16'h0000};
+		for (int k = 0; k < 4; k++)
+			for (int i = 0; i < 4; i++)
+				mem.mem[(16'hF208 + 32 * k + 4 * i) >> 2] <= am_x_rd[k][127 - 32 * i -: 32];
+	end
+	if (am_go) mem.mem[16'hF28C >> 2] <= 32'd0;
+end
 int          cap;
 
 always_comb begin
@@ -164,8 +253,15 @@ always_ff @(posedge clk) begin
 		ipl_next    <= '0;
 		irq_exc_armed <= '0;
 		fetch_stall <= '0;
+		am_go       <= 1'b0;
+		am_n        <= '0;
+		am_trig_en  <= 1'b0;
+		am_trig_a   <= '0;
+		am_delay    <= '0;
+		for (int k = 0; k < 4; k++) begin am_x_addr[k] <= '0; am_x_ctl[k] <= '0; am_x_wd[k] <= '0; end
 	end
 	else begin
+		am_go <= 1'b0;
 		if (fetch_hold) fetch_stall <= fetch_stall - 1'd1;
 		// $F144 mode 1: IPL2 while TRAP #0 starts stacking; mode 2: IPL2
 		// once its vector has been read, the handler's first fetch held
@@ -194,6 +290,12 @@ always_ff @(posedge clk) begin
 			if (ev_tm == 3'd2 || ev_tm == 3'd6) fberr_armed <= 1'b0;
 			if (ev_tm == 3'd3 || ev_tm == 3'd4) wberr_arm <= 1'b0;
 		end
+		if (ev && ev_rd && !ev_err && ev_tt == 2'd0 && !am_drive &&
+		    ev_addr[15:0] == 16'hF2B0)
+			mem.mem[16'hF2B4 >> 2] <= mem.mem[16'hF2B4 >> 2] + 32'd1;
+		if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && !am_drive &&
+		    ev_addr[15:0] == 16'hF294 && ev_be == 4'b1111)
+			mem.mem[16'hF2A8 >> 2] <= ev_data;
 		if (ev && !ev_rd && !ev_err && ev_tt == 2'd0) begin
 			logic [15:0] w;
 			w = ev_word(ev_addr, ev_data);
@@ -224,6 +326,20 @@ always_ff @(posedge clk) begin
 				16'hF14C: begin ipl_lvl <= w[2:0]; ipl_pulse <= w[15:8]; end
 				16'hF150: begin ipl_lvl <= w[2:0]; ipl_next <= w[6:4]; ipl_step <= w[15:8]; end
 				16'hF154: begin fberr_armed <= (w != 16'd0); fberr_addr <= w; end
+				16'hF280: begin
+					// the command block was written to memory by the slave
+					for (int k = 0; k < 4; k++) begin
+						am_x_addr[k] <= mem.mem[(16'hF200 + 32 * k) >> 2];
+						am_x_ctl[k]  <= mem.mem[(16'hF204 + 32 * k) >> 2][20:16];
+						am_x_wd[k]   <= {mem.mem[(16'hF208 + 32 * k) >> 2], mem.mem[(16'hF20C + 32 * k) >> 2],
+						                 mem.mem[(16'hF210 + 32 * k) >> 2], mem.mem[(16'hF214 + 32 * k) >> 2]};
+					end
+					am_n       <= w[2:0];
+					am_trig_en <= w[8];
+					am_trig_a  <= mem.mem[16'hF284 >> 2];
+					am_delay   <= mem.mem[16'hF288 >> 2][31:16];
+					am_go      <= 1'b1;
+				end
 				default: ;
 			endcase
 			if ((ev_addr[15:0] & 16'hFFFC) == 16'hF120 && ev_tm != 3'd1) begin
