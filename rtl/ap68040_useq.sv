@@ -16,8 +16,7 @@
 //--------------------------------------------------------------------------//
 
 module ap68040_useq
-	import ap68040_pkg::*;
-	import ap68040_upkg::*;
+	import ap68040_pkg::*, ap68040_upkg::*;
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -276,6 +275,7 @@ always_comb begin
 	nu.target = src.target;
 	nu.pred   = src.pred && (uw.br == BR_COND || uw.br == BR_IMM);
 	nu.ser    = uw.ser;
+	nu.t0cof  = src.t0;
 	nu.pc     = src.pc;
 	nu.npc    = src.npc;
 	nu.first  = src_first;
@@ -674,6 +674,7 @@ always_ff @(posedge clk) begin
 				4'd1:    upc <= UA_EXC_FMT2;
 				4'd2:    upc <= UA_EXC_FMT7;
 				4'd3:    upc <= UA_EXC_IRQ;
+				4'd5:    upc <= UA_EXC_IRQM;
 				4'd4:    upc <= UA_EXC_RESET;
 				default: upc <= UA_EXC_FMT0;
 			endcase
@@ -695,6 +696,8 @@ always_comb begin
 		JC_AY7:      jc_now = (src.opw[2:0] == 3'd7);
 		JC_SUPER:    jc_now = smode;
 		JC_MASK0:    jc_now = (src.ext1 == 16'd0);
+		JC_X1A:      jc_now = src.ext1[15];
+		JC_SZ_B:     jc_now = (src.sz == SZ_B);
 		JC_CREG_RF:  jc_now = (src.ext1[11:0] == 12'h800) || (src.ext1[11:0] == 12'h803) ||
 		                      (src.ext1[11:0] == 12'h804);
 		default:     jc_now = 1'b0;

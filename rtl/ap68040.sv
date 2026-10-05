@@ -95,7 +95,6 @@ ap68040_biu #(.NC(NC)) biu (
 	.br_n(br_n), .bg_n(bg_n), .bb_n_i(bb_n_i), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n)
 );
-assign rsto_req = 1'b0;
 
 //--------------------------------------------------------------------------
 // back end and front end
@@ -112,6 +111,8 @@ logic  [2:0] sfc, dfc;
 logic        kill_now, adv_ag;
 logic [31:0] dtt0, dtt1, itt0, itt1, tc;
 logic        q_odd;
+logic  [2:0] iack_lvl;
+logic        dm_iack;
 
 logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
@@ -134,13 +135,13 @@ ap68040_backend be (
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
 	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy),
 	.dm_st_fault(dm_st_fault), .dm_st_fssw(dm_st_fssw),
-	.ipl(ipl_s2),
+	.ipl(ipl_s2), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted)
@@ -150,7 +151,7 @@ ap68040_dmu dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super),
-	.dm_noalloc(dm_noalloc),
+	.dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now),
 	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .fault(dm_fault), .fvec(dm_fvec),
@@ -160,7 +161,8 @@ ap68040_dmu dmu (
 	.cacr(cacr), .dtt0(dtt0), .dtt1(dtt1),
 	.b_req(b_req[0]), .b_breq(b_breq[0]), .b_wdata(b_wdata[0]),
 	.b_gnt(b_gnt[0]), .b_done(b_done[0]), .b_err(b_err[0]),
-	.b_rvalid(b_rvalid && b_rclient == 1'b0), .b_rdata(b_rdata), .b_rbeat(b_rbeat)
+	.b_rvalid(b_rvalid && b_rclient == 1'b0), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
+	.b_ravec(b_ravec)
 );
 
 // front end

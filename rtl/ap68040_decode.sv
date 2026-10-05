@@ -16,8 +16,7 @@
 //--------------------------------------------------------------------------//
 
 module ap68040_decode
-	import ap68040_pkg::*;
-	import ap68040_upkg::*;
+	import ap68040_pkg::*, ap68040_upkg::*;
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -233,6 +232,8 @@ function automatic logic jcond(input logic [4:0] jc, input logic [3:0] e0,
 		JC_AY7:      jcond = (ry == 3'd7);
 		JC_BOTH_MEM: jcond = m0 && m1;
 		JC_MASK0:    jcond = (ext1 == 16'd0);
+		JC_X1A:      jcond = ext1[15];
+		JC_SZ_B:     jcond = (s == SZ_B);
 		JC_CREG_RF:  jcond = (ext1[11:0] == 12'h800) || (ext1[11:0] == 12'h803) ||
 		                     (ext1[11:0] == 12'h804);
 		default:     jcond = 1'b0;
@@ -283,6 +284,7 @@ always_comb begin
 		nrec.eop  = pla.eop;
 		nrec.econd = pla.econd;
 		nrec.ccr  = pla.ccr;
+		nrec.t0   = pla.t0;
 		// immediate field: words 1 + nfix ..
 		begin
 			logic [2:0] pi;

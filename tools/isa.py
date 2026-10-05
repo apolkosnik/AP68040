@@ -318,6 +318,12 @@ def ea_legal(e, op):
     return True
 
 
+# 68040 T0 trace list (WinUAE gencpu.cpp trace_t0_68040_only/check_trace
+# sites; taken control transfers are traced by the back end)
+T0_RT = {'SR_LOG', 'MOVE_TO_SR', 'MOVE_TO_USP', 'NOP', 'MOVEC_WR', 'CAS',
+         'CAS2', 'MOVES', 'CACHE_OP', 'PFLUSH', 'PTEST'}
+
+
 def lookup(op):
     """Decode exactly as the hardware does: most specific bit pattern, then
     that entry's EA legality; None is an illegal/unimplemented opcode."""

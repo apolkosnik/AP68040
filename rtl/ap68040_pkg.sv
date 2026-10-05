@@ -79,10 +79,11 @@ localparam logic [1:0] M_ST   = 2'd2;
 localparam logic [1:0] M_RMW  = 2'd3;    // load, then store to the same place
 
 // function code of a data access
-localparam logic [1:0] MFC_NORM = 2'd0;  // user/supervisor data by S
-localparam logic [1:0] MFC_SFC  = 2'd1;  // MOVES read
-localparam logic [1:0] MFC_DFC  = 2'd2;  // MOVES write
-localparam logic [1:0] MFC_SUP  = 2'd3;  // supervisor data (exception stacking)
+localparam logic [2:0] MFC_NORM = 3'd0;  // user/supervisor data by S
+localparam logic [2:0] MFC_SFC  = 3'd1;  // MOVES read
+localparam logic [2:0] MFC_DFC  = 3'd2;  // MOVES write
+localparam logic [2:0] MFC_SUP  = 3'd3;  // supervisor data (exception stacking)
+localparam logic [2:0] MFC_IACK = 3'd4;  // interrupt acknowledge (TT=3)
 
 // control flow
 localparam logic [2:0] BR_NONE = 3'd0;
@@ -153,7 +154,10 @@ localparam logic [6:0]
 	OP_CHKSR = 7'd56,  // privilege/format checks for RTE etc (cond)
 	OP_CAS2C = 7'd57,  // CAS2 compare: cond 0 first pair, 1 second (if equal so far)
 	OP_CAS2W = 7'd58,  // CAS2 store: cond 0 A only if equal, 1 equal ? A : B
-	OP_CAS2R = 7'd59;  // CAS2 register: B merged with A unless equal
+	OP_CAS2R = 7'd59,  // CAS2 register: B merged with A unless equal
+	OP_RTEF  = 7'd60,  // RTE: frame length of format word A (exception 14)
+	OP_RTE   = 7'd61,  // RTE: SR = A, jump to B (throwaway frame: this RTE)
+	OP_IACKV = 7'd62;  // interrupt vector from the IACK data
 
 typedef struct packed {
 	logic [31:0] pc;        // address of the 68040 instruction
@@ -192,7 +196,7 @@ typedef struct packed {
 	// memory
 	logic  [1:0] mem;
 	logic  [1:0] msz;
-	logic  [1:0] mfc;
+	logic  [2:0] mfc;
 	logic        mlock;
 	logic        mlocke;    // last transfer of the locked sequence
 	logic        mprog;     // program space (PC-relative operand)
@@ -206,6 +210,7 @@ typedef struct packed {
 	// exceptions and control
 	logic  [7:0] exc;       // decode-time exception vector, 0 = none
 	logic        ser;       // serialize: flush and refetch npc after WB
+	logic        t0cof;     // the instruction is on the 68040 T0 trace list
 } uop_t;
 
 //--------------------------------------------------------------------------
@@ -251,6 +256,7 @@ typedef struct packed {
 	ea_t         ea1;
 	logic [31:0] target;  // PC-relative branch target
 	logic        pred;    // the front end followed target
+	logic        t0;      // on the 68040 T0 trace list
 } dinst_t;
 
 endpackage

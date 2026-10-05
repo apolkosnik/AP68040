@@ -82,7 +82,7 @@ m68040_bus_slave #(.AW(20)) mem (
 	.d_mem(d_mem), .ta_n(ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(1'b0), .iack_vector(8'd0),
+	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold), .iack_vector(8'd0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
@@ -120,6 +120,11 @@ logic [15:0] fberr_addr;
 logic [15:0] ipl_delay;
 logic  [7:0] ipl_pulse, ipl_step;
 logic  [2:0] ipl_next;
+logic  [1:0] irq_exc_armed;   // $F144
+logic  [2:0] fetch_stall;     // hold the next instruction fetch this many clocks
+logic        fetch_hold;
+assign fetch_hold = (fetch_stall != 0) && xfer_v && (xfer_tm == 3'd2 || xfer_tm == 3'd6);
+int          cap;
 
 always_comb begin
 	tea_req = 1'b0;
@@ -147,8 +152,20 @@ always_ff @(posedge clk) begin
 		ipl_pulse   <= '0;
 		ipl_step    <= '0;
 		ipl_next    <= '0;
+		irq_exc_armed <= '0;
+		fetch_stall <= '0;
 	end
 	else begin
+		if (fetch_hold) fetch_stall <= fetch_stall - 1'd1;
+		// $F144 mode 1: IPL2 while TRAP #0 starts stacking; mode 2: IPL2
+		// once its vector has been read, the handler's first fetch held
+		if (irq_exc_armed == 2'd1 && dut.be.exc_go && dut.be.xi_vecw[9:2] == 8'd32) begin
+			ipl_lvl <= 3'd2; irq_exc_armed <= 2'd0;
+		end
+		if (irq_exc_armed == 2'd2 && ev && ev_rd && ev_tm == 3'd5 &&
+		    ev_addr == dut.be.vbr_r + 32'h80) begin
+			ipl_lvl <= 3'd2; irq_exc_armed <= 2'd0; fetch_stall <= 3'd5;
+		end
 		if (ipl_delay != 0) begin
 			ipl_delay <= ipl_delay - 1'd1;
 			if (ipl_delay == 16'd1) ipl_lvl <= 3'd2;
@@ -177,6 +194,9 @@ always_ff @(posedge clk) begin
 						result <= 2;
 						$display("FAIL: program reports failure, test %0d (pc=%h)",
 						         mem.mem[16'hF100 >> 2][31:16], dbg_pc);
+						if (mem.mem[16'hF100 >> 2][31:16] == 16'd98)
+							$display("     hfail from handler id %0d",
+							         mem.mem[16'h3670 >> 2][31:16]);
 					end
 				end
 				16'hF108: begin
@@ -188,6 +208,7 @@ always_ff @(posedge clk) begin
 					mem.mem[16'h3500 >> 2] <= {w, 16'h0000};
 				end
 				16'hF142: berr_armed <= 1'b1;
+				16'hF144: irq_exc_armed <= w[1:0];
 				16'hF146: wberr_arm <= 1'b1;
 				16'hF148: ipl_delay <= w;
 				16'hF14C: begin ipl_lvl <= w[2:0]; ipl_pulse <= w[15:8]; end
@@ -211,6 +232,13 @@ always_ff @(posedge clk)
 		         cycles, dut.be.ag_v, dut.be.ag_u.pc, dut.be.ag_u.mem, dut.be.dc1_v, dut.be.dc2_v,
 		         dut.be.ex_v, dut.be.wb_v, dut.dmu.m1.v, dut.dmu.m2.v, dut.dmu.m3.v, dut.dmu.m4.v,
 		         dut.dmu.dc2_rdy, dut.dmu.q_st, dut.dmu.q_ld_done, dut.dmu.b_req, dut.dmu.b_gnt);
+
+// exception entries
+always_ff @(posedge clk)
+	if (trace && dut.be.x_go)
+		$display("%8d EXC vec=%0d kind=%0d pc=%08x addr=%08x osr=%04x nsr=%04x stopped=%b",
+		         cycles, dut.be.x_vec, dut.be.x_kind, dut.be.x_pc, dut.be.x_addr,
+		         dut.be.x_osr, dut.be.x_nsr, dut.be.stopped);
 
 // optional bus trace
 logic trace;
@@ -251,6 +279,8 @@ initial begin
 	cycles = 0;
 	stamp_prev = 0;
 	load_prog();
+	if (!$value$plusargs("cap=%d", cap)) cap = 7;
+	mem.mem[16'hF160 >> 2] = {cap[15:0], 16'h0000};
 	repeat (8) @(posedge clk);
 	rsti_n = 1'b1;
 	while (result == 0 && cycles < timeout && !dbg_halted) @(posedge clk);

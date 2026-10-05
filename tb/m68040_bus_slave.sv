@@ -48,6 +48,7 @@ module m68040_bus_slave #(
 	input  int          retry_pct,
 	input  logic        tea_req,
 	input  logic        tci_req,
+	input  logic        hold,          // insert wait states while high
 	input  logic  [7:0] iack_vector,   // 0 = answer with AVEC
 
 	// the transfer being answered (valid while xfer_v)
@@ -171,6 +172,9 @@ always_ff @(posedge clk) begin
 		end
 		else if (waits != 0) begin
 			waits <= waits - 1'd1;
+		end
+		else if (hold) begin
+			// the bench holds this beat
 		end
 		else begin
 			// answer this beat

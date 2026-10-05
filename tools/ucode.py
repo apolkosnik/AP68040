@@ -31,7 +31,7 @@ Operand selectors (a, b, d): symbolic names below, or a physical register
 
 import os
 import sys
-from isa import T, MODES
+from isa import T, MODES, T0_RT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, '..', 'rtl', 'gen')
@@ -41,7 +41,7 @@ OPS = {n: i for i, n in enumerate("""MOV ADD ADDX SUB SUBX CMP AND OR EOR NOT NE
 NEGX CLR EXT EXTB SWAP TAS ABCD SBCD NBCD PACK UNPK ASL ASR LSL LSR ROL ROR
 ROXL ROXR BTST BCHG BCLR BSET SCC EA BCC DBCC TRAPCC CHK CHK2A CHK2B CCRLOG
 SRLOG SPR SPW LATCH CAS MUL DIV MDHI MDRES BF BFSET MISC FPU CHKSR CAS2C
-CAS2W CAS2R""".split())}
+CAS2W CAS2R RTEF RTE IACKV""".split())}
 
 SYM = ['NONE', 'EA0', 'EA1', 'EA1R', 'DX', 'DY', 'AX', 'AY', 'IMM', 'QUICK',
        'MOVEQ', 'SHCNT', 'SP', 'SSP', 'NPC', 'PC', 'ZERO', 'CONST', 'X1R',
@@ -85,7 +85,7 @@ AGM = {n: i for i, n in enumerate(
 DSEL = {n: i for i, n in enumerate(['CONST', 'IMM', 'NIMM', 'QUICK', 'NQUICK',
                                     'IMMC', 'SZB'])}
 MEM = {None: 0, 'LD': 1, 'ST': 2, 'RMW': 3}
-MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3}
+MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3, 'IACK': 4}
 BR = {None: 0, 'COND': 1, 'IMM': 2, 'EA': 3, 'A': 4, 'B': 5}
 # condition sources: opword cc (11:8), the opcode entry's, the extension
 # word's ({ext[10], ext[11]}: 64-bit, signed), or a constant
@@ -96,7 +96,7 @@ SXW = {None: 0, 1: 1, 'SW': 2}
 JC = {n: i for i, n in enumerate(
     ['NEVER', 'ALWAYS', 'EA0_MEM', 'EA1_MEM', 'EA0_REG', 'EA0_DN', 'EA0_AN',
      'EA0_IMM', 'NOT_EA0_MEM', 'EXT11', 'SZ_L', 'AY7', 'BOTH_MEM',
-     'MASK0', 'SUPER', 'EXT10', 'CREG_RF'])}
+     'MASK0', 'SUPER', 'EXT10', 'CREG_RF', 'X1A', 'SZ_B'])}
 CCR = {'XNZVC': 0x1F, 'NZVC': 0x0F, 'Z': 0x04, 'ZC': 0x05, 'NONE': 0x00}
 
 
@@ -421,8 +421,45 @@ R('CHK2',
   U(op='LATCH', sz='L', a='T0'),
   U(op='CHK2B', cond='CHK2', a='T2', b='X1R', ccr='ZC', last=1))
 
-for n in ['MOVES', 'RTE', 'RTR', 'FPU_GEN',
-          'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC', 'FSAVE', 'FRESTORE',
+# RTE: SR, PC and the format word; RTEF turns the format into the frame
+# length (exception 14 on an unknown format; format $1 marks a throwaway
+# frame), SP += length, then RTE loads SR and jumps -- for a throwaway
+# frame back to this RTE, which then runs on the stack the new SR selects
+R('RTE',
+  U(op='MOV', sz='W', msz='W', a='LD', d='T1', ag='BASED', agb='SP', const=0),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2),
+  U(op='MOV', sz='W', msz='W', a='LD', d='T3', ag='BASED', agb='SP', const=6),
+  U(op='RTEF', sz='W', a='T3', d='T0'),
+  U(ag='ADDT0', agb='SP', agw='SP'),
+  U(op='RTE', sz='W', a='T1', b='T2', last=1))
+# RTR: CCR = (SP)+ word, PC = (SP)+ long
+R('RTR',
+  U(op='MOV', sz='W', msz='W', a='LD', d='T1', ag='BASED', agb='SP', const=0),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2),
+  U(op='CCRLOG', cond=3, a='T1', b='T2', ag='ADDC', agb='SP', agw='SP', const=6,
+    ccr='XNZVC', br='B', last=1))
+
+# FSAVE/FRESTORE with the FPU in its reset state: a four-byte NULL frame
+# (replaced by the FPU's frames when the FPU is attached)
+R('FSAVE',    U(op='MOV', sz='L', msz='L', a='ZERO', d='EA0', last=1))
+R('FRESTORE', U(op='MOV', sz='L', msz='L', a='EA0', d='T0', last=1))
+
+# MOVES: ext bit 11 = register to memory (DFC), else memory to register
+# (SFC); an address register takes the operand sign-extended to 32 bits
+R('MOVES',
+  U(jc='EXT11', jt='MOVES.9'),
+  U(jc='X1A', jt='MOVES.3'),
+  U(op='MOV', a='EA0', b='X1R', d='X1R', mfc='SFC', last=1),
+  U(op='MOV', a='EA0', d='T0', mfc='SFC'),
+  U(jc='SZ_L', jt='MOVES.8'),
+  U(jc='SZ_B', jt='MOVES.7'),
+  U(op='EXT', sz='L', b='T0', d='X1R', last=1),
+  U(op='EXTB', sz='L', b='T0', d='X1R', last=1),
+  U(op='MOV', sz='L', a='T0', d='X1R', last=1),
+  U(op='MOV', a='X1R', d='EA0', mfc='DFC', last=1))
+
+for n in ['FPU_GEN',
+          'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC',
           'CACHE_OP', 'PFLUSH', 'PTEST']:
     R(n, U(last=1))
 
@@ -461,7 +498,35 @@ R('EXC_RESET',
     a='LD', d='ISP'),
   U(op='MOV', sz='L', ag='BASED', agb='ZERO', const=4, msz='L', mem='LD', mfc='SUP',
     a='LD', br='A', last=1))
-R('EXC_IRQ', U(last=1))
+# interrupts.  At entry the back end has set S, cleared T, raised the mask,
+# and written T9 PC, T10 old SR; the IACK cycle (TT=3, TM=level) returns
+# the vector (AVEC: autovector, TEA: spurious).  IACKV turns it into the
+# format/vector word (cond 0) and the vector address (cond 1).
+R('EXC_IRQ',
+  U(op='IACKV', cond=0, sz='L', msz='B', a='LD', d='T12', mem='LD', mfc='IACK',
+    ag='BASED', agb='ZERO', const=-1),
+  U(op='IACKV', cond=1, sz='L', d='T8'),
+  U(op='MOV', sz='W', a='T12', ag='BASED', agb='ISP', const=-2, msz='W', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='L', a='T9',  ag='BASED', agb='ISP', const=-6, msz='L', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='ISP', const=-8, msz='W', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
+    a='LD', br='A', last=1))
+# with M set (68020-68040): format $0 on the master stack, then a format $1
+# throwaway frame on the interrupt stack with S set in its SR
+R('EXC_IRQM',
+  U(op='IACKV', cond=0, sz='L', msz='B', a='LD', d='T12', mem='LD', mfc='IACK',
+    ag='BASED', agb='ZERO', const=-1),
+  U(op='IACKV', cond=1, sz='L', d='T8'),
+  U(op='MOV', sz='W', a='T12', ag='BASED', agb='MSP', const=-2, msz='W', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='L', a='T9',  ag='BASED', agb='MSP', const=-6, msz='L', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='MSP', const=-8, msz='W', mem='ST', mfc='SUP'),
+  U(op='OR', sz='W', a='CONST', const=0x1000, b='T12', d='T7'),
+  U(op='OR', sz='W', a='CONST', const=0x2000, b='T10', d='T6'),
+  U(op='MOV', sz='W', a='T7',  ag='BASED', agb='ISP', const=-2, msz='W', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='L', a='T9',  ag='BASED', agb='ISP', const=-6, msz='L', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='W', a='T6',  ag='BASEDU', agb='ISP', const=-8, msz='W', mem='ST', mfc='SUP'),
+  U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
+    a='LD', br='A', last=1))
 
 # ------------------------------------------------------------ entry params
 EOP = {
@@ -539,7 +604,7 @@ def val(u, name):
 LAYOUT = [('op_inst', 1), ('op', 7), ('sz', 2), ('msz', 3), ('cond_inst', 3),
           ('cond', 4), ('ccr_inst', 1), ('ccr', 5), ('a', 6), ('b', 6),
           ('d', 6), ('sxw', 2), ('ag', 4), ('agb', 6), ('agw', 6),
-          ('dsel', 3), ('cval', 16), ('mem', 2), ('mfc', 2), ('lock', 1),
+          ('dsel', 3), ('cval', 16), ('mem', 2), ('mfc', 3), ('lock', 1),
           ('locke', 1),
           ('br', 3), ('last', 1), ('ser', 1), ('noupd', 1), ('upd2', 1),
           ('jc', 5), ('jt', 9), ('loop', 1)]
@@ -576,7 +641,7 @@ def emit():
             f.write('localparam logic [2:0] DS_%s = 3\'d%d;\n' % (n, i))
         for n, i in JC.items():
             f.write('localparam logic [4:0] JC_%s = 5\'d%d;\n' % (n, i))
-        for n in ['EXC_FMT0', 'EXC_FMT2', 'EXC_FMT7', 'EXC_RESET', 'EXC_IRQ',
+        for n in ['EXC_FMT0', 'EXC_FMT2', 'EXC_FMT7', 'EXC_RESET', 'EXC_IRQ', 'EXC_IRQM',
                   'DEC_EXC', 'BCC', 'BSR', 'DBCC', 'FBCC', 'FDBCC', 'FPU_GEN',
                   'TRAP', 'BKPT', 'ILLEGAL', 'MOVEM_RM', 'MOVEM_MR',
                   'MOVEC_RD', 'MOVEC_WR']:
@@ -603,7 +668,7 @@ def emit():
                 '\tlogic [4:0] ccr;\n'
                 '\tlogic [1:0] szc;\n\tlogic [11:0] ea0m;\n\tlogic [11:0] ea1m;\n'
                 '\tlogic [1:0] nfix;\n\tlogic [2:0] immk;\n\tlogic priv;\n'
-                '\tlogic [4:0] jc0;\n\tlogic [8:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n\tlogic [1:0] fea;\n'
+                '\tlogic [4:0] jc0;\n\tlogic [8:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n\tlogic [1:0] fea;\n\tlogic t0;\n'
                 '} pla_t;\n')
         f.write('function automatic pla_t dec_pla(input logic [15:0] op);\n')
         f.write("\tdec_pla = '0;\n\tcasez (op)\n")
@@ -622,11 +687,11 @@ def emit():
             if u0['jt'] is not None:
                 rn, k = u0['jt'].split('.')
                 jt0 = ENTRY[rn] + int(k)
-            f.write("\t\t16'b%s: dec_pla = '{1'b1, 9'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 5'd%d, 9'd%d, 1'b%d, 1'b%d, 2'd%d};  // %s %s\n"
+            f.write("\t\t16'b%s: dec_pla = '{1'b1, 9'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 5'd%d, 9'd%d, 1'b%d, 1'b%d, 2'd%d, 1'b%d};  // %s %s\n"
                     % (pat, ENTRY[e.rt], eop, ec or 0, 1 if ec is not None else 0,
                        ccr, SZC[e.sz], mask0, mask1, e.nfix, IMMK[e.imm],
                        1 if e.priv else 0, jc0, jt0, e.ea0 is not None,
-                       e.ea1 is not None, e.fea, e.name, e.rt))
+                       e.ea1 is not None, e.fea, e.rt in T0_RT, e.name, e.rt))
         f.write('\t\tdefault: ;\n\tendcase\nendfunction\n')
     print('ucode: %d words of %d bits, %d routines' % (len(ROM), WIDTH, len(ORDER)))
 
