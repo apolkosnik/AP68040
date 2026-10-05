@@ -56,6 +56,22 @@ typedef struct packed {
 } busreq_t;
 
 //--------------------------------------------------------------------------
+// ATC entry (MC68040UM figure 3-21); pa is PA31-12 (PA12 comes from LA12
+// with 8 Kbyte pages)
+//--------------------------------------------------------------------------
+typedef struct packed {
+	logic [19:0] pa;
+	logic        g;       // global
+	logic  [1:0] upa;     // U1 U0
+	logic        s;       // supervisor only
+	logic  [1:0] cm;      // cache mode
+	logic        m;       // modified
+	logic        w;       // write protected (accumulated)
+	logic        r;       // resident (table search succeeded)
+	logic        b;       // the table search took a bus error
+} atce_t;
+
+//--------------------------------------------------------------------------
 // Operation sizes
 //--------------------------------------------------------------------------
 localparam logic [1:0] SZ_B = 2'd0;

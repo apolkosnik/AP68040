@@ -228,10 +228,12 @@ end
 logic ptrace;
 always_ff @(posedge clk)
 	if (ptrace)
-		$display("%8d AG=%b/%08x mem=%0d DC1=%b DC2=%b EX=%b WB=%b | m1=%b m2=%b m3=%b m4=%b rdy=%b q=%0d ldd=%b req=%b gnt=%b",
+		$display("%8d AG=%b/%08x mem=%0d DC1=%b DC2=%b EX=%b WB=%b | m1=%b m2=%b m3=%b m4=%b rdy=%b e=%0d done=%b req=%b gnt=%b | f=%b hz=%b x=%b/%0d/%h dw=%b/%0d st1=%b",
 		         cycles, dut.be.ag_v, dut.be.ag_u.pc, dut.be.ag_u.mem, dut.be.dc1_v, dut.be.dc2_v,
-		         dut.be.ex_v, dut.be.wb_v, dut.dmu.m1.v, dut.dmu.m2.v, dut.dmu.m3.v, dut.dmu.m4.v,
-		         dut.dmu.dc2_rdy, dut.dmu.q_st, dut.dmu.q_ld_done, dut.dmu.b_req, dut.dmu.b_gnt);
+		         dut.be.ex_v, dut.be.wb_v, dut.dmu.m1.v, dut.dmu.m2.r.v, dut.dmu.m3.r.v, dut.dmu.m4.r.v,
+		         dut.dmu.dc2_rdy, dut.dmu.e_st, dut.dmu.e_dc2_done, dut.dmu.b_req, dut.dmu.b_gnt,
+		         dut.dmu.m2.fast, dut.dmu.hz, dut.dmu.m2.x.hit, dut.dmu.m2.x.way, dut.dmu.m2.x.pa,
+		         dut.dmu.dw, dut.dmu.dw_set, dut.dmu.m1_stale);
 
 // exception entries
 always_ff @(posedge clk)

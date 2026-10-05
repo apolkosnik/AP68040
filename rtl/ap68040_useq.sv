@@ -191,7 +191,7 @@ always_comb begin
 		o = '0;
 		o.v = (s != S_NONE);
 		o.src = OS_REG;
-		if (s >= 6'd32) o.r = s[4:0];
+		if (s >= 6'd40) o.r = 5'(s - 6'd25);
 		else case (s)
 			S_EA0, S_EA0R, S_EA1, S_EA1R: begin
 				ea_t e;
@@ -240,6 +240,7 @@ always_comb begin
 				if (src.ext1[5]) o.r = dreg(src.ext1[2:0]);
 				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[4:0]}; end
 			end
+			S_OPW:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {16'd0, src.opw}; end
 			S_CREGR: o.r = (src.ext1[2:0] == 3'd0) ? R_USP : (src.ext1[2:0] == 3'd3) ? R_MSP : R_ISP;
 			default: o.v = 1'b0;
 		endcase
@@ -411,14 +412,14 @@ always_comb begin
 			S_AY:  rb = areg(src.opw[2:0], sp_reg);
 			S_SP:  rb = sp_reg;
 			S_SSP: rb = ssp;
-			default: rb = uw.agb[4:0];
+			default: rb = 5'(uw.agb - 6'd25);   // USP ISP MSP T0-T13 (>= 40)
 		endcase
 		case (uw.agw)
 			S_AX:  rw = areg(src.opw[11:9], sp_reg);
 			S_AY:  rw = areg(src.opw[2:0], sp_reg);
 			S_SP:  rw = sp_reg;
 			S_SSP: rw = ssp;
-			default: rw = uw.agw[4:0];
+			default: rw = 5'(uw.agw - 6'd25);
 		endcase
 		case (uw.dsel)
 			DS_IMM:    dsv = src.imm;

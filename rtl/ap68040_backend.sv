@@ -65,6 +65,18 @@ module ap68040_backend
 	output logic        dm_super,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        dm_iack,        // interrupt acknowledge cycle
+	input  logic        dm_hold1,       // the DMU holds DC1
+	// WB maintenance (CINV/CPUSH/PFLUSH/PTEST) in the DMU
+	output logic        mt_v,
+	output logic  [2:0] mt_op,
+	output logic  [1:0] mt_scope,
+	output logic  [1:0] mt_caches,
+	output logic [31:0] mt_addr,
+	output logic  [2:0] mt_fc,
+	output logic        mt_ng,
+	output logic        mt_wr,
+	input  logic        mt_done,
+	input  logic [31:0] mt_mmusr,
 	output logic        adv_dc1,        // DC1 -> DC2
 	output logic        adv_dc2,        // DC2 -> EX
 	output logic        adv_ex,         // EX -> WB
@@ -80,6 +92,7 @@ module ap68040_backend
 	input  logic        dm_st_rdy,      // store accepted (WB may complete)
 	input  logic        dm_st_fault,
 	input  logic [15:0] dm_st_fssw,
+	input  logic [31:0] dm_st_faddr,
 
 	// interrupts (synchronized level, 0-7)
 	input  logic  [2:0] ipl,
@@ -94,6 +107,8 @@ module ap68040_backend
 	output logic [31:0] itt0,
 	output logic [31:0] itt1,
 	output logic [31:0] tc,
+	output logic [31:0] urp,
+	output logic [31:0] srp,
 
 	// debug
 	output logic [31:0] dbg_pc,
@@ -167,6 +182,8 @@ assign dtt1 = dtt1_r;
 assign itt0 = itt0_r;
 assign itt1 = itt1_r;
 assign tc   = tc_r;
+assign urp  = urp_r;
+assign srp  = srp_r;
 assign vbr  = vbr_r;
 assign cacr = cacr_r;
 assign sfc  = sfc_r;
@@ -186,7 +203,7 @@ assign dc2_hold  = dc2_v && (dc2_u.mem != M_NONE) && (dc2_u.exc == 8'd0) && !dm_
 assign stall_wb  = wb_v  && wb_hold;
 assign stall_ex  = ex_v  && (ex_hold  || stall_wb);
 assign stall_dc2 = dc2_v && (dc2_hold || stall_ex);
-assign stall_dc1 = dc1_v && stall_dc2;
+assign stall_dc1 = dc1_v && (stall_dc2 || dm_hold1);
 assign stall_ag  = ag_v  && (ag_hold  || stall_dc1);
 
 assign adv_wb  = wb_v  && !stall_wb;
@@ -652,6 +669,7 @@ always_comb begin
 		end
 		OP_MISC: begin
 			xs.flags = ccr_f;
+			xs.res   = ex_av;              // maintenance: the address
 			if (ex_u.cond == 4'd2) begin
 				// STOP #imm: SR = imm, then wait for an interrupt
 				xs.sr_new = ex_av[15:0] & 16'hF71F;
@@ -673,13 +691,14 @@ always_comb begin
 			end
 		end
 		OP_RTEF: begin
-			// 68040 frame formats (WinUAE i_RTE): $0 8, $1 8 (throwaway),
-			// $2 12, $3 12, $4 16, $7 60 bytes; others: format error
+			// 68040 frame formats: $0 8, $1 8 (throwaway), $2 12, $3 12,
+			// $7 60 bytes; others are a format error -- including $4, which
+			// "the MC68040 does not generate or recognize" (MC68040UM 8.4.5;
+			// only the LC/EC040 use it)
 			xs.flags = ccr_f;
 			case (ex_av[15:12])
 				4'h0, 4'h1: xs.res = 32'd8;
 				4'h2, 4'h3: xs.res = 32'd12;
-				4'h4:       xs.res = 32'd16;
 				4'h7:       xs.res = 32'd60;
 				default: begin xs.res = 32'd0; xs.xvec = 8'd14; end
 			endcase
@@ -801,8 +820,23 @@ wire x_go        = (adv_wb && wb_is_exc) || take_trace || take_irq;
 
 // WB holds: store not accepted yet; RESET until RSTO is done
 wire wb_reset    = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd1);
+wire wb_mt       = (wb_u.op == OP_MISC) && (wb_u.cond >= 4'd3) && (wb_u.cond <= 4'd5);
+logic mt_seen;                // the DMU finished this WB uop's maintenance
 assign wb_hold = wb_v && !wb_is_exc &&
-                 ((wb_st && !dm_st_rdy) || (wb_reset && (!rst_issued || rsto_busy)));
+                 ((wb_st && !dm_st_rdy) || (wb_st && dm_st_fault) ||
+                  (wb_reset && (!rst_issued || rsto_busy)) ||
+                  (wb_mt && !mt_seen));
+
+assign mt_v      = wb_v && wb_mt && !wb_is_exc && !mt_seen;
+assign mt_op     = (wb_u.cond == 4'd3) ? (wb_u.imm_b[5] ? 3'd2 : 3'd1) :
+                   (wb_u.cond == 4'd4) ? 3'd3 : 3'd4;
+assign mt_scope  = (wb_u.cond == 4'd3) ? wb_u.imm_b[4:3] :
+                   (wb_u.cond == 4'd4) ? (wb_u.imm_b[4] ? 2'd3 : 2'd2) : 2'd2;
+assign mt_caches = wb_u.imm_b[7:6];
+assign mt_addr   = wb_res;
+assign mt_fc     = dfc_r;
+assign mt_ng     = (wb_u.cond == 4'd4) && !wb_u.imm_b[3];
+assign mt_wr     = (wb_u.cond == 4'd5) && !wb_u.imm_b[5];
 
 logic        rst_seq;         // reset exception pending (first cycles)
 
@@ -816,6 +850,7 @@ logic [31:0] x_pc, x_addr;
 logic [15:0] x_osr, x_ssw, x_nsr;
 logic  [3:0] x_kind;
 logic  [4:0] x_ssp;
+logic        x_wfault;
 always_comb begin
 	logic [15:0] cur;
 	// the SR the exception sees: after this instruction when it completed
@@ -853,6 +888,7 @@ always_comb begin
 	x_kind = take_irq && !(adv_wb && wb_is_exc) ? (cur[12] ? EK_IRQM : EK_IRQ) :
 	         (x_fmt == 4'h7) ? EK_FMT7 : (x_fmt == 4'h2) ? EK_FMT2 : EK_FMT0;
 	x_ssp  = cur[12] ? R_MSP : R_ISP;
+	x_wfault = (x_fmt == 4'h7) && !x_ssw[8];
 	// the SR inside the handler: S set, T cleared; an interrupt raises the
 	// mask to its level and clears M
 	x_nsr  = {2'b00, 1'b1, cur[12], cur[11:0]};
@@ -905,6 +941,7 @@ always_ff @(posedge clk) begin
 		trace_defer <= 1'b0;
 		trace_addr <= 32'd0;
 		rst_issued <= 1'b0;
+		mt_seen <= 1'b0;
 		wb_cof  <= 1'b0;
 		halted  <= 1'b0;
 		rst_seq <= 1'b1;
@@ -1160,7 +1197,28 @@ always_ff @(posedge clk) begin
 			rf_f[R_T0 + 11] <= x_addr;
 			rf_f[R_T0 + 12] <= {16'd0, vw};
 			rf_f[R_T0 + 13] <= {16'd0, x_ssw};
+			// format $7 write fault: WB3A mirrors the fault address and
+			// WB3D carries the store data (WB3S stays clear: the core
+			// restarts the instruction, nothing is left to write back)
+			rf_b[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;
+			rf_b[R_T0 + 7]  <= x_wfault ? wb_st_data : 32'd0;
+			rf_f[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;
+			rf_f[R_T0 + 7]  <= x_wfault ? wb_st_data : 32'd0;
 		end
+
+		// a store that took a bus error at WB becomes an access fault of
+		// its instruction (WB holds one cycle, then takes it)
+		if (wb_v && wb_st && dm_st_rdy && dm_st_fault && wb_exc == 8'd0) begin
+			wb_exc      <= 8'd2;
+			wb_exc_addr <= dm_st_faddr;
+			wb_exc_ssw  <= dm_st_fssw;
+		end
+		// maintenance done: WB completes next cycle; PTEST sets MMUSR
+		if (wb_v && wb_mt && mt_done) begin
+			mt_seen <= 1'b1;
+			if (wb_u.cond == 4'd5) mmusr_r <= mt_mmusr;
+		end
+		if (adv_wb) mt_seen <= 1'b0;
 
 		// RESET instruction: RSTO for 512 bus clocks, WB waits
 		if (wb_v && wb_reset && !rst_issued && !wb_is_exc) rst_issued <= 1'b1;

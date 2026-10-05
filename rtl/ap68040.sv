@@ -111,6 +111,10 @@ logic  [2:0] sfc, dfc;
 logic        kill_now, adv_ag;
 logic [31:0] dtt0, dtt1, itt0, itt1, tc;
 logic        q_odd;
+logic        dm_hold1, mt_v, mt_ng, mt_wr, mt_done;
+logic  [2:0] mt_op, mt_fc;
+logic  [1:0] mt_scope, mt_caches;
+logic [31:0] mt_addr, mt_mmusr, urp, srp, dm_st_faddr;
 logic  [2:0] iack_lvl;
 logic        dm_iack;
 
@@ -142,6 +146,10 @@ ap68040_backend be (
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
 	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy),
 	.dm_st_fault(dm_st_fault), .dm_st_fssw(dm_st_fssw),
+	.dm_hold1(dm_hold1), .mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope),
+	.mt_caches(mt_caches), .mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng),
+	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .dm_st_faddr(dm_st_faddr),
+	.urp(urp), .srp(srp),
 	.ipl(ipl_s2), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
@@ -151,19 +159,27 @@ ap68040_backend be (
 ap68040_dmu dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
-	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super),
-	.dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
+	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
+	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
-	.kill_now(kill_now),
+	.kill_now(kill_now), .dm_hold1(dm_hold1),
 	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .fault(dm_fault), .fvec(dm_fvec),
 	.faddr(dm_faddr), .fssw(dm_fssw),
 	.st_v(dm_st_v), .st_data(dm_st_data), .st_rdy(dm_st_rdy),
-	.st_fault(dm_st_fault), .st_fssw(dm_st_fssw),
-	.cacr(cacr), .dtt0(dtt0), .dtt1(dtt1),
+	.st_fault(dm_st_fault), .st_fssw(dm_st_fssw), .st_faddr(dm_st_faddr),
+	.mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope), .mt_caches(mt_caches),
+	.mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng), .mt_wr(mt_wr),
+	.mt_done(mt_done), .mt_mmusr(mt_mmusr),
+	.cacr(cacr), .tc(tc), .urp(urp), .srp(srp),
+	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1),
+	.iw_req(1'b0), .iw_va(32'd0), .iw_fc2(1'b0), .iw_done(), .iw_ent(),
+	.ic_inv(), .ic_inv_scope(), .ic_inv_pa(), .ic_inv_done(1'b1),
+	.iatc_flush_all(), .iatc_flush_page(), .iatc_flush_ng(), .iatc_flush_la(),
+	.iatc_flush_fc2(), .iatc_wr(), .iatc_wla(), .iatc_wfc2(), .iatc_went(),
 	.b_req(b_req[0]), .b_breq(b_breq[0]), .b_wdata(b_wdata[0]),
 	.b_gnt(b_gnt[0]), .b_done(b_done[0]), .b_err(b_err[0]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b0), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
-	.b_ravec(b_ravec)
+	.b_ravec(b_ravec), .b_rtci(b_rtci)
 );
 
 // front end

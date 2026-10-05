@@ -46,9 +46,9 @@ CAS2W CAS2R RTEF RTE IACKV""".split())}
 SYM = ['NONE', 'EA0', 'EA1', 'EA1R', 'DX', 'DY', 'AX', 'AY', 'IMM', 'QUICK',
        'MOVEQ', 'SHCNT', 'SP', 'SSP', 'NPC', 'PC', 'ZERO', 'CONST', 'X1R',
        'X1DL', 'X1DH', 'X1DU', 'X2DC', 'X2DU', 'X2R', 'MVR', 'EA0R', 'LD',
-       'CREG', 'CREGR', 'BFO', 'BFW']
+       'CREG', 'CREGR', 'BFO', 'BFW', 'OPW']
 SYMI = {n: i for i, n in enumerate(SYM)}
-assert len(SYM) <= 32
+assert len(SYM) <= 40
 
 PHYS = {}
 for i in range(8):
@@ -60,12 +60,16 @@ for i in range(14):
     PHYS['T%d' % i] = 18 + i
 
 
+# selector encoding: 0-39 symbolic, 40-56 the physical registers USP, ISP,
+# MSP, T0-T13 (physical 15-31) that microcode may name directly
 def sel(x):
     if x is None:
         return 0
     if x in SYMI:
         return SYMI[x]
-    return 32 + PHYS[x]
+    p = PHYS[x]
+    assert p >= 15, 'microcode names only USP/ISP/MSP/T0-T13: ' + x
+    return 40 + (p - 15)
 
 
 # AG modes
@@ -458,9 +462,14 @@ R('MOVES',
   U(op='MOV', sz='L', a='T0', d='X1R', last=1),
   U(op='MOV', a='X1R', d='EA0', mfc='DFC', last=1))
 
+# cache and MMU maintenance run at WB in the data memory unit: A is the
+# address register, B the operation word (scope, caches, variant)
+R('CACHE_OP', U(op='MISC', cond=3, sz='L', a='AY', b='OPW', ser=1, last=1))
+R('PFLUSH',   U(op='MISC', cond=4, sz='L', a='AY', b='OPW', ser=1, last=1))
+R('PTEST',    U(op='MISC', cond=5, sz='L', a='AY', b='OPW', ser=1, last=1))
+
 for n in ['FPU_GEN',
-          'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC',
-          'CACHE_OP', 'PFLUSH', 'PTEST']:
+          'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC']:
     R(n, U(last=1))
 
 # exception routines.  At entry the back end has set S, cleared T, and
@@ -481,6 +490,10 @@ R('EXC_FMT2',
     a='LD', br='A', last=1))
 _f7 = [U(op='MOV', sz='L', a='ZERO', ag='BASED', agb='SSP', const=-4 * (k + 1),
          msz='L', mem='ST', mfc='SUP') for k in range(10)]
+_f7[7] = U(op='MOV', sz='L', a='T7', ag='BASED', agb='SSP', const=-32,
+          msz='L', mem='ST', mfc='SUP')                    # WB3D
+_f7[8] = U(op='MOV', sz='L', a='T6', ag='BASED', agb='SSP', const=-36,
+          msz='L', mem='ST', mfc='SUP')                    # WB3A
 R('EXC_FMT7',
   *_f7,                                                     # PD3..WB3A area
   U(op='MOV', sz='L', a='T11', ag='BASED', agb='SSP', const=-40, msz='L', mem='ST', mfc='SUP'),  # FA
