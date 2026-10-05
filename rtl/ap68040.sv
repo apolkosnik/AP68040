@@ -10,7 +10,10 @@
 
 module ap68040
 	import ap68040_pkg::*;
-(
+#(
+	parameter logic [7:0] FPU_REVISION = 8'h41   // FSAVE frames: $41, or $40 (44-byte UNIMP)
+)(
+
 	input  logic        clk,
 	input  logic        bclk_en,
 	input  logic        rsti_n,
@@ -132,7 +135,7 @@ logic  [1:0] uq_n;
 uop_t        uq0;
 logic        uo_rdy;
 
-ap68040_backend be (
+ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush),

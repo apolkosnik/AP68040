@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO / "tools" / "cputest"))
 from replay_gen import generate  # noqa: E402
 
 SIM = Path(os.environ.get("CPUTEST_SIM", REPO / "obj" / "obj_cputest" / "tb_cputest"))
-MON = HERE / "build" / "cputest_mon.bin"
+MON = Path(os.environ.get("CPUTEST_MON", HERE / "build" / "cputest_mon.bin"))
 
 GROUPS = {
     "4_AE": "AE", "4_BASIC": "Basic", "4_Default": "Default",
@@ -166,12 +166,23 @@ def main():
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--keep-jobs", action="store_true")
     ap.add_argument("--plusarg", action="append", default=[])
+    ap.add_argument("--skip-log", type=Path, action="append", default=[],
+                    help="skip slices reported PASS in this earlier runner output")
     args = ap.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
     if not SIM.exists() or not MON.exists():
         raise SystemExit("build the bench first: tb/build_cputest.sh")
     root = corpus_root(args.corpus, args.work)
     items = discover(root, args)
+    passed = set()
+    for lg in args.skip_log:
+        for line in lg.read_text(errors="replace").splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[0] == "PASS":
+                passed.add(f[1])
+    if passed:
+        items = [it for it in items if "%s--%s--%s" % (
+            it["group"], it["instr"].replace("/", "_"), it["slice"]) not in passed]
     print("%d slices" % len(items), flush=True)
     results = []
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:

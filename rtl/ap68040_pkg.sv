@@ -100,6 +100,7 @@ localparam logic [2:0] MFC_SFC  = 3'd1;  // MOVES read
 localparam logic [2:0] MFC_DFC  = 3'd2;  // MOVES write
 localparam logic [2:0] MFC_SUP  = 3'd3;  // supervisor data (exception stacking)
 localparam logic [2:0] MFC_IACK = 3'd4;  // interrupt acknowledge (TT=3)
+localparam logic [2:0] MFC_EAP  = 3'd5;  // microcode: the EA's space (D2 maps it)
 
 // control flow
 // internal exception codes of instruction fetch faults (uop.exc); real
@@ -237,6 +238,8 @@ typedef struct packed {
 	logic        b_upd;     // operand B is this uop's own (An)+/-(An) register:
 	                        // it reads the updated value (source EA updates)
 	logic        a_upd;     // the same for operand A (MOVES An,(An)+ / -(An))
+	logic  [2:0] dyn;       // cancelled at AG by run-time state (FPU transfers)
+	logic  [4:0] dynk;      // ... its slot / word index
 } uop_t;
 
 //--------------------------------------------------------------------------
@@ -286,14 +289,13 @@ typedef struct packed {
 	logic [15:0] opw;
 	logic [15:0] ext1;
 	logic [15:0] ext2;
-	logic  [8:0] rt;      // first micro-instruction
+	logic  [9:0] rt;      // first micro-instruction
 	logic  [6:0] eop;
 	logic  [3:0] econd;
 	logic  [4:0] ccr;
 	logic  [1:0] sz;
 	logic  [7:0] exc;     // decode-time exception vector, 0 none
 	logic [31:0] imm;     // immediate field
-	logic [63:0] fimm;    // further immediate words (FPU .D/.X/.P)
 	ea_t         ea0;
 	ea_t         ea1;
 	logic [31:0] target;  // PC-relative branch target

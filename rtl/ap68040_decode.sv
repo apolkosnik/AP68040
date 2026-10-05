@@ -169,7 +169,14 @@ endfunction
 
 // FPU immediate length from the command word's source format
 function automatic logic [2:0] fp_immlen(input logic [15:0] cmd);
-	case (cmd[12:10])
+	logic [2:0] crl;
+	crl = (cmd[12:10] == 3'd0) ? 3'b001 : cmd[12:10];
+	if (cmd[15:13] == 3'b100)
+		// FMOVE(M) #imm to control registers: a long word each
+		fp_immlen = {2'(crl[0]) + 2'(crl[1]) + 2'(crl[2]), 1'b0};
+	else if (cmd[15:13] != 3'b010)
+		fp_immlen = 3'd0;
+	else case (cmd[12:10])
 		3'd0, 3'd1: fp_immlen = 3'd2;   // L, S
 		3'd2, 3'd3: fp_immlen = 3'd6;   // X, P
 		3'd4, 3'd6: fp_immlen = 3'd1;   // W, B
@@ -269,10 +276,10 @@ always_comb begin
 				nrec.ea1 = mk_ea(i, part.opw[11:9], part_len, 3'd0,
 				                 part.pc + {27'd0, part_len, 1'b0},
 				                 win[0], win[1], win[2], win[3], win[4]);
-			if (ph == PH_EA0 && il == 3'd6)
-				nrec.fimm = {win[2], win[3], win[4], win[5]};
-			if (ph == PH_EA0 && il == 3'd4)
-				nrec.fimm = {win[2], win[3], 32'd0};
+			// an FPU immediate is read from the instruction stream by the
+			// microcode: its address follows the extension word
+			if (ph == PH_EA0 && nrec.ea0.m == EM_IMM && part.rt == UA_FPU_GEN)
+				nrec.ea0.bd = part.pc + 32'd4;
 			if (ph == PH_EA0 && has_ext(part_pd.i1) && !flt) begin
 				go_part = 1'b1;
 				nph     = PH_EA1;
@@ -361,7 +368,7 @@ always_comb begin
 
 		nrec.npc = qpc + {27'd0, use_n, 1'b0};
 		nrec.rt  = (jcond(a0.jc0, pd0.i0, pd0.i1, win[1], pd0.sz, opw[2:0])) ? a0.jt0 :
-		           (a0.jc0 != JC_NEVER) ? a0.rt + 9'd1 : a0.rt;
+		           (a0.jc0 != JC_NEVER) ? a0.rt + 10'd1 : a0.rt;
 		// fixed operand forms: (Ay)+,(Ax)+ and -(Ay),-(Ax); MOVE16
 		if (a0.fea == 2'd3) begin
 			if (opw[5]) begin
@@ -421,6 +428,18 @@ always_comb begin
 			ntarget = qpc + 32'd2 + disp;
 			nredir  = disp[31];
 		end
+		else if (a0.rt == UA_FBCC) begin
+			disp    = opw[6] ? {win[1], win[2]} : sx16(win[1]);
+			ntarget = qpc + 32'd2 + disp;
+			nredir  = (opw[5:0] == 6'h0F) || disp[31];
+		end
+		else if (a0.rt == UA_FDBCC) begin
+			disp    = sx16(win[2]);
+			ntarget = qpc + 32'd4 + disp;
+			nredir  = disp[31];
+		end
+		if (a0.rt == UA_FPU_GEN && nrec.ea0.m == EM_IMM)
+			nrec.ea0.bd = qpc + 32'd4;
 		nrec.target = flt ? f_addr : ntarget;
 		nrec.pred   = nredir && (nrec.exc == 8'd0) && pd0.legal;
 	end

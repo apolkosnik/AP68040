@@ -24,7 +24,9 @@
 
 module ap68040_backend
 	import ap68040_pkg::*;
-(
+#(
+	parameter logic [7:0] FPU_REVISION = 8'h41   // FSAVE frame revision ($40: 44-byte UNIMP)
+)(
 	input  logic        clk,
 	input  logic        nreset,
 
@@ -152,6 +154,9 @@ logic  [7:0] wb_exc;          // exception vector, 0 none
 logic        wb_exc_pcv;      // the frame PC is wb_exc_pc (odd change of flow)
 logic [31:0] wb_exc_pc;
 logic        wb_oddrte;       // RTE to an odd PC: its SR is committed first
+logic        wb_exc_fmtv;     // the frame format is wb_exc_fmt (FPU exceptions)
+logic  [3:0] wb_exc_fmt;
+logic        wb_xcommit;      // the uop's address updates stand (FPU unimp/unsupp)
 logic [31:0] wb_exc_addr;
 logic [15:0] wb_exc_ssw;
 logic        wb_st;           // store at WB
@@ -171,6 +176,14 @@ logic [31:0] dc1_upd, dc1_upd2, dc2_upd, dc2_upd2, ex_upd, ex_upd2;
 // exception clears fv, so every register reads the back file again -- no
 // copy.  Five read ports at AG: base, index, upd2 register, A, B.
 logic [31:0] fv;
+// FPU interface outputs (ap68040_fpif)
+logic        fp_hold, fp_dkill, fp_taken, fp_xnext, fp_xcommit, fp_stkill;
+logic [31:0] fp_res, fp_xaddr;
+logic  [7:0] fp_xvec;
+logic  [3:0] fp_xfmt;
+logic  [7:0] fp_mvslots;
+logic  [2:0] fp_crslots;
+logic  [4:0] fp_svwords, fp_rswords;
 logic  [2:0] fwe, bwe;
 logic  [4:0] fwa [3], bwa [3];
 logic [31:0] fwd [3], bwd [3];
@@ -268,8 +281,14 @@ wire [31:0] ag_u2v  = rrd[2] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
 wire        ag_bfh    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hE);
 wire        ag_bft    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hD);
 wire        ag_rte7   = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hB);
+// FPU transfers cancelled by run-time state: FMOVEM slots, FSAVE and
+// FRESTORE frame words (dyn; the FPU interface latched the state in EX
+// before these uops' addresses could be formed)
+wire        ag_dyncan = (ag_u.dyn == 3'd1 && !fp_mvslots[ag_u.dynk[2:0]]) ||
+                        (ag_u.dyn == 3'd2 && ag_u.dynk >= fp_svwords) ||
+                        (ag_u.dyn == 3'd3 && ag_u.dynk >= fp_rswords);
 wire        ag_cancel = (ag_bft && !(bf_nb == 3'd3 || bf_nb == 3'd5)) ||
-                        (ag_rte7 && !rte_fmt7);
+                        (ag_rte7 && !rte_fmt7) || ag_dyncan;
 // a continued MOVEM transfers from the stacked EA
 wire        ag_cm     = cm_pend && (ag_u.pc == cm_pc) && (ag_u.mem != M_NONE) &&
                         (ag_u.op == OP_MOV) && (ag_u.cond == 4'hC);
@@ -372,9 +391,25 @@ ap68040_muldiv md (
 	.busy(md_busy), .done(md_done), .res_hi(md_hi), .res_lo(md_lo), .ovf(md_ovf)
 );
 
+// FPU: OP_FPU uops act once no older uop is in flight (WB empty)
+wire         ex_is_fp = (ex_u.op == OP_FPU);
+ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
+	.clk(clk), .nreset(nreset),
+	.ex_v(ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0), .sub(ex_u.cond),
+	.imm(ex_u.imm[7:0]), .immb(ex_u.imm_b[7:0]),
+	.av(ex_av), .bv(ex_bv), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
+	.safe(!wb_v), .adv(adv_ex), .kill(kill_now),
+	.hold(fp_hold), .res(fp_res), .dkill(fp_dkill), .taken(fp_taken),
+	.xvec(fp_xvec), .xfmt(fp_xfmt), .xnext(fp_xnext), .xaddr(fp_xaddr),
+	.xcommit(fp_xcommit), .st_kill(fp_stkill),
+	.mv_slots(fp_mvslots), .cr_slots(fp_crslots),
+	.sv_words(fp_svwords), .rs_words(fp_rswords)
+);
+
 // EX holds while the unit runs, until the cycle its result is presented
 assign ex_hold = (ex_v && ex_is_md && !ex_div0 && !ex_fault && !md_done) ||
-                 (ex_v && ex_slow && !ex_ph);
+                 (ex_v && ex_slow && !ex_ph) ||
+                 (ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0 && fp_hold);
 
 // multiply/divide result and flags
 logic [31:0] md_res;
@@ -626,6 +661,13 @@ always_comb begin
 	xf.sr_we  = 1'b0;
 	xf.sr_new = {sr_r[15:5], alu_flags};
 	case (ex_u.op)
+		OP_FPU: begin
+			xf.res   = fp_res;
+			xf.flags = ccr_f;
+			xf.dkill = fp_dkill;
+			xf.taken = fp_taken;
+			xf.xvec  = fp_xvec;
+		end
 		OP_MUL, OP_DIV: begin
 			xf.res   = md_res;
 			xf.flags = md_flags;
@@ -836,6 +878,9 @@ always_comb begin
 		end
 		default: ex_st = ex_res;
 	endcase
+	// an FPU store whose result is not written (an enabled integer
+	// SNAN/OPERR, an unimplemented / unsupported store): its stores go
+	if (fp_stkill && ex_u.mem == M_ST && !ex_is_fp) ex_stkill = 1'b1;
 end
 
 // a store into the instruction stream just ahead (see EX -> WB)
@@ -947,11 +992,11 @@ wire x_go        = (adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_ir
 // the routine's operands (T5-T13, three per cycle).
 always_comb begin
 	logic wcom, wpost;
-	fwe[0] = adv_ag && ag_u.upd_v;  fwa[0] = ag_u.upd_reg;  fwd[0] = ag_updv;
-	fwe[1] = adv_ag && ag_u.upd2_v; fwa[1] = ag_u.upd2_reg; fwd[1] = ag_u2v;
+	fwe[0] = adv_ag && ag_u.upd_v && !ag_dyncan;  fwa[0] = ag_u.upd_reg;  fwd[0] = ag_updv;
+	fwe[1] = adv_ag && ag_u.upd2_v && !ag_dyncan; fwa[1] = ag_u.upd2_reg; fwd[1] = ag_u2v;
 	fwe[2] = exw_v;                 fwa[2] = exw_reg;       fwd[2] = exw_val;
 	wcom  = wb_commit;
-	wpost = adv_wb && wb_is_exc && wb_post_trap;
+	wpost = adv_wb && wb_is_exc && (wb_post_trap || wb_xcommit);
 	bwe[0] = (wcom || wpost) && wb_u.upd2_v; bwa[0] = wb_u.upd2_reg; bwd[0] = wb_upd2_val;
 	bwe[1] = (wcom || wpost) && wb_u.upd_v;  bwa[1] = wb_u.upd_reg;  bwd[1] = wb_upd_val;
 	bwe[2] = wcom && wb_dwe;                 bwa[2] = wb_u.d_reg;    bwd[2] = wb_res;
@@ -1051,8 +1096,9 @@ always_comb begin
 	x_fmt  = (x_vec == 8'd2) ? 4'h7 :
 	         (x_vec == 8'd3 || x_vec == 8'd5 || x_vec == 8'd6 || x_vec == 8'd7 ||
 	          x_vec == 8'd9) ? 4'h2 : 4'h0;
+	if (adv_wb && wb_is_exc && wb_exc_fmtv) x_fmt = wb_exc_fmt;
 	x_kind = take_irq && !(adv_wb && wb_is_exc) ? (cur[12] ? EK_IRQM : EK_IRQ) :
-	         (x_fmt == 4'h7) ? EK_FMT7 : (x_fmt == 4'h2) ? EK_FMT2 : EK_FMT0;
+	         (x_fmt == 4'h7) ? EK_FMT7 : (x_fmt == 4'h2 || x_fmt == 4'h3) ? EK_FMT2 : EK_FMT0;
 	x_ssp  = cur[12] ? R_MSP : R_ISP;
 	x_wfault = (x_fmt == 4'h7) && !x_ssw[8];
 
@@ -1165,9 +1211,14 @@ always_ff @(posedge clk) begin
 			dc1_u   <= ag_u;
 			dc1_u.msz <= ag_msz;
 			if (ag_cancel) begin
-				// no tail byte: a load gives zero, a store nothing
+				// no tail byte: a load gives zero, a store nothing; a
+				// cancelled FPU transfer also leaves its address registers
 				dc1_u.mem   <= M_NONE;
 				dc1_u.a_src <= OS_ZERO;
+				if (ag_dyncan) begin
+					dc1_u.upd_v  <= 1'b0;
+					dc1_u.upd2_v <= 1'b0;
+				end
 			end
 			dc1_a   <= ag_a;
 			dc1_b   <= ag_b;
@@ -1293,6 +1344,12 @@ always_ff @(posedge clk) begin
 				wb_exc_addr <= {ex_otgt[31:1], 1'b0};
 				wb_exc_ssw  <= 16'd0;
 			end
+			else if (ex_is_fp && ex_xvec != 8'd0) begin
+				// FPU exceptions bring their frame format, PC and address
+				wb_exc      <= ex_xvec;
+				wb_exc_addr <= fp_xaddr;
+				wb_exc_ssw  <= 16'd0;
+			end
 			else begin
 				wb_exc      <= ex_xvec;
 				wb_exc_addr <= ex_u.pc;
@@ -1300,6 +1357,15 @@ always_ff @(posedge clk) begin
 			end
 			wb_exc_pcv <= ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && ex_odd;
 			wb_exc_pc  <= ex_odd_pc;
+			wb_exc_fmtv <= 1'b0;
+			wb_xcommit  <= 1'b0;
+			if (ex_u.exc == 8'd0 && !ex_fault && ex_is_fp && ex_xvec != 8'd0) begin
+				wb_exc_pcv  <= 1'b1;
+				wb_exc_pc   <= fp_xnext ? ex_u.npc : ex_u.pc;
+				wb_exc_fmtv <= 1'b1;
+				wb_exc_fmt  <= fp_xfmt;
+				wb_xcommit  <= fp_xcommit;
+			end
 			wb_oddrte  <= ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && ex_odd &&
 			              ex_u.op == OP_RTE;
 			// CCR after this uop (CHK, CHK2, TRAPcc and divide-by-zero set

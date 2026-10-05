@@ -46,7 +46,7 @@ CAS2W CAS2R RTEF RTE IACKV""".split())}
 SYM = ['NONE', 'EA0', 'EA1', 'EA1R', 'DX', 'DY', 'AX', 'AY', 'IMM', 'QUICK',
        'MOVEQ', 'SHCNT', 'SP', 'SSP', 'NPC', 'PC', 'ZERO', 'CONST', 'X1R',
        'X1DL', 'X1DH', 'X1DU', 'X2DC', 'X2DU', 'X2R', 'MVR', 'EA0R', 'LD',
-       'CREG', 'CREGR', 'BFO', 'BFW', 'OPW']
+       'CREG', 'CREGR', 'BFO', 'BFW', 'OPW', 'EXT1', 'FPDL']
 SYMI = {n: i for i, n in enumerate(SYM)}
 assert len(SYM) <= 40
 
@@ -83,13 +83,17 @@ def sel(x):
 #   LEA0     agw = address of EA0, no access
 #   MOVEM    MOVEM transfer (offset from the sequencer)
 #   ADDT0    agw = agb + T0 (bit field byte offset)
+#   FEA      agw = the FPU operand's address: (An)+ An, -(An) An - size, else
+#            the EA (an FPU #imm: its address in the instruction stream)
+#   FUPD     (An)+ / -(An): An = An +/- the FPU operand size; else nothing
 AGM = {n: i for i, n in enumerate(
     ['NONE', 'EA0', 'EA1', 'PUSH', 'POP', 'BASED', 'BASEDU', 'VAL0', 'ADDV',
-     'ADDC', 'LEA0', 'MOVEM', 'POPR', 'ADDT0'])}
+     'ADDC', 'LEA0', 'MOVEM', 'POPR', 'ADDT0', 'FEA', 'FUPD'])}
 DSEL = {n: i for i, n in enumerate(['CONST', 'IMM', 'NIMM', 'QUICK', 'NQUICK',
                                     'IMMC', 'SZB'])}
 MEM = {None: 0, 'LD': 1, 'ST': 2, 'RMW': 3}
-MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3, 'IACK': 4}
+# EAP: the instruction's EA space (program space for PC-relative / #imm)
+MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3, 'IACK': 4, 'EAP': 5}
 BR = {None: 0, 'COND': 1, 'IMM': 2, 'EA': 3, 'A': 4, 'B': 5}
 # condition sources: opword cc (11:8), the opcode entry's, the extension
 # word's ({ext[10], ext[11]}: 64-bit, signed), or a constant
@@ -100,7 +104,10 @@ SXW = {None: 0, 1: 1, 'SW': 2}
 JC = {n: i for i, n in enumerate(
     ['NEVER', 'ALWAYS', 'EA0_MEM', 'EA1_MEM', 'EA0_REG', 'EA0_DN', 'EA0_AN',
      'EA0_IMM', 'NOT_EA0_MEM', 'EXT11', 'SZ_L', 'AY7', 'BOTH_MEM',
-     'MASK0', 'SUPER', 'EXT10', 'CREG_RF', 'X1A', 'SZ_B'])}
+     'MASK0', 'SUPER', 'EXT10', 'CREG_RF', 'X1A', 'SZ_B',
+     # FPU: extension word opclass (15:13), format (12:10), direction (13)
+     'FP_OC0', 'FP_OC2', 'FP_OC3', 'FP_OC45', 'FP_OC67', 'FMT_1', 'FMT_2',
+     'FMT_8', 'FMT_12', 'FMT_7', 'EA0_APD', 'EA0_AIP', 'EXT13'])}
 CCR = {'XNZVC': 0x1F, 'NZVC': 0x0F, 'Z': 0x04, 'ZC': 0x05, 'NONE': 0x00}
 
 
@@ -109,7 +116,7 @@ class U:
                   a=None, b=None, d=None, sxw=None,
                   ag=None, agb=None, agw=None, dsel='CONST', const=0,
                   mem=None, mfc=None, lock=0, locke=0, br=None, last=0, ser=0,
-                  noupd=0, upd2=0, jc='NEVER', jt=None, loop=0)
+                  noupd=0, upd2=0, jc='NEVER', jt=None, loop=0, dyn=0, dynk=0)
 
     def __init__(self, **kw):
         for k in kw:
@@ -459,13 +466,6 @@ R('RTR',
   U(op='CCRLOG', cond=3, a='T1', b='T2', ag='ADDC', agb='SP', agw='SP', const=6,
     ccr='XNZVC', br='B', last=1))
 
-# FSAVE/FRESTORE with the FPU in its reset state: a four-byte NULL frame
-# (replaced by the FPU's frames when the FPU is attached)
-R('FSAVE',    U(op='MOV', sz='L', msz='L', a='ZERO', d='EA0', last=1))
-R('FRESTORE',
-  U(op='MOV', sz='L', msz='L', a='EA0', d='T0', noupd=1),
-  U(op='RTEF', cond=1, sz='L', a='T0', upd2=1, last=1))
-
 # MOVES: ext bit 11 = register to memory (DFC), else memory to register
 # (SFC); an address register takes the operand sign-extended to 32 bits
 R('MOVES',
@@ -486,9 +486,177 @@ R('CACHE_OP', U(op='MISC', cond=3, sz='L', a='AY', b='OPW', ser=1, last=1))
 R('PFLUSH',   U(op='MISC', cond=4, sz='L', a='AY', b='OPW', ser=1, last=1))
 R('PTEST',    U(op='MISC', cond=5, sz='L', a='AY', b='OPW', ser=1, last=1))
 
-for n in ['FPU_GEN',
-          'FSCC', 'FDBCC', 'FTRAPCC', 'FBCC']:
-    R(n, U(last=1))
+# ------------------------------------------------------------------ FPU
+# The FPU interface (rtl/ap68040_fpif.sv) runs the OP_FPU uops in EX; the
+# microcode moves the data.  Every routine starts with CHK (A = extension
+# word, B = operation word).  Dynamic transfers are cancelled at AG (dyn):
+# 1 FMOVEM slot dynk, 2 FSAVE word dynk, 3 FRESTORE word dynk, 4 FMOVEM
+# control slot dynk (FPCR, FPSR, FPIAR).
+FC = dict(CHK=0, DISP=1, GET=2, END=3, CRR=4, CRW=5, LIST=6, MVR=7, MVW=8,
+          COND=9, DBCC=10, SV0=11, SVW=12, RS0=13, RSW=14, EAL=15)
+
+
+def F(sub, **kw):
+    kw.setdefault('sz', 'L')
+    return U(op='FPU', cond=FC[sub], **kw)
+
+
+def FCHK():
+    return F('CHK', a='EXT1', b='OPW')
+
+
+def _fld(dst, off, **kw):
+    # an operand long word at T11 + off (the instruction's address space)
+    if dst == 'LATCH':
+        return U(op='LATCH', sz='L', msz=kw.pop('msz', 'L'), a='LD', ag='BASED',
+                 agb='T11', const=off, mem='LD', mfc='EAP', **kw)
+    return U(op='MOV', sz='L', msz=kw.pop('msz', 'L'), a='LD', d=dst, ag='BASED',
+             agb='T11', const=off, mem='LD', mfc='EAP', **kw)
+
+
+def _fst(src, off, msz='L', **kw):
+    return U(op='MOV', sz='L', msz=msz, a=src, ag='BASED', agb='T11', const=off,
+             mem='ST', **kw)
+
+
+R('FPU_GEN',
+  FCHK(),
+  U(jc='FP_OC0', jt='FPU_RR.0'),
+  U(jc='FP_OC2', jt='FPU_IN.0'),
+  U(jc='FP_OC3', jt='FPU_OUT.0'),
+  U(jc='FP_OC45', jt='FPU_CR.0'),
+  U(jc='FP_OC67', jt='FPU_MVM.0'),
+  F('DISP', last=1))                       # opclass 001 never gets here (CHK)
+R('FPU_RR', F('DISP', last=1))
+# <ea> to FPn
+R('FPU_IN',
+  U(jc='FMT_7', jt='FPU_RR.0'),            # FMOVECR: no operand
+  U(jc='EA0_DN', jt='FPU_IND.0'),
+  F('EAL', ag='FEA', agw='T11'),
+  U(jc='FMT_12', jt='FPU_IN12.0'),
+  U(jc='FMT_8', jt='FPU_IN8.0'),
+  U(jc='FMT_2', jt='FPU_IN2.0'),
+  U(jc='FMT_1', jt='FPU_IN1.0'),
+  _fld('T0', 0),
+  F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_IN1', _fld('T0', 0, msz='B'), F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_IN2', _fld('T0', 0, msz='W'), F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_IN8', _fld('T0', 0), _fld('T1', 4), F('DISP', a='T0', b='T1', ag='FUPD', last=1))
+R('FPU_IN12', _fld('T0', 0), _fld('T1', 4), _fld('LATCH', 8),
+  F('DISP', a='T0', b='T1', ag='FUPD', last=1))
+R('FPU_IND', F('DISP', a='EA0', last=1))
+# FPn to <ea>
+R('FPU_OUT',
+  U(jc='EA0_DN', jt='FPU_OUTD.0'),
+  F('EAL', ag='FEA', agw='T11'),
+  F('DISP', d='T0'),
+  U(jc='FMT_12', jt='FPU_OUT12.0'),
+  U(jc='FMT_8', jt='FPU_OUT8.0'),
+  U(jc='FMT_2', jt='FPU_OUT2.0'),
+  U(jc='FMT_1', jt='FPU_OUT1.0'),
+  _fst('T0', 0),
+  F('END', ag='FUPD', last=1))
+R('FPU_OUT1', _fst('T0', 0, msz='B'), F('END', ag='FUPD', last=1))
+R('FPU_OUT2', _fst('T0', 0, msz='W'), F('END', ag='FUPD', last=1))
+R('FPU_OUT8', F('GET', a='CONST', const=1, d='T1'), _fst('T0', 0), _fst('T1', 4),
+  F('END', ag='FUPD', last=1))
+R('FPU_OUT12', F('GET', a='CONST', const=1, d='T1'), F('GET', a='CONST', const=2, d='T2'),
+  _fst('T0', 0), _fst('T1', 4), _fst('T2', 8), F('END', ag='FUPD', last=1))
+R('FPU_OUTD', F('DISP', b='EA0', d='EA0'), F('END', last=1))
+# FMOVE(M) control registers: one slot each for FPCR, FPSR, FPIAR, the
+# absent ones cancelled; Dn / An hold the single register
+R('FPU_CR',
+  U(jc='EXT13', jt='FPU_CRS.0'),
+  U(jc='EA0_DN', jt='FPU_CRLR.0'),
+  U(jc='EA0_AN', jt='FPU_CRLR.0'),
+  F('EAL', ag='FEA', agw='T11'),
+  *[u for k in range(3) for u in (
+      _fld('T0', 0, dyn=4, dynk=k),
+      F('CRW', a='T0', b='CONST', const=k),
+      U(ag='ADDC', agb='T11', agw='T11', const=4, dyn=4, dynk=k))],
+  F('END', ag='FUPD', last=1))
+R('FPU_CRLR', *[F('CRW', a='EA0', b='CONST', const=k) for k in range(3)], F('END', last=1))
+R('FPU_CRS',
+  U(jc='EA0_DN', jt='FPU_CRSR.0'),
+  U(jc='EA0_AN', jt='FPU_CRSR.0'),
+  F('EAL', ag='FEA', agw='T11'),
+  *[u for k in range(3) for u in (
+      F('CRR', a='CONST', const=k, d='T0'),
+      _fst('T0', 0, dyn=4, dynk=k),
+      U(ag='ADDC', agb='T11', agw='T11', const=4, dyn=4, dynk=k))],
+  F('END', ag='FUPD', last=1))
+R('FPU_CRSR', *[F('CRR', a='CONST', const=k, d='EA0') for k in range(3)], F('END', last=1))
+# FMOVEM data registers: eight slots, the registers in processing order;
+# T0 = the signed byte adjustment, T11 walks the transfers
+R('FPU_MVM',
+  F('LIST', a='FPDL', d='T0'),
+  U(ag='ADDC', agb='T0', agw='T10', const=0),                  # AG waits for LIST: the slots are latched
+  U(jc='EA0_APD', jt='FPU_MVPD.0'),
+  U(jc='EA0_AIP', jt='FPU_MVPI.0'),
+  F('EAL', ag='FEA', agw='T11'),
+  U(jc='EXT13', jt='FPU_MVS.0'),
+  U(jc='ALWAYS', jt='FPU_MVL.0'))
+R('FPU_MVPD', U(ag='ADDT0', agb='AY', agw='T11'), U(jc='ALWAYS', jt='FPU_MVS.0'))
+R('FPU_MVPI', U(ag='ADDC', agb='AY', agw='T11', const=0), U(jc='ALWAYS', jt='FPU_MVL.0'))
+R('FPU_MVL',
+  *[u for k in range(8) for u in (
+      _fld('T2', 0, dyn=1, dynk=k), _fld('T3', 4, dyn=1, dynk=k),
+      _fld('LATCH', 8, dyn=1, dynk=k),
+      F('MVW', a='T2', b='T3'),
+      U(ag='ADDC', agb='T11', agw='T11', const=12, dyn=1, dynk=k))],
+  U(jc='EA0_AIP', jt='FPU_MVE.0'),
+  F('END', last=1))
+R('FPU_MVS',
+  *[u for k in range(8) for u in (
+      F('MVR', d='T2'), F('GET', a='CONST', const=1, d='T3'),
+      F('GET', a='CONST', const=2, d='T4'),
+      _fst('T2', 0, dyn=1, dynk=k), _fst('T3', 4, dyn=1, dynk=k),
+      _fst('T4', 8, dyn=1, dynk=k),
+      U(ag='ADDC', agb='T11', agw='T11', const=12, dyn=1, dynk=k))],
+  U(jc='EA0_APD', jt='FPU_MVE.0'),
+  F('END', last=1))
+R('FPU_MVE', F('END', ag='ADDT0', agb='AY', agw='AY', last=1))
+# FBcc, FScc, FDBcc, FTRAPcc
+R('FBCC',    FCHK(), F('COND', br='COND', last=1))
+R('FSCC',    FCHK(), F('COND', sz='B', b='EA0R', d='EA0', last=1))
+R('FDBCC',   FCHK(), F('DBCC', b='DY', d='DY', br='COND', last=1))
+R('FTRAPCC', FCHK(), F('COND', last=1))
+# FSAVE: the frame by the FPU state (NULL, IDLE, UNIMP, BUSY); -(An)
+# writes below An and moves An once every word is out
+R('FSAVE',
+  FCHK(),
+  F('SV0', d='T0'),
+  U(ag='ADDC', agb='T0', agw='T10', const=0),                  # AG waits for SV0: the frame size is latched
+  U(jc='EA0_APD', jt='FSAVE_PD.0'),
+  U(ag='LEA0', agw='T11'),
+  *[F('SVW', a='CONST', const=4 * k, msz='L', mem='ST', ag='BASED', agb='T11', dyn=2, dynk=k)
+    for k in range(25)],
+  F('END', last=1))
+R('FSAVE_PD',
+  U(ag='ADDT0', agb='AY', agw='T11'),
+  *[F('SVW', a='CONST', const=4 * k, msz='L', mem='ST', ag='BASED', agb='T11', dyn=2, dynk=k)
+    for k in range(25)],
+  F('END', ag='ADDC', agb='T11', agw='AY', const=0, last=1))
+# FRESTORE: the header decides the frame (anything unknown: format error);
+# every word is read before the FPU state changes; (An)+ moves at the end
+R('FRESTORE',
+  FCHK(),
+  U(jc='EA0_AIP', jt='FREST_PI.0'),
+  U(ag='LEA0', agw='T11'),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T0', ag='BASED', agb='T11', mem='LD'),
+  F('RS0', a='T0', d='T0'),
+  U(ag='ADDC', agb='T0', agw='T10', const=0),                  # AG waits for RS0
+  *[F('RSW', a='LD', b='CONST', const=4 * k, msz='L', mem='LD', ag='BASED', agb='T11',
+      dyn=3, dynk=k) for k in range(1, 25)],
+  F('END', last=1))
+R('FREST_PI',
+  U(ag='ADDC', agb='AY', agw='T11', const=0),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T0', ag='BASED', agb='T11', mem='LD'),
+  F('RS0', a='T0', d='T0'),
+  U(ag='ADDC', agb='T0', agw='T10', const=0),                  # AG waits for RS0
+  *[F('RSW', a='LD', b='CONST', const=4 * k, msz='L', mem='LD', ag='BASED', agb='T11',
+      dyn=3, dynk=k) for k in range(1, 25)],
+  F('END', ag='ADDT0', agb='AY', agw='AY', last=1))
 
 # exception routines.  At entry the back end has set S, cleared T, and
 # written: T8 vector address, T9 PC to stack, T10 old SR, T11 address
@@ -628,7 +796,7 @@ def val(u, name):
         mem=MEM[f['mem']], mfc=MFC[f['mfc']], lock=f['lock'], locke=f['locke'],
         br=BR[f['br']],
         last=f['last'], ser=f['ser'], noupd=f['noupd'], upd2=f['upd2'],
-        jc=JC[f['jc']], jt=jt, loop=f['loop'])
+        jc=JC[f['jc']], jt=jt, loop=f['loop'], dyn=f['dyn'], dynk=f['dynk'])
     return v
 
 
@@ -638,7 +806,7 @@ LAYOUT = [('op_inst', 1), ('op', 7), ('sz', 2), ('msz', 3), ('cond_inst', 3),
           ('dsel', 3), ('cval', 16), ('mem', 2), ('mfc', 3), ('lock', 1),
           ('locke', 1),
           ('br', 3), ('last', 1), ('ser', 1), ('noupd', 1), ('upd2', 1),
-          ('jc', 5), ('jt', 9), ('loop', 1)]
+          ('jc', 6), ('jt', 10), ('loop', 1), ('dyn', 3), ('dynk', 5)]
 WIDTH = sum(w for _, w in LAYOUT)
 
 
@@ -653,7 +821,7 @@ def pack(v):
 def emit():
     os.makedirs(OUT, exist_ok=True)
     resolve_jumps()
-    assert len(ROM) <= 512, len(ROM)
+    assert len(ROM) <= 1024, len(ROM)
 
     # shared definitions
     with open(os.path.join(OUT, 'ap68040_upkg.sv'), 'w') as f:
@@ -671,21 +839,21 @@ def emit():
         for n, i in DSEL.items():
             f.write('localparam logic [2:0] DS_%s = 3\'d%d;\n' % (n, i))
         for n, i in JC.items():
-            f.write('localparam logic [4:0] JC_%s = 5\'d%d;\n' % (n, i))
+            f.write('localparam logic [5:0] JC_%s = 6\'d%d;\n' % (n, i))
         for n in ['EXC_FMT0', 'EXC_FMT2', 'EXC_FMT7', 'EXC_RESET', 'EXC_IRQ', 'EXC_IRQM',
                   'DEC_EXC', 'BCC', 'BSR', 'DBCC', 'FBCC', 'FDBCC', 'FPU_GEN',
                   'TRAP', 'BKPT', 'ILLEGAL', 'MOVEM_RM', 'MOVEM_MR',
                   'MOVEC_RD', 'MOVEC_WR']:
-            f.write('localparam logic [8:0] UA_%s = 9\'d%d;\n' % (n, ENTRY[n]))
+            f.write('localparam logic [9:0] UA_%s = 10\'d%d;\n' % (n, ENTRY[n]))
         f.write('endpackage\n')
 
     # ROM
     with open(os.path.join(OUT, 'ap68040_ucode_rom.svh'), 'w') as f:
         f.write('// generated by tools/ucode.py - do not edit\n')
-        f.write('function automatic uword_t ucode_rom(input logic [8:0] a);\n')
+        f.write('function automatic uword_t ucode_rom(input logic [9:0] a);\n')
         f.write('\tcase (a)\n')
         for i, (name, k, u) in enumerate(ROM):
-            f.write("\t\t9'd%d: ucode_rom = %d'h%x;  // %s.%d\n" %
+            f.write("\t\t10'd%d: ucode_rom = %d'h%x;  // %s.%d\n" %
                     (i, WIDTH, pack(val(u, name)), name, k))
         f.write("\t\tdefault: ucode_rom = '0;\n\tendcase\nendfunction\n")
 
@@ -711,12 +879,12 @@ def emit():
         f.write('// excluded by the more specific patterns overlapping it, so exactly\n')
         f.write('// one entry (or none) is selected; attributes are OR trees.\n')
         f.write('localparam int NENT = %d;\n' % len(ents))
-        f.write('typedef struct packed {\n\tlogic match;\n\tlogic [8:0] ent;\n\tlogic [8:0] rt;\n'
+        f.write('typedef struct packed {\n\tlogic match;\n\tlogic [8:0] ent;\n\tlogic [9:0] rt;\n'
                 '\tlogic [6:0] eop;\n\tlogic [3:0] econd;\n\tlogic econd_v;\n'
                 '\tlogic [4:0] ccr;\n'
                 '\tlogic [1:0] szc;\n\tlogic [11:0] ea0m;\n\tlogic [11:0] ea1m;\n'
                 '\tlogic [1:0] nfix;\n\tlogic [2:0] immk;\n\tlogic priv;\n'
-                '\tlogic [4:0] jc0;\n\tlogic [8:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n\tlogic [1:0] fea;\n\tlogic t0;\n'
+                '\tlogic [5:0] jc0;\n\tlogic [9:0] jt0;\n\tlogic ea0v;\n\tlogic ea1v;\n\tlogic [1:0] fea;\n\tlogic t0;\n'
                 '} pla_t;\n')
         # entry selection
         f.write('function automatic logic [NENT-1:0] dec_sel(input logic [15:0] op);\n')
@@ -747,7 +915,7 @@ def emit():
             if u0['jt'] is not None:
                 rn, k = u0['jt'].split('.')
                 jt0 = ENTRY[rn] + int(k)
-            f.write("\t\t9'd%d: ent_attr = '{1'b1, 9'd%d, 9'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 5'd%d, 9'd%d, 1'b%d, 1'b%d, 2'd%d, 1'b%d};  // %s %s\n"
+            f.write("\t\t9'd%d: ent_attr = '{1'b1, 9'd%d, 10'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 6'd%d, 10'd%d, 1'b%d, 1'b%d, 2'd%d, 1'b%d};  // %s %s\n"
                     % (i, i, ENTRY[e.rt], eop, ec or 0, 1 if ec is not None else 0,
                        ccr, SZC[e.sz], mask0, mask1, e.nfix, IMMK[e.imm],
                        1 if e.priv else 0, jc0, jt0, e.ea0 is not None,

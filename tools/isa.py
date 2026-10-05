@@ -321,7 +321,8 @@ def ea_legal(e, op):
 # 68040 T0 trace list (WinUAE gencpu.cpp trace_t0_68040_only/check_trace
 # sites; taken control transfers are traced by the back end)
 T0_RT = {'SR_LOG', 'MOVE_TO_SR', 'MOVE_TO_USP', 'NOP', 'MOVEC_WR', 'CAS',
-         'CAS2', 'MOVES', 'CACHE_OP', 'PFLUSH', 'PTEST'}
+         'CAS2', 'MOVES', 'CACHE_OP', 'PFLUSH', 'PTEST', 'FDBCC', 'FSAVE',
+         'FRESTORE'}
 
 
 def lookup(op):

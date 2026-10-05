@@ -47,7 +47,7 @@ module ap68040_useq
 //--------------------------------------------------------------------------
 // state
 //--------------------------------------------------------------------------
-logic  [8:0] upc;               // address of uw_q
+logic  [9:0] upc;               // address of uw_q
 uword_t      uw_q;              // registered microcode word
 logic        uw_v;              // uw_q is valid for the current instruction
 logic        exc_mode;          // running an exception routine
@@ -126,12 +126,33 @@ uop_t        nu;
 logic        n_ptr;          // nu is a pointer load (memory indirect)
 logic        n_ptr_ea1;
 logic        n_jump;         // pure jump micro-instruction
-logic  [8:0] n_jt;
+logic  [9:0] n_jt;
 logic        n_mv_pre;       // nu is the MOVEM address copy into T11
 logic [15:0] n_mv_rest;      // mask after this transfer
 logic        n_def_set;      // nu defers its source update
 logic  [4:0] n_def_reg;
 logic  [7:0] n_def_amt;
+
+// FPU operand bytes for AG modes FEA / FUPD: opclass 010/011 by format (a
+// byte through A7 moves it by two), FMOVE(M) of control registers four per
+// register; the other FPU instructions move their address register by a
+// run-time amount (ADDT0)
+logic [6:0] fp_size;
+always_comb begin
+	logic [2:0] crl;
+	crl = (src.ext1[12:10] == 3'd0) ? 3'b001 : src.ext1[12:10];
+	case (src.ext1[15:13])
+		3'b010, 3'b011: case (src.ext1[12:10])
+			3'd0, 3'd1: fp_size = 7'd4;
+			3'd4:       fp_size = 7'd2;
+			3'd6:       fp_size = (src.ea0.r == 3'd7) ? 7'd2 : 7'd1;
+			3'd5:       fp_size = 7'd8;
+			default:    fp_size = 7'd12;
+		endcase
+		3'b100, 3'b101: fp_size = {3'd0, 2'(crl[0]) + 2'(crl[1]) + 2'(crl[2]), 2'b00};
+		default: fp_size = 7'd0;
+	endcase
+end
 
 always_comb begin
 	opsel_t oa, ob, od;
@@ -177,6 +198,19 @@ always_comb begin
 		JC_AY7:      jc_true = (src.opw[2:0] == 3'd7);
 		JC_SUPER:    jc_true = smode;
 		JC_MASK0:    jc_true = (src.ext1 == 16'd0);
+		JC_FP_OC0:   jc_true = (src.ext1[15:13] == 3'b000);
+		JC_FP_OC2:   jc_true = (src.ext1[15:13] == 3'b010);
+		JC_FP_OC3:   jc_true = (src.ext1[15:13] == 3'b011);
+		JC_FP_OC45:  jc_true = (src.ext1[15:14] == 2'b10);
+		JC_FP_OC67:  jc_true = (src.ext1[15:14] == 2'b11);
+		JC_FMT_1:    jc_true = (src.ext1[12:10] == 3'd6);
+		JC_FMT_2:    jc_true = (src.ext1[12:10] == 3'd4);
+		JC_FMT_8:    jc_true = (src.ext1[12:10] == 3'd5);
+		JC_FMT_12:   jc_true = (src.ext1[12:10] == 3'd2 || src.ext1[12:10] == 3'd3);
+		JC_FMT_7:    jc_true = (src.ext1[12:10] == 3'd7);
+		JC_EA0_APD:  jc_true = (src.ea0.m == EM_APD);
+		JC_EA0_AIP:  jc_true = (src.ea0.m == EM_AIP);
+		JC_EXT13:    jc_true = src.ext1[13];
 		default:     jc_true = 1'b0;
 	endcase
 	// a micro-instruction with a jump condition is a pure jump
@@ -242,6 +276,8 @@ always_comb begin
 				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[4:0]}; end
 			end
 			S_OPW:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {16'd0, src.opw}; end
+			S_EXT1:  begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {16'd0, src.ext1}; end
+			S_FPDL:  o.r = dreg(src.ext1[6:4]);      // FMOVEM dynamic list register
 			S_CREGR: o.r = (src.ext1[2:0] == 3'd0) ? R_USP : (src.ext1[2:0] == 3'd3) ? R_MSP : R_ISP;
 			default: o.v = 1'b0;
 		endcase
@@ -273,14 +309,18 @@ always_comb begin
 	nu.b_reg  = ob.r;
 	nu.imm    = oa.imm_v ? oa.imm : {{16{uw.cval[15]}}, uw.cval};
 	nu.imm_b  = ob.imm;
-	nu.mfc    = uw.mfc;
+	nu.mfc    = (uw.mfc == MFC_EAP) ? MFC_NORM : uw.mfc;
+	nu.dyn    = uw.dyn;
+	nu.dynk   = uw.dynk;
 	nu.mlock  = uw.lock;
 	nu.mlocke = uw.locke;
 	nu.br     = uw.br;
 	nu.target = src.target;
 	nu.pred   = src.pred && (uw.br == BR_COND || uw.br == BR_IMM);
 	nu.ser    = uw.ser;
-	nu.t0cof  = src.t0;
+	// FMOVEM / FMOVE of control registers to memory are T0 trace points
+	nu.t0cof  = src.t0 || (src.opw[15:6] == 10'b1111_0010_00 &&
+	                       (src.ext1[15:13] == 3'b101 || src.ext1[15:13] == 3'b111));
 	nu.pc     = src.pc;
 	nu.npc    = src.npc;
 	nu.first  = src_first;
@@ -299,7 +339,7 @@ always_comb begin
 	me_v   = oa.mem || ob.mem || od.mem;
 	me_ea1 = oa.mem ? oa.ea1 : ob.mem ? ob.ea1 : od.ea1;
 	me     = me_ea1 ? src.ea1 : src.ea0;
-	if (uw.ag == AGM_EA0 || uw.ag == AGM_LEA0) begin me = src.ea0; me_ea1 = 1'b0; end
+	if (uw.ag == AGM_EA0 || uw.ag == AGM_LEA0 || uw.ag == AGM_FEA) begin me = src.ea0; me_ea1 = 1'b0; end
 	if (uw.ag == AGM_EA1) begin me = src.ea1; me_ea1 = 1'b1; end
 	me_sp  = (me.r == 3'd7);
 	amt    = size_bytes(msz, me_sp && (me.m == EM_AIP || me.m == EM_APD));
@@ -315,7 +355,8 @@ always_comb begin
 	end
 
 
-	if (me_v || uw.ag == AGM_EA0 || uw.ag == AGM_EA1 || uw.ag == AGM_LEA0) begin
+	if (me_v || uw.ag == AGM_EA0 || uw.ag == AGM_EA1 || uw.ag == AGM_LEA0 ||
+	    (uw.ag == AGM_FEA && src.ea0.m != EM_IMM)) begin
 		logic [4:0] bre;
 		logic       mi_stage1;
 		nu.ag = 1'b1;
@@ -500,6 +541,33 @@ always_comb begin
 				if (uw.agw != S_NONE) begin nu.upd_v = !n_ptr; nu.upd_reg = rw; end
 				nu.mem = M_NONE;
 			end
+			AGM_FEA: begin
+				// the FPU operand's address into agw: (An)+ An, -(An) An -
+				// size (the register moves with FUPD), #imm its place in the
+				// instruction stream (D1: bd = PC + 4; a byte is the word's
+				// low byte), else the EA
+				nu.mem = M_NONE;
+				if (src.ea0.m == EM_AIP || src.ea0.m == EM_APD) begin
+					nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = areg(src.ea0.r, sp_reg);
+					nu.idx_v = 1'b0; nu.pinc = 1'b0;
+					nu.disp = (src.ea0.m == EM_APD) ? -{25'd0, fp_size} : 32'd0;
+				end
+				else if (src.ea0.m == EM_IMM) begin
+					nu.ag = 1'b1; nu.base_v = 1'b0; nu.idx_v = 1'b0; nu.pinc = 1'b0;
+					nu.disp = src.ea0.bd + ((src.ext1[15:13] == 3'b010 &&
+					                         src.ext1[12:10] == 3'd6) ? 32'd1 : 32'd0);
+					nu.mprog = 1'b1;
+				end
+				nu.upd_v = !n_ptr; nu.upd_reg = rw;
+			end
+			AGM_FUPD: begin
+				if (src.ea0.m == EM_AIP || src.ea0.m == EM_APD) begin
+					nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = areg(src.ea0.r, sp_reg);
+					nu.idx_v = 1'b0; nu.pinc = 1'b0;
+					nu.disp = (src.ea0.m == EM_APD) ? -{25'd0, fp_size} : {25'd0, fp_size};
+					nu.upd_v = 1'b1; nu.upd_reg = areg(src.ea0.r, sp_reg);
+				end
+			end
 			default: ;
 		endcase
 	end
@@ -618,6 +686,23 @@ always_comb begin
 		end
 	end
 
+	// FMOVEM of control registers: a slot whose register is not in the
+	// (static) list is no operation
+	if (uw.dyn == 3'd4) begin
+		logic [2:0] crl;
+		crl = (src.ext1[12:10] == 3'd0) ? 3'b001 : src.ext1[12:10];
+		if (!crl[2 - uw.dynk[1:0]]) begin
+			nu.mem = M_NONE; nu.ag = 1'b0; nu.upd_v = 1'b0; nu.upd2_v = 1'b0;
+			nu.d_v = 1'b0;
+		end
+		nu.dyn = 3'd0;
+	end
+
+	// FPU operand transfers read the EA's space: program space for
+	// PC-relative and immediate sources
+	if (uw.mfc == MFC_EAP)
+		nu.mprog = (src.ea0.m == EM_PC16 || src.ea0.m == EM_PCX || src.ea0.m == EM_IMM);
+
 	// a pointer load replaces the uop this cycle
 	if (n_ptr) begin
 		uop_t p;
@@ -649,7 +734,7 @@ wire done = emit && !stay && uw.last;                       // instruction ends
 
 assign rq_pop = done && !exc_mode;
 
-logic [8:0] na;          // next microcode address
+logic [9:0] na;          // next microcode address
 logic       nv;
 always_comb begin
 	na = upc;
@@ -669,9 +754,9 @@ always_comb begin
 		nv = 1'b0;
 	end
 	else if (step) begin
-		if (n_jump)      na = jc_now ? uw.jt : upc + 9'd1;
+		if (n_jump)      na = jc_now ? uw.jt : upc + 10'd1;
 		else if (stay)   na = upc;
-		else if (!uw.last) na = upc + 9'd1;
+		else if (!uw.last) na = upc + 10'd1;
 		else if (!exc_mode && rq_n == 2'd2) na = rq1.rt;   // next instruction
 		else nv = 1'b0;
 	end
@@ -795,6 +880,20 @@ always_comb begin
 		JC_MASK0:    jc_now = (src.ext1 == 16'd0);
 		JC_X1A:      jc_now = src.ext1[15];
 		JC_SZ_B:     jc_now = (src.sz == SZ_B);
+		JC_EA0_AN:   jc_now = (src.ea0.m == EM_AN);
+		JC_EA0_APD:  jc_now = (src.ea0.m == EM_APD);
+		JC_EA0_AIP:  jc_now = (src.ea0.m == EM_AIP);
+		JC_EXT13:    jc_now = src.ext1[13];
+		JC_FP_OC0:   jc_now = (src.ext1[15:13] == 3'b000);
+		JC_FP_OC2:   jc_now = (src.ext1[15:13] == 3'b010);
+		JC_FP_OC3:   jc_now = (src.ext1[15:13] == 3'b011);
+		JC_FP_OC45:  jc_now = (src.ext1[15:14] == 2'b10);
+		JC_FP_OC67:  jc_now = (src.ext1[15:14] == 2'b11);
+		JC_FMT_1:    jc_now = (src.ext1[12:10] == 3'd6);
+		JC_FMT_2:    jc_now = (src.ext1[12:10] == 3'd4);
+		JC_FMT_8:    jc_now = (src.ext1[12:10] == 3'd5);
+		JC_FMT_12:   jc_now = (src.ext1[12:10] == 3'd2 || src.ext1[12:10] == 3'd3);
+		JC_FMT_7:    jc_now = (src.ext1[12:10] == 3'd7);
 		JC_CREG_RF:  jc_now = (src.ext1[11:0] == 12'h800) || (src.ext1[11:0] == 12'h803) ||
 		                      (src.ext1[11:0] == 12'h804);
 		default:     jc_now = 1'b0;
