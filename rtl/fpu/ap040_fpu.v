@@ -1770,9 +1770,9 @@ always @(posedge clk) begin
 			end
 
 			F_DIVL: begin : f_divl
-				reg [64:0] r2a, rem1, r2b, rem2, r2c, rem3;
-				reg        q1, q2, q3;
-				if (loop_n == 7'd23) begin
+				reg [64:0] r2a, rem1, r2b, rem2;
+				reg        q1, q2;
+				if (loop_n == 7'd34) begin
 					if (qv[66]) begin
 						a_m <= qv[66:3];
 						grs <= {qv[2], qv[1], qv[0] | (acc_hi != 65'd0)};
@@ -1795,38 +1795,36 @@ always @(posedge clk) begin
 					loop_n <= 7'd1;
 				end
 				else begin
-					// three restoring fraction bits per cycle (66 = 3 x 22):
-					// the remainder shifts left with zeros entering, exactly
-					// three former one-bit iterations cascaded combinationally
+					// two restoring fraction bits per cycle (66 = 2 x 33):
+					// the remainder shifts left with zeros entering, two
+					// one-bit iterations cascaded combinationally (three
+					// do not close at 60 MHz)
 					r2a = {acc_hi[63:0], 1'b0};
 					q1 = (r2a >= {1'b0, a_m});
 					rem1 = q1 ? (r2a - {1'b0, a_m}) : r2a;
 					r2b = {rem1[63:0], 1'b0};
 					q2 = (r2b >= {1'b0, a_m});
 					rem2 = q2 ? (r2b - {1'b0, a_m}) : r2b;
-					r2c = {rem2[63:0], 1'b0};
-					q3 = (r2c >= {1'b0, a_m});
-					rem3 = q3 ? (r2c - {1'b0, a_m}) : r2c;
-					acc_hi <= rem3;
-					qv <= {qv[63:0], q1, q2, q3};
+					acc_hi <= rem2;
+					qv <= {qv[64:0], q1, q2};
 					loop_n <= loop_n + 7'd1;
 				end
 			end
 
 			F_SQRTL: begin : f_sqrtl
-				reg [68:0] r2a, rem1, r2b, rem2, r2c, rem3;
-				reg [68:0] trial1, trial2, trial3;
-				reg        q1, q2, q3;
-				if (loop_n == 7'd22) begin
+				reg [68:0] r2a, rem1, r2b, rem2;
+				reg [68:0] trial1, trial2;
+				reg        q1, q2;
+				if (loop_n == 7'd33) begin
 					a_m <= qv[65:2];
 					grs <= {qv[1], qv[0], (srem != 69'd0)};
 					a_t <= T_NUM;
 					fst <= F_ROUND;
 				end
 				else begin
-					// three result digits per cycle (66 = 3 x 22): each trial
-					// folds the earlier digits into the partial root, exactly
-					// three former one-digit steps cascaded combinationally
+					// two result digits per cycle (66 = 2 x 33): each trial
+					// folds the earlier digits into the partial root, two
+					// one-digit steps cascaded combinationally
 					r2a = {srem[66:0], srad[131:130]};
 					trial1 = {1'b0, qv[65:0], 2'b01};
 					q1 = (r2a >= trial1);
@@ -1835,13 +1833,9 @@ always @(posedge clk) begin
 					trial2 = {1'b0, qv[64:0], q1, 2'b01};
 					q2 = (r2b >= trial2);
 					rem2 = q2 ? (r2b - trial2) : r2b;
-					r2c = {rem2[66:0], srad[127:126]};
-					trial3 = {1'b0, qv[63:0], q1, q2, 2'b01};
-					q3 = (r2c >= trial3);
-					rem3 = q3 ? (r2c - trial3) : r2c;
-					srad <= {srad[125:0], 6'b000000};
-					srem <= rem3;
-					qv <= {qv[63:0], q1, q2, q3};
+					srad <= {srad[127:0], 4'b0000};
+					srem <= rem2;
+					qv <= {qv[64:0], q1, q2};
 					loop_n <= loop_n + 7'd1;
 				end
 			end
