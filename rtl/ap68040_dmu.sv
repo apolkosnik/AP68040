@@ -288,8 +288,11 @@ logic  [1:0] sn_src;               // found in: 0 a cache way, 1 push buffer, 2 
 logic  [1:0] sn_way;
 logic        bo_cancel;            // the queued push was invalidated by a snoop
 
-wire  [5:0] la_set_n = sn_rset ? sn_pa[9:4] :
-                       steal ? st_set : (adv_ag ? dm_va[9:4] : m1.a[9:4]);
+// The lookup set: AG's address (late: register read, address adders)
+// passes one LUT; the other choices are registers, merged beforehand.
+// Each way's RAMs get their own copy of that LUT (fanout 18, not 72).
+wire  [5:0] la_alt   = sn_rset ? sn_pa[9:4] : steal ? st_set : m1.a[9:4];
+wire        la_ag    = adv_ag && !sn_rset && !steal;
 
 // tags: port A for lookups (DC1 or stolen), port B for engine reads/writes
 logic [21:0] tq_a [4];
@@ -313,6 +316,7 @@ logic [127:0] dw_wdata;
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
+		(* keep *) wire [5:0] la_set_n = la_ag ? dm_va[9:4] : la_alt;
 		ap68040_tdp #(.AW(6), .DW(22)) tag (
 			.clk(clk),
 			.addr_a(la_set_n), .we_a(1'b0), .wd_a(22'd0), .q_a(tq_a[gw]),

@@ -144,4 +144,7 @@ localparam logic [9:0] UA_MOVEM_RM = 10'd122;
 localparam logic [9:0] UA_MOVEM_MR = 10'd125;
 localparam logic [9:0] UA_MOVEC_RD = 10'd116;
 localparam logic [9:0] UA_MOVEC_WR = 10'd119;
+localparam logic [9:0] UA_JSR = 10'd89;
+localparam logic [9:0] UA_JMP = 10'd88;
+localparam logic [9:0] UA_RTS = 10'd91;
 endpackage

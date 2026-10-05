@@ -159,6 +159,115 @@ int          result;          // 0 running, 1 pass, 2 fail
 int          errors;
 int          cycles;
 int          stamp_prev;
+int          insns, insn_prev;   // instructions completed (last uops retired)
+always_ff @(posedge clk) begin
+	if (!rsti_n) insns <= 0;
+	else if (dut.be.adv_wb && dut.be.wb_u.last) insns <= insns + 1;
+end
+
+// +prof: where the cycles go between stamps.  A cycle that retires a uop
+// is "retire"; otherwise the oldest stage that holds (or the first empty
+// one, going back from WB) takes the blame.
+logic prof;
+int   pf [12];
+localparam int PF_RET = 0, PF_WB = 1, PF_EX = 2, PF_DC2 = 3, PF_DC1 = 4, PF_AG = 5,
+               PF_FE = 6, PF_UOPS = 7, PF_REDIR = 8, PF_DREDIR = 9, PF_FQE = 10, PF_HALT = 11;
+initial for (int i = 0; i < 12; i++) pf[i] = 0;
+always_ff @(posedge clk) if (rsti_n) begin
+	if (dut.be.adv_wb) begin pf[PF_RET]++; pf[PF_UOPS]++; end
+	else if (dut.be.wb_v) pf[PF_WB]++;
+	else if (dut.be.ex_v) pf[PF_EX]++;
+	else if (dut.be.dc2_v) pf[PF_DC2]++;
+	else if (dut.be.dc1_v) pf[PF_DC1]++;
+	else if (dut.be.ag_v) pf[PF_AG]++;
+	else if (dut.fetch.cnt == 0) pf[PF_FQE]++;
+	else pf[PF_FE]++;
+	if (dut.redir_v) pf[PF_REDIR]++;
+	if (dut.d_redir_v) pf[PF_DREDIR]++;
+	if (dut.be.adv_ex) begin
+		if (dut.be.ex_mispred) begin
+			case (dut.be.ex_u.br)
+				3'd1:    rc[0]++;          // conditional (Bcc/DBcc/FBcc)
+				3'd2:    rc[1]++;          // BR_IMM
+				3'd3:    rc[2]++;          // BR_EA (JMP/JSR <ea>)
+				3'd4:    rc[3]++;          // BR_A (RTS, RTD, RTR...)
+				3'd5:    rc[4]++;          // BR_B
+				default: rc[5]++;          // RTE and others
+			endcase
+		end
+		else if (dut.be.ex_u.ser) rc[6]++;
+		else if (dut.be.ex_sr_we) rc[7]++;
+		else if (dut.be.ex_u.last && (dut.be.smc_pend || dut.be.ex_smc)) rc[8]++;
+	end
+end
+int rc [9];
+initial for (int i = 0; i < 9; i++) rc[i] = 0;
+// BTB: followed, overruled at a branch's end, restarted (flag inside)
+int btc [3];
+initial for (int i = 0; i < 3; i++) btc[i] = 0;
+always_ff @(posedge clk) if (rsti_n) begin
+	if (dut.dec.push && dut.dec.ph == 0 && dut.dec.bt_end) begin
+		if (dut.dec.nrec.pred && dut.dec.ntarget == dut.dec.bt_tgt) btc[0]++;
+		else btc[1]++;
+	end
+	if (dut.dec.bt_restart && !dut.dec.stall) btc[2]++;
+end
+// EX-blamed cycles by EX op; WB-blamed by WB op
+int exop [64], wbop [64];
+initial for (int i = 0; i < 64; i++) begin exop[i] = 0; wbop[i] = 0; end
+int hold [8];
+int us [5];
+initial for (int i = 0; i < 5; i++) us[i] = 0;
+initial for (int i = 0; i < 8; i++) hold[i] = 0;
+always_ff @(posedge clk) if (rsti_n && prof) begin
+	if (dut.be.wb_v && dut.be.wb_hold) begin hold[0]++; wbop[dut.be.wb_u.op]++; end
+	if (dut.be.ex_v && dut.be.ex_hold) begin hold[1]++; exop[dut.be.ex_u.op]++; end
+	if (dut.be.dc2_hold) hold[2]++;
+	if (dut.be.dc1_v && dut.dm_hold1) hold[3]++;
+	if (dut.be.ag_v && dut.be.ag_hold) hold[4]++;
+	if (!dut.be.ag_v || !dut.be.stall_ag) begin
+		// AG could take a uop: does the front end have one?
+		if (dut.uq_n == 2'd0) begin
+			if (dut.rq_n != 2'd0) begin
+				hold[5]++;                            // useq busy / expanding
+				if (!dut.useq.uw_v) us[0]++;          // first-word ROM read
+				else if (dut.useq.step && dut.useq.n_jump) us[1]++;   // jump word
+				else if (!dut.useq.step) us[2]++;     // not stepping
+				else if (dut.useq.n_ptr) us[3]++;     // pointer load
+				else us[4]++;
+			end
+			else if (dut.fetch.cnt != 0) hold[6]++;   // decode has words, no record
+			else hold[7]++;                           // fetch queue empty
+		end
+	end
+end
+task automatic prof_report();
+	int tot;
+	tot = pf[PF_RET] + pf[PF_WB] + pf[PF_EX] + pf[PF_DC2] + pf[PF_DC1] + pf[PF_AG] + pf[PF_FE] + pf[PF_FQE];
+	if (tot == 0) tot = 1;
+	$display("PROF cycles=%0d uops=%0d | retire %0d%% | waiting on: WB %0d%% EX %0d%% DC2 %0d%% DC1 %0d%% AG %0d%% decode/useq %0d%% fetch-empty %0d%% | redirects WB=%0d D1=%0d",
+	         tot, pf[PF_UOPS], 100 * pf[PF_RET] / tot, 100 * pf[PF_WB] / tot, 100 * pf[PF_EX] / tot,
+	         100 * pf[PF_DC2] / tot, 100 * pf[PF_DC1] / tot, 100 * pf[PF_AG] / tot,
+	         100 * pf[PF_FE] / tot, 100 * pf[PF_FQE] / tot, pf[PF_REDIR], pf[PF_DREDIR]);
+	$display("PROF BTB: followed %0d, overruled at the end %0d, restarted %0d", btc[0], btc[1], btc[2]);
+	for (int i = 0; i < 3; i++) btc[i] = 0;
+	$display("PROF WB redirects: mispredict cond=%0d imm=%0d ea=%0d A(rts)=%0d B=%0d other=%0d | serialize=%0d sr-write=%0d smc=%0d",
+	         rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8]);
+	for (int i = 0; i < 12; i++) pf[i] = 0;
+	for (int i = 0; i < 9; i++) rc[i] = 0;
+	$display("PROF holds (cycles): WB %0d%% EX %0d%% DC2 %0d%% DC1 %0d%% AG-interlock %0d%% | AG starved: useq %0d%% decode %0d%% fetch %0d%%",
+	         100 * hold[0] / tot, 100 * hold[1] / tot, 100 * hold[2] / tot, 100 * hold[3] / tot,
+	         100 * hold[4] / tot, 100 * hold[5] / tot, 100 * hold[6] / tot, 100 * hold[7] / tot);
+	$display("PROF   useq: first-word %0d%% jump-word %0d%% not-stepping %0d%% pointer %0d%% other %0d%%",
+	         100 * us[0] / tot, 100 * us[1] / tot, 100 * us[2] / tot, 100 * us[3] / tot, 100 * us[4] / tot);
+	for (int i = 0; i < 5; i++) us[i] = 0;
+	for (int i = 0; i < 8; i++) hold[i] = 0;
+	for (int i = 0; i < 64; i++) begin
+		if (exop[i] * 100 > tot) $display("PROF   EX op %0d: %0d%%", i, 100 * exop[i] / tot);
+		if (wbop[i] * 100 > tot) $display("PROF   WB op %0d: %0d%%", i, 100 * wbop[i] / tot);
+		exop[i] = 0; wbop[i] = 0;
+	end
+endtask
 logic        berr_armed, wberr_arm, fberr_armed;
 logic [15:0] fberr_addr;
 logic [15:0] ipl_delay;
@@ -312,8 +421,11 @@ always_ff @(posedge clk) begin
 					end
 				end
 				16'hF108: begin
-					$display("STAMP tag=%04x cycles=%0d", w, cycles - stamp_prev);
+					$display("STAMP tag=%04x cycles=%0d instructions=%0d", w, cycles - stamp_prev,
+					         insns - insn_prev);
+					if (prof) prof_report();
 					stamp_prev <= cycles;
+					insn_prev  <= insns;
 				end
 				16'hF110: ipl_lvl <= w[2:0];
 				16'hF130: begin
@@ -468,10 +580,12 @@ initial begin
 	bclk2 = $test$plusargs("bclk2");
 	trace = $test$plusargs("trace");
 	ptrace = $test$plusargs("ptrace");
+	prof = $test$plusargs("prof");
 	result = 0;
 	errors = 0;
 	cycles = 0;
 	stamp_prev = 0;
+	insn_prev = 0;
 	load_prog();
 	if (!$value$plusargs("cap=%d", cap)) cap = 7;
 	mem.mem[16'hF160 >> 2] = {cap[15:0], 16'h0000};
@@ -479,6 +593,7 @@ initial begin
 	repeat (8) @(posedge clk);
 	rsti_n = 1'b1;
 	while (result == 0 && cycles < timeout && !dbg_halted) @(posedge clk);
+	if (prof) prof_report();
 	if (result == 1 && errors == 0)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)

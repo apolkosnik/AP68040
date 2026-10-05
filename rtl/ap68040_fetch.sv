@@ -32,6 +32,12 @@
 // fetch; a fault on the lookahead after it is speculative, and the back   //
 // end refetches it on demand before it becomes an access error.           //
 //                                                                          //
+// Branch target buffer: 64 entries looked up with the F0 address; a hit  //
+// (the long word holds the last word of a branch D1 predicted taken)     //
+// ends the chunk at that word, flags it, and sends F0 to the target in   //
+// F1 (one bubble).  The flagged word's target travels in a FIFO; D1       //
+// checks every flagged word against its own decode (see decode).          //
+//                                                                          //
 // CINV/CPUSH of the instruction cache arrive from the DMU (ic_inv): all   //
 // in one cycle, a line in two, a page by a scan of the 64 sets.  Bus     //
 // snooping (sn_inv) invalidates a line the same way (MC68040UM table   //
@@ -61,11 +67,19 @@ module ap68040_fetch
 	output logic  [7:0] win_flt,      // the word came from a faulted fetch
 	output logic  [7:0] win_fdem,     // ... the first of a redirected stream
 	output logic  [7:0] win_fatc,     // ... an ATC (MMU) fault, else bus error
+	output logic  [7:0] win_bt,       // ... ends a branch the BTB took
+	output logic [31:0] bt_tgt,       // the target of the first such word
 	output pd_t         pd0,          // predecode of win[0]
 	output logic  [3:0] qcnt,         // words available in win (0..8)
 	output logic [31:0] qpc,
 	input  logic  [2:0] consume,
 	output logic        q_odd,        // the stream starts at an odd address
+	input  logic        btb_we,       // D1 writes a BTB entry
+	input  logic  [5:0] btb_wi,
+	input  logic        btb_wv,       // valid (0 drops the entry)
+	input  logic [23:0] btb_wtag,
+	input  logic        btb_wslot,    // the branch ends at word 1 of the long word
+	input  logic [30:0] btb_wtgt,     // target[31:1]
 
 	// DMU: table walks for the I-ATC, I-ATC maintenance, cache invalidation
 	output logic        iw_req,
@@ -89,6 +103,7 @@ module ap68040_fetch
 	input  logic [31:0] sn_inv_pa,
 	input  logic        sn_inv_all,    // ... or every line
 	output logic        sn_inv_done,
+	output logic        sn_ihit,       // ... and removed a valid line (or the line buffer)
 
 	// BIU client
 	output logic        b_req,
@@ -120,6 +135,9 @@ endfunction
 logic [15:0]   qw [QN];
 pd_t           qp [QN];
 logic [QN-1:0] qf, qd, qa;     // faulted, demand fetch, ATC fault
+logic [QN-1:0] qb;             // ends a branch the BTB took
+logic [30:0]   tq [4];         // their targets, in queue order
+logic  [2:0]   tq_n;
 logic  [4:0]   cnt;
 logic [31:0]   qpc_r;
 logic          odd;
@@ -135,18 +153,24 @@ always_comb begin
 		win_flt[i]  = qf[i];
 		win_fdem[i] = qd[i];
 		win_fatc[i] = qa[i];
+		win_bt[i]   = qb[i];
 	end
 end
+assign bt_tgt = {tq[0], 1'b0};
 
 // F2: the words of a chunk, predecoded into F3; F3: appended this cycle
 logic  [1:0]  f2_n;
 logic [15:0]  f2_w [2];
 logic         f2_f, f2_d, f2_a;
 pd_t          f2_p [2];
+logic  [1:0]  f2_b;            // the word ends a BTB-taken branch
+logic [30:0]  f2_t;
 logic  [1:0]  f3_n;
 logic [15:0]  f3_w [2];
 pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
+logic  [1:0]  f3_b;
+logic [30:0]  f3_t;
 genvar gp;
 generate
 	for (gp = 0; gp < 2; gp++) begin : g_pd
@@ -158,6 +182,17 @@ endgenerate
 // I-ATC
 //--------------------------------------------------------------------------
 logic [31:0] fpc;              // F0 fetch address (A0 clear)
+
+// BTB: valid, tag fpc[31:8], slot, target[31:1]
+logic [56:0] btb_q;
+ap68040_lutram #(.AW(6), .DW(57)) btb (
+	.clk(clk), .we(btb_we), .waddr(btb_wi),
+	.wdata({btb_wv, btb_wtag, btb_wslot, btb_wtgt}),
+	.raddr(fpc[7:2]), .q(btb_q)
+);
+// a hit needs the branch's last word in this fetch (a fetch that starts
+// at word 1 cannot end a branch at word 0)
+wire btb_hit = btb_q[56] && btb_q[55:32] == fpc[31:8] && (btb_q[31] || !fpc[1]);
 logic        atc_hit;
 atce_t       atc_e;
 ap68040_atc iatc (
@@ -216,6 +251,8 @@ logic        fnew;             // the next F0 starts a redirected stream
 // F1
 logic        f1_v;
 logic [31:0] f1_pc;
+logic        f1_bt, f1_bslot;   // the BTB hit at F0, and where the branch ends
+logic [30:0] f1_btgt;
 logic        f1_s, f1_dem;
 logic        f1_hit;
 atce_t       f1_e;
@@ -238,6 +275,7 @@ logic  [1:0] m_way;
 logic        inv_busy, inv_hold, inv_ph;
 logic  [6:0] inv_i;
 logic        inv_sn;           // the running invalidation is the snooper's
+logic        inv_lbh;          // ... and the line buffer held its line
 logic  [1:0] inv_scope;
 logic [31:0] inv_pa;
 
@@ -291,6 +329,8 @@ wire f1_deliver = f1_go && (x_hit || x_lb);
 // F0 issue: room for this chunk and those in flight
 //--------------------------------------------------------------------------
 wire [5:0] inflight = (f1_v ? 6'd2 : 6'd0) + {4'd0, f2_n} + {4'd0, f3_n};
+// the target FIFO cannot overflow: count the flagged words on their way
+wire       bt_room  = ({1'b0, tq_n} + {3'd0, f1_v && f1_bt} + {3'd0, |f2_b} + {3'd0, |f3_b}) < 4'd4;
 wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 2);
 // a snooped invalidation goes first (the snooper has priority, 4.5)
 wire       f0_go    = (st == S_RUN) && !odd && !stop && !redir_any &&
@@ -338,6 +378,10 @@ always_ff @(posedge clk) begin
 		fnew  <= 1'b1;
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
+		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0;
+		f2_b  <= '0; f2_t <= '0; f3_b <= '0; f3_t <= '0;
+		qb    <= '0; tq_n <= '0;
+		for (int i = 0; i < 4; i++) tq[i] <= '0;
 		f2_n  <= '0; f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
@@ -350,7 +394,8 @@ always_ff @(posedge clk) begin
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
 		inv_busy <= 1'b0; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
-		inv_sn <= 1'b0; inv_scope <= '0; inv_pa <= '0;
+		inv_sn <= 1'b0; inv_scope <= '0; inv_pa <= '0; inv_lbh <= 1'b0;
+		sn_ihit <= 1'b0;
 		ic_inv_done <= 1'b0;
 		sn_inv_done <= 1'b0;
 		for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
@@ -361,6 +406,7 @@ always_ff @(posedge clk) begin
 		c_we        <= 1'b0;
 		ic_inv_done <= 1'b0;
 		sn_inv_done <= 1'b0;
+		sn_ihit     <= 1'b0;
 		inv_hold    <= 1'b0;
 
 		//------------------------------------------------------------------
@@ -378,6 +424,7 @@ always_ff @(posedge clk) begin
 				qf[i] <= qf[src[4:0]];
 				qd[i] <= qd[src[4:0]];
 				qa[i] <= qa[src[4:0]];
+				qb[i] <= qb[src[4:0]];
 			end
 			else if (k < {3'b000, f3_n}) begin
 				qw[i] <= f3_w[k[0]];
@@ -385,21 +432,52 @@ always_ff @(posedge clk) begin
 				qf[i] <= f3_f;
 				qd[i] <= f3_d;
 				qa[i] <= f3_a;
+				qb[i] <= f3_b[k[0]];
 			end
 		end
 		cnt   <= keep + {3'b000, f3_n};
-		qpc_r <= qpc_r + {28'd0, consume, 1'b0};
+		// D1 consumed the end of a BTB-taken branch: the stream continues
+		// at its target (the words after it in the queue came from there)
+		begin
+			logic        cfl;
+			logic  [2:0] cj;
+			logic [30:0] tqn [4];
+			logic  [2:0] n;
+			cfl = 1'b0; cj = 3'd0;
+			for (int i = 6; i >= 0; i--)
+				if (3'(i) < consume && qb[i]) begin cfl = 1'b1; cj = 3'(i); end
+			qpc_r <= cfl ? ({tq[0], 1'b0} + {28'd0, consume - cj - 3'd1, 1'b0})
+			             : qpc_r + {28'd0, consume, 1'b0};
+			for (int i = 0; i < 4; i++) tqn[i] = tq[i];
+			n = tq_n;
+			if (cfl && n != 3'd0) begin
+				for (int i = 0; i < 3; i++) tqn[i] = tqn[i + 1];
+				n = n - 3'd1;
+			end
+			if (f3_n != 2'd0 && f3_b != 2'b00 && n != 3'd4) begin
+				tqn[n[1:0]] = f3_t;
+				n = n + 3'd1;
+			end
+			for (int i = 0; i < 4; i++) tq[i] <= tqn[i];
+			tq_n <= n;
+		end
 		f3_n  <= f2_n;
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
+		f3_b  <= f2_b; f3_t <= f2_t;
 		for (int i = 0; i < 2; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
 		f2_n  <= '0;
+		f2_b  <= '0;
 
 		//------------------------------------------------------------------
 		// F0 -> F1
 		//------------------------------------------------------------------
-		f1_v <= 1'b0;
+		f1_v  <= 1'b0;
+		f1_bt <= 1'b0;
 		if (f0_go) begin
 			f1_v   <= 1'b1;
+			f1_bt  <= btb_hit && bt_room;
+			f1_bslot <= btb_q[31];
+			f1_btgt  <= btb_q[30:0];
 			f1_pc  <= fpc;
 			f1_s   <= smode;
 			f1_dem <= fnew;
@@ -418,6 +496,18 @@ always_ff @(posedge clk) begin
 			f2_w[0] <= f1_pc[1] ? x_chunk[15:0] : x_chunk[31:16];
 			f2_w[1] <= x_chunk[15:0];
 			f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
+			if (f1_bt) begin
+				// a predicted taken branch ends in this chunk: the words up
+				// to its last, that one flagged; F0 goes to the target and
+				// its sequential fetch of this cycle is dropped
+				f2_n <= (f1_pc[1] || !f1_bslot) ? 2'd1 : 2'd2;
+				f2_b <= (f1_pc[1] || !f1_bslot) ? 2'b01 : 2'b10;
+				f2_t <= f1_btgt;
+				f1_v <= 1'b0;
+				f1_bt <= 1'b0;
+				fpc  <= {f1_btgt, 1'b0};
+				fnew <= 1'b0;
+			end
 		end
 		else if (f1_go) begin
 			f1_v   <= 1'b0;
@@ -560,7 +650,11 @@ always_ff @(posedge clk) begin
 			cnt   <= '0;
 			f2_n  <= '0;
 			f3_n  <= '0;
+			f2_b  <= '0;
+			f3_b  <= '0;
+			tq_n  <= '0;
 			f1_v  <= 1'b0;
+			f1_bt <= 1'b0;
 			fpc   <= {redir_npc[31:1], 1'b0};
 			qpc_r <= redir_npc;
 			odd   <= redir_npc[0];
@@ -580,10 +674,12 @@ always_ff @(posedge clk) begin
 			inv_sn    <= !ic_inv;
 			inv_scope <= ic_inv ? ic_inv_scope : 2'd1;
 			inv_pa    <= ic_inv ? ic_inv_pa : sn_inv_pa;
+			inv_lbh   <= !ic_inv && lb_v && lb_pa == sn_inv_pa[31:4];
 			if (ic_inv ? (ic_inv_scope == 2'd3) : sn_inv_all) begin
 				for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
 				ic_inv_done <= ic_inv;
 				sn_inv_done <= !ic_inv;
+				sn_ihit     <= !ic_inv;
 				inv_hold    <= 1'b1;
 			end
 			else begin
@@ -607,7 +703,9 @@ always_ff @(posedge clk) begin
 					else
 						m = ct[w][21:2] == inv_pa[31:12];
 					if (m) iv[s][w] <= 1'b0;
+					if (m && iv[s][w] && inv_sn) sn_ihit <= 1'b1;
 				end
+				if (inv_sn && inv_lbh) sn_ihit <= 1'b1;
 			end
 			inv_ph <= 1'b1;
 			if (inv_scope == 2'd1) begin

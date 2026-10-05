@@ -254,6 +254,7 @@ start:
 
 ;------------------------------------------------------- instruction cache
 	mwr	STUB,$70014E75		; moveq #1,d0 ; rts
+	cpusha	bc			; required before self-modified code runs (4.5)
 	jsr	(STUB).l
 	chkl	d0,1,32
 	amx	0,STUB,SZL|SC0		; not snooped

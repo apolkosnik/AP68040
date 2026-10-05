@@ -31,6 +31,8 @@ module ap68040_decode
 	input  logic  [7:0] win_flt,
 	input  logic  [7:0] win_fdem,     // the faulted fetch was a demand fetch
 	input  logic  [7:0] win_fatc,     // ... an ATC (MMU) fault
+	input  logic  [7:0] win_bt,       // the word ends a branch the fetch BTB took
+	input  logic [31:0] bt_tgt,       // its target (the first flagged word's)
 	input  pd_t         pd0,
 	input  logic  [3:0] qcnt,
 	input  logic [31:0] qpc,
@@ -45,7 +47,20 @@ module ap68040_decode
 	output logic  [1:0] rq_n,
 	output dinst_t      rq0,
 	output dinst_t      rq1,
-	input  logic        rq_pop
+	input  logic        rq_pop,
+
+	// Bcc history training (from EX)
+	input  logic        bht_we,
+	input  logic  [7:0] bht_wa,
+	input  logic  [1:0] bht_wd,
+
+	// BTB maintenance (the fetch unit's table)
+	output logic        btb_we,
+	output logic  [5:0] btb_wi,
+	output logic        btb_wv,
+	output logic [23:0] btb_wtag,
+	output logic        btb_wslot,
+	output logic [30:0] btb_wtgt
 );
 
 `include "gen/ap68040_dec_pla.svh"
@@ -244,6 +259,23 @@ end
 logic [31:0] ntarget;
 ph_t         nph;
 
+// Branch prediction at D1 (the back end verifies every prediction in EX):
+//  * Bcc: the static rule (backward taken), overruled by a 256-entry
+//    history table of 2-bit counters indexed by PC[8:1].  A counter counts
+//    how often the branch disagreed with the static rule, so the power-up
+//    zeros mean "static"; at 2 or more the prediction is inverted.
+//  * JSR/JMP to an absolute or PC-relative address: the target.
+//  * RTS: an 8-entry return stack, pushed by BSR/JSR records, popped by
+//    RTS records (not repaired after a redirect: a wrong entry only costs
+//    the redirect EX would have made anyway).
+logic  [1:0] bht_q;
+ap68040_lutram #(.AW(8), .DW(2)) bht (
+	.clk(clk), .we(bht_we), .waddr(bht_wa), .wdata(bht_wd), .raddr(qpc[8:1]), .q(bht_q)
+);
+logic [31:0] ras [8];
+logic  [2:0] ras_tp;           // the top entry
+logic  [3:0] ras_n;            // entries held (0..8)
+
 always_comb begin
 	logic [31:0] disp;
 	logic        nredir;
@@ -415,13 +447,24 @@ always_comb begin
 			end
 		end
 
-		// PC-relative branches: target and static prediction
+		// PC-relative branches: target and prediction
 		if (a0.rt == UA_BCC || a0.rt == UA_BSR) begin
 			disp = (opw[7:0] == 8'h00) ? sx16(win[1]) :
 			       (opw[7:0] == 8'hFF) ? {win[1], win[2]} :
 			       {{24{opw[7]}}, opw[7:0]};
 			ntarget = qpc + 32'd2 + disp;
-			nredir  = (a0.rt == UA_BSR) || (opw[11:8] == 4'h0) || disp[31];
+			nrec.bst = disp[31];
+			nrec.bhc = bht_q;
+			nredir  = (a0.rt == UA_BSR) || (opw[11:8] == 4'h0) || (disp[31] ^ bht_q[1]);
+		end
+		else if ((a0.rt == UA_JSR || a0.rt == UA_JMP) && go && !go_part &&
+		         (nrec.ea0.m == EM_ABSW || nrec.ea0.m == EM_ABSL || nrec.ea0.m == EM_PC16)) begin
+			ntarget = nrec.ea0.bd;
+			nredir  = 1'b1;
+		end
+		else if (a0.rt == UA_RTS && ras_n != 4'd0) begin
+			ntarget = ras[ras_tp];
+			nredir  = 1'b1;
 		end
 		else if (a0.rt == UA_DBCC) begin
 			disp    = sx16(win[1]);
@@ -446,9 +489,30 @@ always_comb begin
 end
 
 // the FIFO has room when it holds at most one record (registered)
+// Words the fetch BTB flagged (the end of a branch it took).  A flag on
+// the last word of a complete decode is checked against D1's own
+// prediction; a flag anywhere else (a stale or aliased entry: the words
+// after it came from its target) drops the entry and restarts the fetch
+// at this instruction, consuming nothing.
+logic [7:0] bt_lm;
+logic       bt_any, bt_last, bt_pre, bt_end, bt_restart;
+logic [2:0] bt_j;
+always_comb begin
+	bt_lm   = (use_n >= 4'd8) ? 8'hFF : 8'((9'd1 << use_n) - 9'd1);
+	bt_any  = |(win_bt & bt_lm);
+	bt_last = (use_n != 4'd0) && win_bt[3'(use_n - 4'd1)];
+	bt_pre  = |(win_bt & (bt_lm >> 1));
+	bt_end  = go && !go_part && (ph == PH_IDLE) && bt_last && !bt_pre;
+	bt_restart = (go || go_part) && bt_any && !bt_end;
+	bt_j = 3'd0;
+	for (int i = 7; i >= 0; i--) if (win_bt[i] && bt_lm[i]) bt_j = 3'(i);
+end
+wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
+wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.rt != UA_RTS) && (nrec.exc == 8'd0);
+
 wire room  = (rq_n != 2'd2);
 wire stall = flush || hold_redir || d_redir_v || !room;
-wire fire  = (go || go_part) && !stall;
+wire fire  = (go || go_part) && !stall && !bt_restart;
 wire push  = fire && go;
 wire pop   = rq_pop && (rq_n != 2'd0);
 
@@ -467,10 +531,47 @@ always_ff @(posedge clk) begin
 		d_redir_v  <= 1'b0;
 		d_redir_pc <= '0;
 		hold_redir <= 1'b0;
+		btb_we     <= 1'b0;
+		btb_wi     <= '0;
+		btb_wv     <= 1'b0;
+		btb_wtag   <= '0;
+		btb_wslot  <= 1'b0;
+		btb_wtgt   <= '0;
+		ras_tp     <= '0;
+		ras_n      <= '0;
+		for (int i = 0; i < 8; i++) ras[i] <= '0;
 	end
 	else begin
 		d_redir_v  <= 1'b0;
 		hold_redir <= d_redir_v;
+		btb_we     <= 1'b0;
+
+		if (bt_restart && !stall) begin
+			// a flagged word inside an instruction: drop the entry, fetch
+			// the instruction again
+			logic [31:0] fa;
+			fa = qpc + {28'd0, bt_j, 1'b0};
+			d_redir_v  <= 1'b1;
+			d_redir_pc <= (ph == PH_IDLE) ? qpc : part.pc;
+			ph         <= PH_IDLE;
+			btb_we     <= 1'b1;
+			btb_wv     <= 1'b0;
+			btb_wi     <= fa[7:2];
+			btb_wtag   <= fa[31:8];
+		end
+
+		// the return stack follows the records in program order
+		if (push && nrec.exc == 8'd0) begin
+			if (nrec.rt == UA_BSR || nrec.rt == UA_JSR) begin
+				ras[ras_tp + 3'd1] <= nrec.npc;
+				ras_tp <= ras_tp + 3'd1;
+				if (ras_n != 4'd8) ras_n <= ras_n + 4'd1;
+			end
+			else if (nrec.rt == UA_RTS && ras_n != 4'd0) begin
+				ras_tp <= ras_tp - 3'd1;
+				ras_n  <= ras_n - 4'd1;
+			end
+		end
 
 		case ({push, pop})
 			2'b01: begin rq0 <= rq1; rq_n <= rq_n - 2'd1; end
@@ -498,9 +599,29 @@ always_ff @(posedge clk) begin
 				else
 					part_len <= part_len + use_n;
 			end
-			if (push && nrec.pred && ph == PH_IDLE) begin
+			if (push && ph == PH_IDLE && bt_end) begin
+				// the fetch already took this branch: fine if D1 agrees
+				if (!(nrec.pred && ntarget == bt_tgt)) begin
+					d_redir_v  <= 1'b1;
+					d_redir_pc <= nrec.pred ? ntarget : nrec.npc;
+					btb_we     <= 1'b1;
+					btb_wv     <= nrec.pred && btb_ok;
+					btb_wi     <= lastpc[7:2];
+					btb_wtag   <= lastpc[31:8];
+					btb_wslot  <= lastpc[1];
+					btb_wtgt   <= ntarget[31:1];
+				end
+			end
+			else if (push && nrec.pred && ph == PH_IDLE) begin
 				d_redir_v  <= 1'b1;
 				d_redir_pc <= ntarget;
+				// next time the fetch takes it
+				btb_we     <= btb_ok;
+				btb_wv     <= 1'b1;
+				btb_wi     <= lastpc[7:2];
+				btb_wtag   <= lastpc[31:8];
+				btb_wslot  <= lastpc[1];
+				btb_wtgt   <= ntarget[31:1];
 			end
 		end
 		if (flush) begin

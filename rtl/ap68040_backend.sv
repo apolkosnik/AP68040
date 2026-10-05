@@ -66,6 +66,10 @@ module ap68040_backend
 	output logic        dm_locke,
 	output logic        dm_super,
 	output logic        dm_older,       // uops older than DC2 are in EX or WB
+	input  logic        sn_ihit,        // a snoop dropped valid instruction-cache data
+	output logic        bht_we,         // Bcc history training (decode's table)
+	output logic  [7:0] bht_wa,
+	output logic  [1:0] bht_wd,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        dm_iack,        // interrupt acknowledge cycle
 	input  logic        dm_hold1,       // the DMU holds DC1
@@ -295,8 +299,14 @@ wire        ag_cm     = cm_pend && (ag_u.pc == cm_pc) && (ag_u.mem != M_NONE) &&
                         (ag_u.op == OP_MOV) && (ag_u.cond == 4'hC);
 wire  [1:0] ag_msz    = ag_bfh ? ((bf_nb == 3'd1) ? SZ_B : (bf_nb <= 3'd3) ? SZ_W : SZ_L)
                                : ag_u.msz;
-wire [31:0] ag_maddr  = ag_cm ? cm_ea + ag_u.target :
-                        (ag_bft && bf_nb == 3'd3) ? ag_ea - 32'd2 : ag_ea;
+// the memory address: the cases are folded into the adder's operands
+// (their selects are registers), so nothing follows the sum on its way
+// to the data cache's set index
+wire [31:0] ag_mbase  = ag_cm ? cm_ea : ag_base;
+wire [31:0] ag_mix    = ag_cm ? 32'd0 : ag_ix;
+wire [31:0] ag_mdisp  = ag_cm ? ag_u.target :
+                        (ag_bft && bf_nb == 3'd3) ? ag_u.disp - 32'd2 : ag_u.disp;
+wire [31:0] ag_maddr  = ag_mbase + ag_mix + ag_mdisp;
 
 // operand read with the EX broadcast of this cycle (see the snoop below)
 logic        exw_v;           // EX writes the front file this cycle
@@ -318,10 +328,22 @@ endfunction
 wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
 wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
 
+// A snoop dropped instruction-cache data the front end may already have
+// run ahead into (it predicts calls and returns, beyond the 68040's
+// prefetch): the next instruction to reach AG is refetched, with it
+// everything younger.  Instructions already past AG are in execution.
+logic snp_pend;
+wire  ag_snref = snp_pend && ag_v && ag_u.first;
+always_ff @(posedge clk) begin
+	if (!nreset || flush) snp_pend <= 1'b0;
+	else if (sn_ihit) snp_pend <= 1'b1;
+	else if (adv_ag && ag_snref) snp_pend <= 1'b0;
+end
+
 // memory request to the DMU, issued as the uop leaves AG
 logic s_bit;
 assign s_bit      = sr_r[13];
-assign dm_req     = adv_ag && (ag_u.mem != M_NONE) && (ag_u.exc == 8'd0) && !ag_cancel;
+assign dm_req     = adv_ag && (ag_u.mem != M_NONE) && (ag_u.exc == 8'd0) && !ag_cancel && !ag_snref;
 assign dm_va      = ag_maddr;
 assign dm_mem     = ag_u.mem;
 assign dm_msz     = ag_msz;
@@ -331,6 +353,14 @@ assign dm_locke   = ag_u.mlocke;
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
 assign dm_older   = ex_v || wb_v;
+
+// Bcc history: the counter counts disagreement with the static rule
+// (saturating 0..3); trained as the branch leaves EX
+wire        bht_agree = (ex_taken == ex_u.bst);
+assign bht_we = adv_ex && ex_u.op == OP_BCC && ex_u.br == BR_COND;
+assign bht_wa = ex_u.pc[8:1];
+assign bht_wd = bht_agree ? ((ex_u.bhc == 2'd0) ? 2'd0 : ex_u.bhc - 2'd1)
+                          : ((ex_u.bhc == 2'd3) ? 2'd3 : ex_u.bhc + 2'd1);
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 assign dm_iack    = (ag_u.mfc == MFC_IACK);
 always_comb begin
@@ -885,12 +915,14 @@ always_comb begin
 	if (fp_stkill && ex_u.mem == M_ST && !ex_is_fp) ex_stkill = 1'b1;
 end
 
-// a store into the instruction stream just ahead (see EX -> WB)
+// a store into the instruction stream just ahead (see EX -> WB).  Code
+// the front end fetched elsewhere (a predicted target) is the program's
+// to keep coherent: the 68040 prefetches both paths of a branch and
+// requires CPUSHA before self-modified code runs (MC68040UM 4.5, 7.7).
 wire ex_smc = (ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
               ((ex_ea[31:6] == ex_u.npc[31:6]) ||
                (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1));
 logic smc_pend;
-
 // mispredict: the actual path differs from the one the front end took
 wire        ex_br      = (ex_u.br != BR_NONE) || (ex_u.op == OP_RTE);
 wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
@@ -1215,6 +1247,11 @@ always_ff @(posedge clk) begin
 		if (adv_ag) begin
 			dc1_u   <= ag_u;
 			dc1_u.msz <= ag_msz;
+			if (ag_snref) begin
+				// refetched from here (see snp_pend): no access, no effect
+				dc1_u.exc <= EXC_SNR;
+				dc1_u.mem <= M_NONE;
+			end
 			if (ag_cancel) begin
 				// no tail byte: a load gives zero, a store nothing; a
 				// cancelled FPU transfer also leaves its address registers
@@ -1313,7 +1350,12 @@ always_ff @(posedge clk) begin
 			wb_sr_we    <= ex_sr_we;
 			wb_cof      <= ex_br && ex_taken;
 			wb_sr_new   <= ex_sr_new;
-			if (ex_u.exc != 8'd0) begin
+			if (ex_u.exc == EXC_SNR) begin
+				wb_exc      <= EXC_IFS;     // refetched by WB, never an error
+				wb_exc_addr <= ex_u.pc;
+				wb_exc_ssw  <= 16'd0;
+			end
+			else if (ex_u.exc != 8'd0) begin
 				logic ifs, ifa;
 				// instruction fetch faults: a speculative one is refetched
 				// once (wb_refetch) and becomes an access error when it

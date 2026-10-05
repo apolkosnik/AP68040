@@ -42,13 +42,12 @@ module ap68040_useq
 );
 
 
-`include "gen/ap68040_ucode_rom.svh"
 
 //--------------------------------------------------------------------------
 // state
 //--------------------------------------------------------------------------
 logic  [9:0] upc;               // address of uw_q
-uword_t      uw_q;              // registered microcode word
+uword_t      uw_q;              // microcode word at upc (the ROM's output)
 logic        uw_v;              // uw_q is valid for the current instruction
 logic        exc_mode;          // running an exception routine
 logic        first;
@@ -316,7 +315,9 @@ always_comb begin
 	nu.mlocke = uw.locke;
 	nu.br     = uw.br;
 	nu.target = src.target;
-	nu.pred   = src.pred && (uw.br == BR_COND || uw.br == BR_IMM);
+	nu.pred   = src.pred && (uw.br != BR_NONE);
+	nu.bst    = src.bst;
+	nu.bhc    = src.bhc;
 	nu.ser    = uw.ser;
 	// FMOVEM / FMOVE of control registers to memory are T0 trace points
 	nu.t0cof  = src.t0 || (src.opw[15:6] == 10'b1111_0010_00 &&
@@ -766,10 +767,19 @@ always_comb begin
 	end
 end
 
+// the microcode ROM in block RAM: its address register is the sequencing
+// register (uw_q is the word at upc, read one cycle ahead as before)
+(* romstyle = "M10K" *) logic [$bits(uword_t)-1:0] urom [0:1023];
+initial begin
+`include "gen/ap68040_ucode_init.svh"
+end
+logic [$bits(uword_t)-1:0] uw_raw;
+always_ff @(posedge clk) uw_raw <= urom[na];
+assign uw_q = uword_t'(uw_raw);
+
 always_ff @(posedge clk) begin
 	if (!nreset) begin
 		upc      <= '0;
-		uw_q     <= '0;
 		uw_v     <= 1'b0;
 		exc_mode <= 1'b0;
 		first    <= 1'b1;
@@ -791,7 +801,6 @@ always_ff @(posedge clk) begin
 	end
 	else begin
 		upc  <= na;
-		uw_q <= ucode_rom(na);
 		uw_v <= nv;
 
 		// uop FIFO

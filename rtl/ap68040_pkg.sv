@@ -109,6 +109,8 @@ localparam logic [7:0] EXC_IFS  = 8'd1;    // speculative fetch, bus error
 localparam logic [7:0] EXC_IFB  = 8'd2;    // demand fetch, bus error
 localparam logic [7:0] EXC_IFSA = 8'hFD;   // speculative fetch, ATC fault
 localparam logic [7:0] EXC_IFA  = 8'hFE;   // demand fetch, ATC fault
+localparam logic [7:0] EXC_SNR  = 8'hFC;   // refetch: a snoop dropped code the
+                                            // front end may have run ahead into
 
 localparam logic [2:0] BR_NONE = 3'd0;
 localparam logic [2:0] BR_COND = 3'd1;   // decision from the EX op (Bcc, DBcc, FBcc)
@@ -231,6 +233,8 @@ typedef struct packed {
 	logic  [2:0] br;
 	logic [31:0] target;
 	logic        pred;      // the front end followed target
+	logic        bst;       // Bcc: static prediction, and the history counter
+	logic  [1:0] bhc;       // D1 read (trained in EX)
 	// exceptions and control
 	logic  [7:0] exc;       // decode-time exception vector, 0 = none
 	logic        ser;       // serialize: flush and refetch npc after WB
@@ -301,6 +305,8 @@ typedef struct packed {
 	logic [31:0] target;  // PC-relative branch target
 	logic        pred;    // the front end followed target
 	logic        t0;      // on the 68040 T0 trace list
+	logic        bst;     // Bcc: the static prediction (backward taken)
+	logic  [1:0] bhc;     // Bcc: its history counter as D1 read it
 } dinst_t;
 
 endpackage

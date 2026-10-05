@@ -122,7 +122,7 @@ logic [31:0] sn_pa;
 logic [127:0] sn_line;
 logic [31:0] sn_wword;
 logic [15:0] sn_wbe;
-logic        sn_ic, sn_ic_all, sn_ic_done;
+logic        sn_ic, sn_ic_all, sn_ic_done, sn_ihit;
 logic [31:0] sn_ic_pa;
 
 ap68040_snoop snoop (
@@ -166,6 +166,9 @@ logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
 logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
+logic        bht_we;
+logic  [7:0] bht_wa;
+logic  [1:0] bht_wd;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
 logic [31:0] dm_ldata, dm_faddr, dm_st_data;
 logic  [7:0] dm_fvec;
@@ -184,6 +187,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
 	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
+	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd), .sn_ihit(sn_ihit),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
@@ -246,7 +250,12 @@ atce_t       iatc_went;
 
 // front end
 logic [15:0] win [8];
-logic  [7:0] win_flt, win_fdem, win_fatc;
+logic  [7:0] win_flt, win_fdem, win_fatc, win_bt;
+logic [31:0] bt_tgt;
+logic        btb_we, btb_wv, btb_wslot;
+logic  [5:0] btb_wi;
+logic [23:0] btb_wtag;
+logic [30:0] btb_wtgt;
 pd_t         pd0;
 logic  [3:0] qcnt;
 logic [31:0] qpc;
@@ -264,8 +273,11 @@ ap68040_fetch fetch (
 	.stop(1'b0), .smode(sr[13]),
 	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
+	.win_bt(win_bt), .bt_tgt(bt_tgt),
 	.pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),
 	.q_odd(q_odd),
+	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
+	.btb_wslot(btb_wslot), .btb_wtgt(btb_wtgt),
 	.iw_req(iw_req), .iw_va(iw_va), .iw_fc2(iw_fc2), .iw_done(iw_done),
 	.iatc_wr(iatc_wr), .iatc_wla(iatc_wla), .iatc_wfc2(iatc_wfc2), .iatc_went(iatc_went),
 	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page),
@@ -274,6 +286,7 @@ ap68040_fetch fetch (
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
 	.sn_inv(sn_ic), .sn_inv_pa(sn_ic_pa), .sn_inv_all(sn_ic_all), .sn_inv_done(sn_ic_done),
+	.sn_ihit(sn_ihit),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b1), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
@@ -284,10 +297,14 @@ assign b_wdata[1] = '0;
 ap68040_decode dec (
 	.clk(clk), .nreset(nreset), .flush(flush),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
+	.win_bt(win_bt), .bt_tgt(bt_tgt),
 	.pd0(pd0), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
-	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop)
+	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
+	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd),
+	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
+	.btb_wslot(btb_wslot), .btb_wtgt(btb_wtgt)
 );
 
 ap68040_useq useq (
