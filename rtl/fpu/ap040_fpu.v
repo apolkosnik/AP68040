@@ -1771,6 +1771,7 @@ always @(posedge clk) begin
 
 			F_DIVL: begin : f_divl
 				reg [64:0] r2a, rem1, r2b, rem2;
+				reg [65:0] d0, d1, d2;     // trial subtractions: the borrow is the bit
 				reg        q1, q2;
 				if (loop_n == 7'd34) begin
 					if (qv[66]) begin
@@ -1787,11 +1788,9 @@ always @(posedge clk) begin
 				end
 				else if (loop_n == 7'd0) begin
 					// integer quotient bit compares unshifted
-					if (acc_hi >= {1'b0, a_m}) begin
-						acc_hi <= acc_hi - {1'b0, a_m};
-						qv <= {qv[65:0], 1'b1};
-					end
-					else qv <= {qv[65:0], 1'b0};
+					d0 = {1'b0, acc_hi} - {2'b00, a_m};
+					if (!d0[65]) acc_hi <= d0[64:0];
+					qv <= {qv[65:0], !d0[65]};
 					loop_n <= 7'd1;
 				end
 				else begin
@@ -1800,11 +1799,13 @@ always @(posedge clk) begin
 					// one-bit iterations cascaded combinationally (three
 					// do not close at 60 MHz)
 					r2a = {acc_hi[63:0], 1'b0};
-					q1 = (r2a >= {1'b0, a_m});
-					rem1 = q1 ? (r2a - {1'b0, a_m}) : r2a;
+					d1 = {1'b0, r2a} - {2'b00, a_m};
+					q1 = !d1[65];
+					rem1 = q1 ? d1[64:0] : r2a;
 					r2b = {rem1[63:0], 1'b0};
-					q2 = (r2b >= {1'b0, a_m});
-					rem2 = q2 ? (r2b - {1'b0, a_m}) : r2b;
+					d2 = {1'b0, r2b} - {2'b00, a_m};
+					q2 = !d2[65];
+					rem2 = q2 ? d2[64:0] : r2b;
 					acc_hi <= rem2;
 					qv <= {qv[64:0], q1, q2};
 					loop_n <= loop_n + 7'd1;
@@ -1814,6 +1815,7 @@ always @(posedge clk) begin
 			F_SQRTL: begin : f_sqrtl
 				reg [68:0] r2a, rem1, r2b, rem2;
 				reg [68:0] trial1, trial2;
+				reg [69:0] d1, d2;         // trial subtractions: the borrow is the digit
 				reg        q1, q2;
 				if (loop_n == 7'd33) begin
 					a_m <= qv[65:2];
@@ -1827,12 +1829,14 @@ always @(posedge clk) begin
 					// one-digit steps cascaded combinationally
 					r2a = {srem[66:0], srad[131:130]};
 					trial1 = {1'b0, qv[65:0], 2'b01};
-					q1 = (r2a >= trial1);
-					rem1 = q1 ? (r2a - trial1) : r2a;
+					d1 = {1'b0, r2a} - {1'b0, trial1};
+					q1 = !d1[69];
+					rem1 = q1 ? d1[68:0] : r2a;
 					r2b = {rem1[66:0], srad[129:128]};
 					trial2 = {1'b0, qv[64:0], q1, 2'b01};
-					q2 = (r2b >= trial2);
-					rem2 = q2 ? (r2b - trial2) : r2b;
+					d2 = {1'b0, r2b} - {1'b0, trial2};
+					q2 = !d2[69];
+					rem2 = q2 ? d2[68:0] : r2b;
 					srad <= {srad[127:0], 4'b0000};
 					srem <= rem2;
 					qv <= {qv[64:0], q1, q2};
