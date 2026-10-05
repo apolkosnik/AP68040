@@ -160,13 +160,16 @@ assign ext_rdata = {rd8({xfer_addr[31:2], 2'b00}), rd8({xfer_addr[31:2], 2'b01})
 int          evt_cnt;         // the capture stub reported (EVT written)
 int          frm_cnt;         // the entry RTE read its frame's format word
 int          iack_cnt;        // interrupt acknowledge cycles
+int          rdy_cnt;         // the monitor reached its idle loop (mask 7)
+int          rdy0;            // rdy_cnt already used by a round
 logic [31:0] frm_addr;        // the entry RTE frame of this round
-initial begin evt_cnt = 0; frm_cnt = 0; iack_cnt = 0; end
+initial begin evt_cnt = 0; frm_cnt = 0; iack_cnt = 0; rdy_cnt = 0; end
 always @(posedge clk) begin
 	if (ev && !ev_err && !ev_rd && ev_tt != 2'd3) begin
 		for (int i = 0; i < 4; i++)
 			if (ev_be[3 - i]) wr8({ev_addr[31:2], 2'(i)}, ev_data[31 - 8 * i -: 8]);
 		if ({ev_addr[31:2], 2'b00} == MBOX + 32'h100 && ev_be[3]) evt_cnt = evt_cnt + 1;
+		if ({ev_addr[31:2], 2'b00} == MBOX + 32'h204 && ev_be[3]) rdy_cnt = rdy_cnt + 1;
 	end
 	// the read that covers the frame's last byte: the format word
 	if (ev && !ev_err && ev_rd && ev_tt != 2'd3 &&
@@ -299,6 +302,7 @@ task automatic boot_core();
 	// the first instruction fetch from the monitor ends the reset overlay
 	while (!(xfer_v && xfer_addr >= MONB && xfer_addr < MONB + 32'h2000)) @(posedge clk);
 	boot = 1'b0;
+	rdy0 = rdy_cnt;
 endtask
 
 task automatic read_capture();
@@ -405,7 +409,19 @@ task automatic run_round();
 			$display("  FP%0d=%04x_%016x", i, i_fe[i][15:0], i_fm[i]);
 		$display("  FPCR=%08x FPSR=%08x FPIAR=%08x", i_fpcr, i_fpsr, i_fpiar);
 	end
-	// the native runner raises the interrupt before its entry RTE
+	// the native runner raises the interrupt before its entry RTE, with
+	// the interrupt mask at 7: wait for the monitor to be idle there (the
+	// previous round's capture loop runs at that round's mask)
+	t = 0;
+	while (rdy_cnt == rdy0 && t < EXEC_TIMEOUT) begin @(posedge clk); t++; end
+	if (rdy_cnt == rdy0) begin
+		$display("FAIL j%0d t%0d r%0d: the monitor did not come back to its idle loop",
+		         jr, test_idx, round_idx);
+		errors++;
+		boot_core();
+		return;
+	end
+	rdy0 = rdy_cnt;
 	ipl = i_level[2:0];
 	evt0  = evt_cnt;
 	frm0  = frm_cnt;

@@ -30,6 +30,8 @@ CAP_CR	equ	MBOX+$14C	; CACR TC ITT0 ITT1 DTT0 DTT1 of the test
 CAP_FP	equ	MBOX+$170	; FP0-FP7 at the handler entry, 96 bytes
 CAP_FC	equ	MBOX+$1D0	; FPCR FPSR FPIAR
 CMD	equ	MBOX+$200	; word: bench -> monitor, 1 resume, 2 stop
+RDY	equ	MBOX+$204	; word: monitor -> bench, idle at mask 7 (the
+				; bench raises a round's IPL only after this)
 CAP_FS	equ	MBOX+$300	; the test's FSAVE frame, put back on a resume
 MSTACK	equ	$42130000
 
@@ -107,13 +109,15 @@ cwait:
 stop:
 	move.w	#$2700,sr
 	lea	(MSTACK).l,sp
-	bra	iwait
+	bra	irdy
 
 ; the reset entry, at a fixed address (tb_cputest.sv IDLE)
 	ds.b	$42111800-*
 idle:
 	move.w	#$2700,sr
 	lea	(MSTACK).l,sp
+irdy:
+	move.w	#1,(RDY).l
 iwait:
 	tst.w	(GO).l
 	beq.s	iwait
