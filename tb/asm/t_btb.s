@@ -16,7 +16,10 @@
 ;  13    short branches back to back (the target FIFO fills up)
 ;  14-15 calls and returns nested deeper than the return stack
 ;  16    a computed JMP through a register to changing targets
-;  17    BTB index aliasing: two branches 256 bytes apart, both taken
+;  17    BTB index aliasing: two branches 1 KB apart (the 256-entry BTB
+;        indexes PC[9:2]), both taken
+;  18-19 returns the return stacks cannot predict: RTS to a pushed
+;        address, and a call that leaves by a jump (a stale entry)
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -222,6 +225,30 @@ start:
 	dbra	d1,.l11
 	chkl	d0,50*3,17
 
+;------------- 18-19: returns the stacks cannot know (correct regardless)
+	moveq	#0,d0
+	move.w	#19,d1
+.l18:	pea	(.t18).l		; RTS to an address the program pushed
+	rts
+	addq.l	#8,d0			; not reached
+.t18:	addq.l	#1,d0
+	dbra	d1,.l18
+	chkl	d0,20,18
+	moveq	#0,d0
+	move.w	#19,d1
+l19:	bsr	noret			; returns by a jump: a stale stack entry
+b19:	addq.l	#2,d0
+	bsr	ret1			; the next return finds the stale one first
+	dbra	d1,l19
+	chkl	d0,20*(1+2+4),19
+	bra.s	done19
+noret:	addq.l	#4,sp			; drop the return address
+	addq.l	#1,d0
+	jmp	(b19).l
+ret1:	addq.l	#4,d0
+	rts
+done19:
+
 ;----------------------------------------------------------------- done
 	move.w	#$600D,(DONEREG).l
 	bra.s	*
@@ -241,13 +268,13 @@ deep:	addq.l	#1,d0
 	bsr	deep
 .r:	rts
 
-; the same index, different tags (256 bytes apart)
-	cnop	0,256
+; the same index, different tags (1 KB apart)
+	cnop	0,1024
 alias1:	bra.s	.a1
 	nop
 .a1:	addq.l	#1,d0
 	rts
-	cnop	0,256
+	cnop	0,1024
 alias2:	bra.s	.a2
 	nop
 .a2:	addq.l	#2,d0

@@ -58,11 +58,15 @@ module ap68040_decode
 
 	// BTB maintenance (the fetch unit's table)
 	output logic        btb_we,
-	output logic  [5:0] btb_wi,
+	output logic [BTB_AW-1:0] btb_wi,
 	output logic        btb_wv,
-	output logic [23:0] btb_wtag,
+	output logic [BTB_TW-1:0] btb_wtag,
 	output logic        btb_wslot,
-	output logic [30:0] btb_wtgt
+	output logic  [1:0] btb_wkind,
+	output logic [30:0] btb_wtgt,
+	output logic [30:0] ras_o [8],    // the return stack, for the fetch's
+	output logic  [2:0] ras_tp_o,
+	output logic  [3:0] ras_n_o
 );
 
 `include "gen/ap68040_dec_pla.svh"
@@ -531,7 +535,15 @@ always_comb begin
 	end
 end
 wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
-wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.rt != UA_RTS) && (nrec.exc == 8'd0);
+wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.exc == 8'd0);
+// the entry's kind: a call pushes the fetch's return stack, a return pops it
+wire  [1:0] btb_kind = (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
+                       (nrec.rt == UA_RTS) ? 2'd2 : 2'd0;
+always_comb begin
+	for (int i = 0; i < 8; i++) ras_o[i] = ras[i][31:1];
+	ras_tp_o = ras_tp;
+	ras_n_o  = ras_n;
+end
 
 wire room  = (rq_n != 2'd2);
 wire stall = flush || hold_redir || d_redir_v || !room;
@@ -559,6 +571,7 @@ always_ff @(posedge clk) begin
 		btb_wv     <= 1'b0;
 		btb_wtag   <= '0;
 		btb_wslot  <= 1'b0;
+		btb_wkind  <= '0;
 		btb_wtgt   <= '0;
 		part_bt    <= 1'b0;
 		ras_tp     <= '0;
@@ -577,8 +590,8 @@ always_ff @(posedge clk) begin
 			fa = qpc + {28'd0, bt_j, 1'b0};
 			btb_we     <= 1'b1;
 			btb_wv     <= 1'b0;
-			btb_wi     <= fa[7:2];
-			btb_wtag   <= fa[31:8];
+			btb_wi     <= fa[BTB_AW+1:2];
+			btb_wtag   <= fa[31:BTB_AW+2];
 		end
 		// the flag of an earlier part stays with the instruction
 		if (fire) part_bt <= go_part && (part_bt || bt_restart);
@@ -630,9 +643,10 @@ always_ff @(posedge clk) begin
 					d_redir_pc <= nrec.pred ? ntarget : nrec.npc;
 					btb_we     <= 1'b1;
 					btb_wv     <= nrec.pred && btb_ok;
-					btb_wi     <= lastpc[7:2];
-					btb_wtag   <= lastpc[31:8];
+					btb_wi     <= lastpc[BTB_AW+1:2];
+					btb_wtag   <= lastpc[31:BTB_AW+2];
 					btb_wslot  <= lastpc[1];
+					btb_wkind  <= btb_kind;
 					btb_wtgt   <= ntarget[31:1];
 				end
 			end
@@ -642,9 +656,10 @@ always_ff @(posedge clk) begin
 				// next time the fetch takes it
 				btb_we     <= btb_ok;
 				btb_wv     <= 1'b1;
-				btb_wi     <= lastpc[7:2];
-				btb_wtag   <= lastpc[31:8];
+				btb_wi     <= lastpc[BTB_AW+1:2];
+				btb_wtag   <= lastpc[31:BTB_AW+2];
 				btb_wslot  <= lastpc[1];
+				btb_wkind  <= btb_kind;
 				btb_wtgt   <= ntarget[31:1];
 			end
 		end

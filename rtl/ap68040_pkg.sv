@@ -105,6 +105,10 @@ localparam logic [2:0] MFC_EAP  = 3'd5;  // microcode: the EA's space (D2 maps i
 // control flow
 // internal exception codes of instruction fetch faults (uop.exc); real
 // vectors otherwise.  The back end turns them into vector 2.
+// fetch BTB: 2**BTB_AW entries indexed by PC[BTB_AW+1:2], tagged PC[31:BTB_AW+2]
+localparam int BTB_AW = 8;
+localparam int BTB_TW = 30 - BTB_AW;
+
 localparam logic [7:0] EXC_IFS  = 8'd1;    // speculative fetch, bus error
 localparam logic [7:0] EXC_IFB  = 8'd2;    // demand fetch, bus error
 localparam logic [7:0] EXC_IFSA = 8'hFD;   // speculative fetch, ATC fault

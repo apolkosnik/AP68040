@@ -32,11 +32,13 @@
 // fetch; a fault on the lookahead after it is speculative, and the back   //
 // end refetches it on demand before it becomes an access error.           //
 //                                                                          //
-// Branch target buffer: 64 entries looked up with the F0 address; a hit  //
-// (the long word holds the last word of a branch D1 predicted taken)     //
-// ends the chunk at that word, flags it, and sends F0 to the target in   //
-// F1 (one bubble).  The flagged word's target travels in a FIFO; D1       //
-// checks every flagged word against its own decode (see decode).          //
+// Branch target buffer: 256 entries (BTB_AW) looked up with the F0       //
+// address; a hit (the long word holds the last word of a branch D1        //
+// predicted taken) ends the chunk at that word, flags it, and sends F0 to //
+// the target in F1 (one bubble): the entry's, or for a return the top of //
+// the fetch's return stack (pushed by the calls it takes, resynchronized //
+// from D1's on every redirect).  The flagged word's target travels in a  //
+// FIFO; D1 checks every flagged word against its own decode.              //
 //                                                                          //
 // CINV/CPUSH of the instruction cache arrive from the DMU (ic_inv): all   //
 // in one cycle, a line in two, a page by a scan of the 64 sets.  Bus     //
@@ -77,11 +79,15 @@ module ap68040_fetch
 	input  logic  [2:0] consume,
 	output logic        q_odd,        // the stream starts at an odd address
 	input  logic        btb_we,       // D1 writes a BTB entry
-	input  logic  [5:0] btb_wi,
+	input  logic [BTB_AW-1:0] btb_wi,
 	input  logic        btb_wv,       // valid (0 drops the entry)
-	input  logic [23:0] btb_wtag,
+	input  logic [BTB_TW-1:0] btb_wtag,
 	input  logic        btb_wslot,    // the branch ends at word 1 of the long word
+	input  logic  [1:0] btb_wkind,    // 0 branch, 1 call, 2 return (target from the stack)
 	input  logic [30:0] btb_wtgt,     // target[31:1]
+	input  logic [30:0] d_ras [8],    // D1's return stack: the fetch's is
+	input  logic  [2:0] d_ras_tp,     // ... resynchronized from it on every
+	input  logic  [3:0] d_ras_n,      // ... redirect
 
 	// DMU: table walks for the I-ATC, I-ATC maintenance, cache invalidation
 	output logic        iw_req,
@@ -185,16 +191,26 @@ endgenerate
 //--------------------------------------------------------------------------
 logic [31:0] fpc;              // F0 fetch address (A0 clear)
 
-// BTB: valid, tag fpc[31:8], slot, target[31:1]
-logic [56:0] btb_q;
-ap68040_lutram #(.AW(6), .DW(57)) btb (
+// BTB: valid, tag, slot, kind, target[31:1]
+localparam int BTB_DW = 1 + BTB_TW + 1 + 2 + 31;
+logic [BTB_DW-1:0] btb_q;
+ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb (
 	.clk(clk), .we(btb_we), .waddr(btb_wi),
-	.wdata({btb_wv, btb_wtag, btb_wslot, btb_wtgt}),
-	.raddr(fpc[7:2]), .q(btb_q)
+	.wdata({btb_wv, btb_wtag, btb_wslot, btb_wkind, btb_wtgt}),
+	.raddr(fpc[BTB_AW+1:2]), .q(btb_q)
 );
+wire               btb_qv    = btb_q[BTB_DW-1];
+wire [BTB_TW-1:0]  btb_qtag  = btb_q[BTB_DW-2 -: BTB_TW];
+wire               btb_qslot = btb_q[33];
 // a hit needs the branch's last word in this fetch (a fetch that starts
 // at word 1 cannot end a branch at word 0)
-wire btb_hit = btb_q[56] && btb_q[55:32] == fpc[31:8] && (btb_q[31] || !fpc[1]);
+wire btb_hit = btb_qv && btb_qtag == fpc[31:BTB_AW+2] && (btb_qslot || !fpc[1]);
+
+// the fetch's return stack: pushed by calls the BTB takes, popped by the
+// returns it takes (their target), resynchronized from D1's on redirects
+logic [30:0] fras [8];
+logic  [2:0] fras_tp;
+logic  [3:0] fras_n;
 logic        atc_hit;
 atce_t       atc_e;
 ap68040_atc iatc (
@@ -254,6 +270,7 @@ logic        fnew;             // the next F0 starts a redirected stream
 logic        f1_v;
 logic [31:0] f1_pc;
 logic        f1_bt, f1_bslot;   // the BTB hit at F0, and where the branch ends
+logic  [1:0] f1_bkind;
 logic [30:0] f1_btgt;
 logic        f1_s, f1_dem;
 logic        f1_hit;
@@ -380,7 +397,9 @@ always_ff @(posedge clk) begin
 		fnew  <= 1'b1;
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
-		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0;
+		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0; f1_bkind <= '0;
+		fras_tp <= '0; fras_n <= '0;
+		for (int i = 0; i < 8; i++) fras[i] <= '0;
 		f2_b  <= '0; f2_t <= '0; f3_b <= '0; f3_t <= '0;
 		qb    <= '0; tq_n <= '0;
 		for (int i = 0; i < 4; i++) tq[i] <= '0;
@@ -479,7 +498,8 @@ always_ff @(posedge clk) begin
 		if (f0_go) begin
 			f1_v   <= 1'b1;
 			f1_bt  <= btb_hit && bt_room;
-			f1_bslot <= btb_q[31];
+			f1_bslot <= btb_q[33];
+			f1_bkind <= btb_q[32:31];
 			f1_btgt  <= btb_q[30:0];
 			f1_pc  <= fpc;
 			f1_s   <= smode;
@@ -499,17 +519,29 @@ always_ff @(posedge clk) begin
 			f2_w[0] <= f1_pc[1] ? x_chunk[15:0] : x_chunk[31:16];
 			f2_w[1] <= x_chunk[15:0];
 			f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
-			if (f1_bt) begin
+			if (f1_bt && !(f1_bkind == 2'd2 && fras_n == 4'd0)) begin
 				// a predicted taken branch ends in this chunk: the words up
-				// to its last, that one flagged; F0 goes to the target and
-				// its sequential fetch of this cycle is dropped
+				// to its last, that one flagged; F0 goes to the target (a
+				// return's from the stack) and its sequential fetch of this
+				// cycle is dropped; a call pushes its return address
+				logic [30:0] t;
+				t = (f1_bkind == 2'd2) ? fras[fras_tp] : f1_btgt;
 				f2_n <= (f1_pc[1] || !f1_bslot) ? 2'd1 : 2'd2;
 				f2_b <= (f1_pc[1] || !f1_bslot) ? 2'b01 : 2'b10;
-				f2_t <= f1_btgt;
+				f2_t <= t;
 				f1_v <= 1'b0;
 				f1_bt <= 1'b0;
-				fpc  <= {f1_btgt, 1'b0};
+				fpc  <= {t, 1'b0};
 				fnew <= 1'b0;
+				if (f1_bkind == 2'd1) begin
+					fras[fras_tp + 3'd1] <= {f1_pc[31:2], f1_bslot} + 31'd1;
+					fras_tp <= fras_tp + 3'd1;
+					if (fras_n != 4'd8) fras_n <= fras_n + 4'd1;
+				end
+				else if (f1_bkind == 2'd2) begin
+					fras_tp <= fras_tp - 3'd1;
+					fras_n  <= fras_n - 4'd1;
+				end
 			end
 		end
 		else if (f1_go) begin
@@ -658,6 +690,9 @@ always_ff @(posedge clk) begin
 			tq_n  <= '0;
 			f1_v  <= 1'b0;
 			f1_bt <= 1'b0;
+			for (int i = 0; i < 8; i++) fras[i] <= d_ras[i];
+			fras_tp <= d_ras_tp;
+			fras_n  <= d_ras_n;
 			fpc   <= {redir_npc[31:1], 1'b0};
 			qpc_r <= redir_npc;
 			odd   <= redir_npc[0];

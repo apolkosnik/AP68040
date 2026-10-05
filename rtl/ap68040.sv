@@ -296,9 +296,13 @@ logic [15:0] win [8];
 logic  [7:0] win_flt, win_fdem, win_fatc, win_bt;
 logic [31:0] bt_tgt;
 logic        btb_we, btb_wv, btb_wslot;
-logic  [5:0] btb_wi;
-logic [23:0] btb_wtag;
+logic [BTB_AW-1:0] btb_wi;
+logic [BTB_TW-1:0] btb_wtag;
 logic [30:0] btb_wtgt;
+logic  [1:0] btb_wkind;
+logic [30:0] d_ras [8];
+logic  [2:0] d_ras_tp;
+logic  [3:0] d_ras_n;
 pd_t         pd0;
 logic  [3:0] qcnt;
 logic [31:0] qpc;
@@ -320,7 +324,8 @@ ap68040_fetch fetch (
 	.pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),
 	.q_odd(q_odd),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
-	.btb_wslot(btb_wslot), .btb_wtgt(btb_wtgt),
+	.btb_wslot(btb_wslot), .btb_wkind(btb_wkind), .btb_wtgt(btb_wtgt),
+	.d_ras(d_ras), .d_ras_tp(d_ras_tp), .d_ras_n(d_ras_n),
 	.iw_req(iw_req), .iw_va(iw_va), .iw_fc2(iw_fc2), .iw_done(iw_done),
 	.iatc_wr(iatc_wr), .iatc_wla(iatc_wla), .iatc_wfc2(iatc_wfc2), .iatc_went(iatc_went),
 	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page),
@@ -347,7 +352,8 @@ ap68040_decode dec (
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
-	.btb_wslot(btb_wslot), .btb_wtgt(btb_wtgt)
+	.btb_wslot(btb_wslot), .btb_wkind(btb_wkind), .btb_wtgt(btb_wtgt),
+	.ras_o(d_ras), .ras_tp_o(d_ras_tp), .ras_n_o(d_ras_n)
 );
 
 ap68040_useq useq (
