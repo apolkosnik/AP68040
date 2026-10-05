@@ -102,6 +102,13 @@ localparam logic [2:0] MFC_SUP  = 3'd3;  // supervisor data (exception stacking)
 localparam logic [2:0] MFC_IACK = 3'd4;  // interrupt acknowledge (TT=3)
 
 // control flow
+// internal exception codes of instruction fetch faults (uop.exc); real
+// vectors otherwise.  The back end turns them into vector 2.
+localparam logic [7:0] EXC_IFS  = 8'd1;    // speculative fetch, bus error
+localparam logic [7:0] EXC_IFB  = 8'd2;    // demand fetch, bus error
+localparam logic [7:0] EXC_IFSA = 8'hFD;   // speculative fetch, ATC fault
+localparam logic [7:0] EXC_IFA  = 8'hFE;   // demand fetch, ATC fault
+
 localparam logic [2:0] BR_NONE = 3'd0;
 localparam logic [2:0] BR_COND = 3'd1;   // decision from the EX op (Bcc, DBcc, FBcc)
 localparam logic [2:0] BR_IMM  = 3'd2;   // always, to uop.target

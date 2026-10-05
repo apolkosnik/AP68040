@@ -63,6 +63,7 @@ logic [15:0] mv_mask;           // registers still to transfer
 logic [31:0] mv_off;            // address offset of the next transfer
 logic  [7:0] mv_cnt;            // bytes transferred so far
 logic        mv_t11;            // the address is in T11 (base register in the list)
+logic  [1:0] mv_fix;            // fix-up uops emitted after the last transfer
 
 // the instruction being sequenced: the D1 FIFO head, or nothing for an
 // exception routine
@@ -498,8 +499,8 @@ always_comb begin
 		logic  [3:0] bi, rn;
 		logic  [4:0] r;
 		logic  [2:0] sb;
-		logic        pd, pi, lastx, base_in;
-		logic  [4:0] an;
+		logic        pd, pi, lastx, base_in, fb_in, fx_in;
+		logic  [4:0] an, xreg;
 		logic [31:0] off;
 		m  = mv_act ? mv_mask : src.ext1;
 		pd = (src.ea0.m == EM_APD);
@@ -512,15 +513,29 @@ always_comb begin
 		lastx = (n_mv_rest == 16'd0);
 		sb = (src.sz == SZ_L) ? 3'd4 : 3'd2;
 		an = areg(src.ea0.r, sp_reg);
-		// a load list that contains the base register works from a copy
-		base_in = (uw.d == S_MVR) && !pd &&
-		          ((src.ea0.m == EM_AI || pi || src.ea0.m == EM_AD16 ||
-		            src.ea0.m == EM_AX) && !(src.ea0.m == EM_AX && src.ea0.bs)) &&
+		// A load list that contains a register of the EA (the base, or the
+		// index of an indexed mode) works from a copy of the address in
+		// T11, and the loaded base/index commits only after the last
+		// transfer (through T7/T6 and fix-up uops): a fault on a later
+		// transfer restarts the instruction with the original EA.  (An)+
+		// discards a loaded An: the final An is the incremented address.
+		fb_in   = (uw.d == S_MVR) && !pd && !pi &&
+		          (src.ea0.m == EM_AI || src.ea0.m == EM_AD16 ||
+		           (src.ea0.m == EM_AX && !src.ea0.bs)) &&
 		          src.ext1[{1'b1, src.ea0.r}];
+		xreg    = src.ea0.xa ? areg(src.ea0.xr, sp_reg) : dreg(src.ea0.xr);
+		fx_in   = (uw.d == S_MVR) && (src.ea0.m == EM_AX || src.ea0.m == EM_PCX) &&
+		          !src.ea0.is && src.ext1[{src.ea0.xa, src.ea0.xr}] &&
+		          !(fb_in && xreg == an);
+		base_in = fb_in || fx_in ||
+		          ((uw.d == S_MVR) && pi && src.ext1[{1'b1, src.ea0.r}]);
 		off = mv_act ? mv_off : (pd ? -{29'd0, sb} : 32'd0);
-		nu.last = lastx;
+		nu.last = lastx && !fb_in && !fx_in;
 		if (uw.d == S_MVR) begin
 			nu.d_v = 1'b1; nu.d_reg = r;
+			if (fb_in && r == an)         nu.d_reg = R_T0 + 5'd7;
+			else if (fx_in && r == xreg)  nu.d_reg = R_T0 + 5'd6;
+			else if (pi && r == an)       nu.d_v   = 1'b0;
 		end
 		else begin
 			nu.a_src = OS_REG; nu.a_reg = r;
@@ -531,7 +546,23 @@ always_comb begin
 				nu.b_src = OS_REG; nu.b_reg = an;
 			end
 		end
-		if (base_in && !mv_t11) begin
+		if (mv_act && mv_mask == 16'd0) begin
+			// after the last transfer: commit the deferred base, then index
+			uop_t p;
+			logic fxb;
+			fxb = fb_in && mv_fix == 2'd0;
+			p = '0;
+			p.pc = nu.pc; p.npc = nu.npc; p.first = 1'b0;
+			p.op = OP_MOV; p.sz = SZ_L; p.ccr_we = 5'd0;
+			p.a_src = OS_REG; p.a_reg = fxb ? (R_T0 + 5'd7) : (R_T0 + 5'd6);
+			p.b_src = OS_ZERO;
+			p.d_v = 1'b1; p.d_reg = fxb ? an : xreg;
+			p.last = !(fxb && fx_in);
+			p.exc = nu.exc;
+			nu = p;
+			n_mv_rest = 16'd0;
+		end
+		else if (base_in && !mv_t11) begin
 			// first: T11 = the address, then the transfers from T11
 			uop_t p;
 			p = '0;
@@ -646,6 +677,7 @@ always_ff @(posedge clk) begin
 		mv_off   <= '0;
 		mv_cnt   <= '0;
 		mv_t11   <= 1'b0;
+		mv_fix   <= 2'd0;
 		uq_n     <= 2'd0;
 		uq0      <= '0;
 		uq1      <= '0;
@@ -678,6 +710,7 @@ always_ff @(posedge clk) begin
 				mv_t11 <= 1'b1;
 			end
 			else if (uw.loop && !nu.last) begin
+				if (mv_act && mv_mask == 16'd0) mv_fix <= mv_fix + 2'd1;
 				mv_act  <= 1'b1;
 				mv_mask <= n_mv_rest;
 				mv_off  <= (mv_act ? mv_off : ((src.ea0.m == EM_APD) ?
@@ -700,6 +733,7 @@ always_ff @(posedge clk) begin
 			def_v  <= 1'b0;
 			mv_act <= 1'b0;
 			mv_t11 <= 1'b0;
+			mv_fix <= 2'd0;
 			if (exc_mode) exc_mode <= 1'b0;
 		end
 
@@ -710,6 +744,7 @@ always_ff @(posedge clk) begin
 			def_v <= 1'b0;
 			mv_act <= 1'b0;
 			mv_t11 <= 1'b0;
+			mv_fix <= 2'd0;
 			uq_n  <= 2'd0;
 			if (!exc_go) exc_mode <= 1'b0;
 		end

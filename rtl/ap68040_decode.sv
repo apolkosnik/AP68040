@@ -30,6 +30,7 @@ module ap68040_decode
 	input  logic [15:0] win [8],
 	input  logic  [7:0] win_flt,
 	input  logic  [7:0] win_fdem,     // the faulted fetch was a demand fetch
+	input  logic  [7:0] win_fatc,     // ... an ATC (MMU) fault
 	input  pd_t         pd0,
 	input  logic  [3:0] qcnt,
 	input  logic [31:0] qpc,
@@ -216,7 +217,23 @@ logic        go;            // a record is produced
 logic        go_part;       // a slow-path phase completes (no record yet)
 logic  [3:0] use_n;
 logic        flt;
-logic        fltd;           // a used faulted word came from a demand fetch
+
+// A fetch fault is raised for the lowest faulted word of the window (the
+// words before it are good, so it is the first faulted word an instruction
+// uses).  Codes: EXC_IFB a bus error, EXC_IFA an ATC fault, on a demand
+// fetch; EXC_IFS/EXC_IFSA the same on a speculative prefetch, which the
+// back end refetches on demand first.  The record's target carries the
+// faulting word's address (the format $7 fault address).
+logic  [7:0] f_code;
+logic [31:0] f_addr;
+always_comb begin
+	logic [2:0] fi;
+	fi = 3'd0;
+	for (int i = 7; i >= 0; i--) if (win_flt[i]) fi = 3'(i);
+	f_addr = qpc + {28'd0, fi, 1'b0};
+	f_code = win_fdem[fi] ? (win_fatc[fi] ? EXC_IFA : EXC_IFB)
+	                      : (win_fatc[fi] ? EXC_IFSA : EXC_IFS);
+end
 logic [31:0] ntarget;
 ph_t         nph;
 
@@ -228,7 +245,6 @@ always_comb begin
 	go_part = 1'b0;
 	use_n   = 4'd0;
 	flt     = 1'b0;
-	fltd    = 1'b0;
 	nredir  = 1'b0;
 	ntarget = '0;
 	disp    = '0;
@@ -245,7 +261,6 @@ always_comb begin
 		if ({1'b0, l} <= qcnt) begin
 			use_n = {1'b0, l};
 			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
-			fltd  = |(win_flt & win_fdem & ((8'd1 << l) - 8'd1));
 			if (ph == PH_EA0)
 				nrec.ea0 = mk_ea(i, part.opw[2:0], part_len, il,
 				                 part.pc + {27'd0, part_len, 1'b0},
@@ -268,8 +283,9 @@ always_comb begin
 			end
 			nrec.npc = part.pc + {27'd0, part_len + {1'b0, l}, 1'b0};
 			if (flt) begin
-				nrec.exc = fltd ? 8'd2 : 8'd1;
-				nrec.rt  = UA_DEC_EXC;
+				nrec.exc    = f_code;
+				nrec.target = f_addr;
+				nrec.rt     = UA_DEC_EXC;
 			end
 		end
 	end
@@ -308,7 +324,6 @@ always_comb begin
 			use_n    = 4'd1;
 			go       = 1'b1;
 			flt      = win_flt[0];
-			fltd     = win_flt[0] & win_fdem[0];
 			nrec.exc = (opw[15:12] == 4'hA) ? 8'd10 :
 			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
@@ -317,7 +332,6 @@ always_comb begin
 				go    = 1'b1;
 				use_n = pd0.tot;
 				flt   = |(win_flt & ((9'd1 << pd0.tot) - 9'd1));
-				fltd  = |(win_flt & win_fdem & ((9'd1 << pd0.tot) - 9'd1));
 				nrec.ea0 = mk_ea(pd0.i0, opw[2:0], {1'b0, fb},
 				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
 				                 qpc + {28'd0, fb, 1'b0},
@@ -336,7 +350,6 @@ always_comb begin
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
 			use_n = {1'b0, pd0.b};
 			flt   = |(win_flt & ((8'd1 << pd0.b) - 8'd1));
-			fltd  = |(win_flt & win_fdem & ((8'd1 << pd0.b) - 8'd1));
 			if (flt) begin
 				go = 1'b1;                   // stop at the faulted part
 			end
@@ -384,9 +397,7 @@ always_comb begin
 			else if (a0.rt == UA_ILLEGAL || a0.rt == UA_BKPT)
 				nrec.exc = 8'd4;
 		end
-		// a faulted word that came from a speculative prefetch is not an
-		// access error yet: code 1 makes the back end refetch it on demand
-		if (flt) nrec.exc = fltd ? 8'd2 : 8'd1;
+		if (flt) nrec.exc = f_code;
 		if (nrec.exc != 8'd0) begin
 			nrec.rt = UA_DEC_EXC;
 			if (go_part) begin
@@ -410,7 +421,7 @@ always_comb begin
 			ntarget = qpc + 32'd2 + disp;
 			nredir  = disp[31];
 		end
-		nrec.target = ntarget;
+		nrec.target = flt ? f_addr : ntarget;
 		nrec.pred   = nredir && (nrec.exc == 8'd0) && pd0.legal;
 	end
 end

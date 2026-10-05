@@ -355,8 +355,17 @@ endfunction
 // DC1
 wire        m1_wr  = (m1.mem == M_ST) || (m1.mem == M_RMW);
 xres_t      x_dc1;
-always_comb x_dc1 = xlate(m1.a, m1.smode, m1_wr, atc_hit, atc_e,
-                          tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m1.a[9:4]]);
+always_comb begin
+	x_dc1 = xlate(m1.a, m1.smode, m1_wr, atc_hit, atc_e,
+	              tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m1.a[9:4]]);
+	if (m1.iack) begin
+		// CPU space (interrupt acknowledge) is never translated nor cached
+		x_dc1     = '0;
+		x_dc1.ok  = 1'b1;
+		x_dc1.pa  = m1.a;
+		x_dc1.cm  = 2'b10;
+	end
+end
 wire  [4:0] m1_end   = {1'b0, m1.a[3:0]} + {2'b00, nbytes(m1.msz)};
 wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
 wire        m1_fast  = ((m1.mem == M_LD) || (m1.mem == M_RMW && !m1.lock)) &&
@@ -374,6 +383,10 @@ function automatic logic st_line(input mrec_t m, input logic [27:0] l);
 	          (m.x.pa[31:4] == l || (m.split && m.x1.pa[31:4] == l));
 endfunction
 wire hz = st_line(m3, m2_line) || st_line(m4, m2_line);
+// any store older than the DC2 uop not yet performed: a table walk for the
+// DC2 uop must see it (the program may just have written a descriptor)
+wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
+                (m4.r.v && (m4.r.mem == M_ST || m4.r.mem == M_RMW));
 // a RAM write to the load's set, or any engine activity, after its lookup
 // read the RAM makes the captured line stale: the engine reads it again
 logic m1_stale;
@@ -521,7 +534,9 @@ function automatic logic [15:0] mk_ssw(input logic atc, input logic lk, input lo
 		SZ_L: sz = 2'b00;
 		default: sz = 2'b11;
 	endcase
-	mk_ssw = {4'b0000, 1'b0, atc, lk, rd, 1'b0, sz, fc_tt(fc), fc_tm(fc)};
+	// a MOVE16 (line operand) reports TT = 01, the MOVE16 access
+	mk_ssw = {4'b0000, 1'b0, atc, lk, rd, 1'b0, sz,
+	          (msz == SZ_Q) ? TT_MOVE16 : fc_tt(fc), fc_tm(fc)};
 endfunction
 
 //--------------------------------------------------------------------------
@@ -721,7 +736,18 @@ always_ff @(posedge clk) begin
 			xres_t x;
 			x = xlate(e_va, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
 			          tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[e_va[9:4]]);
-			if (x.walk) begin
+			if (m2.r.iack) begin
+				x    = '0;
+				x.ok = 1'b1;
+				x.pa = e_va;
+				x.cm = 2'b10;
+			end
+			if (x.walk && st_older) begin
+				// older stores first (they need the engine at WB): retry
+				steal <= 1'b0;
+				e_st  <= E_IDLE;
+			end
+			else if (x.walk) begin
 				tw_va <= e_va; tw_s <= m2.r.smode; tw_wr <= (m2.r.mem != M_LD);
 				tw_pt <= 1'b0; tw_i <= 1'b0;
 				e_ret <= E_S_XL;            // look up again after the walk
@@ -746,8 +772,11 @@ always_ff @(posedge clk) begin
 			rd     = (m2.r.mem == M_LD) || (m2.r.mem == M_RMW);
 			if (e_x.flt) begin
 				e_flt   <= 1'b1;
-				e_faddr <= e_va;
-				e_fssw  <= mk_ssw(1'b1, m2.r.lock, m2.r.mem == M_LD, m2.r.msz, m2.r.fc);
+				// FA is the operand's first byte even when a later part
+				// faulted; MA marks an ATC fault on the second page
+				e_faddr <= m2.r.a;
+				e_fssw  <= mk_ssw(1'b1, m2.r.lock, m2.r.mem == M_LD, m2.r.msz, m2.r.fc) |
+				           (e_part ? 16'h0800 : 16'h0000);
 				e_st    <= E_S_DONE;
 			end
 			else if (e_fromline) begin
@@ -852,7 +881,7 @@ always_ff @(posedge clk) begin
 			// the bus read finished
 			if (bo_err && !m2.r.iack) begin
 				e_flt   <= 1'b1;
-				e_faddr <= e_va;
+				e_faddr <= m2.r.a;
 				e_fssw  <= mk_ssw(1'b0, m2.r.lock, 1'b1, m2.r.msz, m2.r.fc);
 				e_st    <= E_S_DONE;
 			end
@@ -941,7 +970,7 @@ always_ff @(posedge clk) begin
 				st_rdy     <= 1'b1;
 				st_fault   <= 1'b1;
 				st_fssw    <= mk_ssw(1'b0, m4.r.lock, 1'b0, m4.r.msz, m4.r.fc);
-				st_faddr   <= e_va;
+				st_faddr   <= m4.r.a;
 				e_wst_done <= 1'b1;
 				e_st       <= E_IDLE;
 			end
@@ -1004,10 +1033,11 @@ always_ff @(posedge clk) begin
 			endcase
 		end
 		E_M_PG: begin
-			// the stolen ATC read of the page is valid now: flush it
+			// the stolen ATC read of the page is valid now: flush it.  The
+			// flush pulse compares the lookup port in the NEXT cycle, so the
+			// port stays stolen (E_M_DONE / the walk's end release it)
 			atc_fpage       <= 1'b1;
 			iatc_flush_page <= 1'b1;
-			steal <= 1'b0;
 			if (mt_op == MT_PTEST) begin
 				// a transparent translation answers without a search
 				logic t0, t1, it0, it1, hitt, wpt, isp;
@@ -1147,7 +1177,7 @@ always_ff @(posedge clk) begin
 			if (bo_err) begin
 				// the operand's long word did not arrive: an access fault
 				e_flt   <= 1'b1;
-				e_faddr <= e_va;
+				e_faddr <= m2.r.a;
 				e_fssw  <= mk_ssw(1'b0, 1'b0, m2.r.mem == M_LD, m2.r.msz, m2.r.fc);
 				e_st    <= E_S_DONE;
 			end

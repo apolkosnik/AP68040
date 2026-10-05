@@ -274,7 +274,9 @@ assign dm_mem     = ag_u.mem;
 assign dm_msz     = ag_u.msz;
 assign dm_lock    = ag_u.mlock;
 assign dm_locke   = ag_u.mlocke;
-assign dm_super   = (ag_u.mfc == MFC_SUP) ? 1'b1 : s_bit;
+// FC2 of the access selects the root and the supervisor checks: MOVES
+// translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
+assign dm_super   = dm_fc[2];
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 assign dm_iack    = (ag_u.mfc == MFC_IACK);
 always_comb begin
@@ -869,7 +871,10 @@ wire take_trace  = trace_due && !take_irq;
 // a speculative fetch fault (code 1) is no exception: WB refetches the
 // instruction once on demand, and only a second fault there is an access
 // error (rt_armed/rt_pc)
-wire wb_refetch  = adv_wb && wb_v && (wb_exc == 8'd1);
+// exceptions that stack the next instruction: the instruction completed
+wire wb_post_trap = (wb_exc >= 8'd32 && wb_exc < 8'd48) ||
+                    wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7;
+wire wb_refetch  = adv_wb && wb_v && (wb_exc == EXC_IFS || wb_exc == EXC_IFSA);
 logic        rt_armed;
 logic [31:0] rt_pc;
 wire x_go        = (adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_irq;
@@ -1126,12 +1131,30 @@ always_ff @(posedge clk) begin
 			wb_cof      <= ex_br && ex_taken;
 			wb_sr_new   <= ex_sr_new;
 			if (ex_u.exc != 8'd0) begin
-				wb_exc      <= (ex_u.exc == 8'd1 && rt_armed && rt_pc == ex_u.pc) ? 8'd2 : ex_u.exc;
-				wb_exc_addr <= ex_u.pc;
-				// a faulted instruction fetch: read, long, TT normal, TM
+				logic ifs, ifa;
+				// instruction fetch faults: a speculative one is refetched
+				// once (wb_refetch) and becomes an access error when it
+				// faults again at the same instruction
+				ifs = (ex_u.exc == EXC_IFS || ex_u.exc == EXC_IFSA);
+				ifa = (ex_u.exc == EXC_IFA || ex_u.exc == EXC_IFSA);
+				if (ifs && !(rt_armed && rt_pc == ex_u.pc))
+					wb_exc <= ex_u.exc;
+				else if (ifs || ex_u.exc == EXC_IFB || ex_u.exc == EXC_IFA)
+					wb_exc <= 8'd2;
+				else
+					wb_exc <= ex_u.exc;
+				// a faulted instruction fetch: the faulting word's address;
+				// SSW ATC for an MMU fault, read, long, TT normal, TM the
 				// program space of the instruction's privilege
-				wb_exc_ssw  <= (ex_u.exc == 8'd2 || ex_u.exc == 8'd1) ?
-				               {7'd0, 1'b1, 3'b000, 2'b00, sr_r[13] ? 3'd6 : 3'd2} : 16'd0;
+				if (ifs || ex_u.exc == EXC_IFB || ex_u.exc == EXC_IFA) begin
+					wb_exc_addr <= ex_u.target;
+					wb_exc_ssw  <= {5'd0, ifa, 1'b0, 1'b1, 3'b000, 2'b00,
+					                sr_r[13] ? 3'd6 : 3'd2};
+				end
+				else begin
+					wb_exc_addr <= ex_u.pc;
+					wb_exc_ssw  <= 16'd0;
+				end
 			end
 			else if (ex_fault) begin
 				wb_exc      <= ex_fvec;
@@ -1277,6 +1300,19 @@ always_ff @(posedge clk) begin
 				if (wb_u.upd2_v) rf_f[wb_u.upd2_reg] <= wb_upd2_val;
 				if (wb_u.upd_v)  rf_f[wb_u.upd_reg] <= wb_upd_val;
 				if (wb_dwe)      rf_f[wb_u.d_reg]   <= wb_res;
+			end
+			else if (adv_wb && wb_is_exc && wb_post_trap) begin
+				// a trap after the instruction completed (CHK, CHK2,
+				// TRAPcc, TRAPV, divide by zero): its address update
+				// stands -- CHK.W (A2)+,D1 that traps leaves A2 advanced
+				if (wb_u.upd2_v) begin
+					rf_b[wb_u.upd2_reg] <= wb_upd2_val;
+					rf_f[wb_u.upd2_reg] <= wb_upd2_val;
+				end
+				if (wb_u.upd_v) begin
+					rf_b[wb_u.upd_reg] <= wb_upd_val;
+					rf_f[wb_u.upd_reg] <= wb_upd_val;
+				end
 			end
 			rf_b[R_T0 + 8]  <= vbr_r + {22'd0, x_vec, 2'b00};
 			rf_b[R_T0 + 9]  <= x_pc;
