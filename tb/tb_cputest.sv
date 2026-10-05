@@ -165,6 +165,16 @@ always @(posedge clk) begin
 	if (ev && ev_tt == 2'd3) iack_cnt = iack_cnt + 1;
 end
 
+// +trace_round: the core's retirement and exception entries of that round
+always @(posedge clk) begin
+	if (jr == trace_round && dut.be.adv_wb)
+		$display("%0t WB pc=%08x op=%0d last=%b exc=%0d bound=%b tr=%b sr=%04x take_trace=%b",
+		         $time, dut.be.wb_u.pc, dut.be.wb_u.op, dut.be.wb_u.last, dut.be.wb_exc,
+		         dut.be.wb_bound, dut.be.tr_now, dut.be.sr_r, dut.be.take_trace);
+	if (jr == trace_round && dut.be.x_go)
+		$display("%0t EXC vec=%0d pc=%08x", $time, dut.be.x_vec, dut.be.x_pc);
+end
+
 //--------------------------------------------------------------------------
 // APR2 input
 //--------------------------------------------------------------------------
@@ -289,7 +299,7 @@ task automatic check_final();
 	if (!(flags & F_IGNORE_EXC) && cap_vec !== e_exc) mismatch("exception", e_exc, cap_vec);
 	for (int i = 0; i < 16; i++)
 		if (cap_regs[i] !== e_regs[i])
-			mismatch(i < 8 ? "D register" : "A register", e_regs[i], cap_regs[i]);
+			mismatch($sformatf("%s%0d", i < 8 ? "D" : "A", i % 8), e_regs[i], cap_regs[i]);
 	// the SR the exception saw: the stacked SR, the format $0 frame's on
 	// the master stack under a throwaway frame
 	fsp = (rdv(cap_sp + 6, 8'd1) >> 12 == 1) ? cap_msp : cap_sp;

@@ -21,7 +21,8 @@
 //   F1  translation, tag compare; a hit is the chunk's words from the     //
 //       fetch address on.  Anything else rolls fpc back and runs in the   //
 //       miss engine (walk, line fill, cache-inhibited stream, fault)      //
-//   F2  predecode, append to the queue                                    //
+//   F2  predecode                                                          //
+//   F3  append to the queue                                                //
 //                                                                          //
 // The queue holds QN words: slot 0 is always the next word D1 decodes.    //
 // A redirect (D1 branch or WB) empties the queue and the pipeline.  A     //
@@ -94,7 +95,7 @@ module ap68040_fetch
 	input  logic        b_rtci
 );
 
-localparam int QN = 20;
+localparam int QN = 24;
 
 wire tc_e  = tc[15];
 wire tc_p  = tc[14];
@@ -130,11 +131,15 @@ always_comb begin
 	end
 end
 
-// F2: the words appended this cycle
+// F2: the words of a chunk, predecoded into F3; F3: appended this cycle
 logic  [2:0]  f2_n;
 logic [15:0]  f2_w [4];
 logic         f2_f, f2_d, f2_a;
 pd_t          f2_p [4];
+logic  [2:0]  f3_n;
+logic [15:0]  f3_w [4];
+pd_t          f3_p [4];
+logic         f3_f, f3_d, f3_a;
 genvar gp;
 generate
 	for (gp = 0; gp < 4; gp++) begin : g_pd
@@ -277,7 +282,7 @@ wire f1_deliver = f1_go && (x_hit || x_lb);
 //--------------------------------------------------------------------------
 // F0 issue: room for this chunk and those in flight
 //--------------------------------------------------------------------------
-wire [5:0] inflight = (f1_v ? 6'd4 : 6'd0) + {3'd0, f2_n};
+wire [5:0] inflight = (f1_v ? 6'd4 : 6'd0) + {3'd0, f2_n} + {3'd0, f3_n};
 wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 4);
 wire       f0_go    = (st == S_RUN) && !odd && !stop && !redir_any &&
                       !iatc_flush_page && !inv_busy && room;
@@ -326,6 +331,8 @@ always_ff @(posedge clk) begin
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
 		f2_n  <= '0; f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
 		for (int i = 0; i < 4; i++) f2_w[i] <= '0;
+		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
+		for (int i = 0; i < 4; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
 		lb_v  <= 1'b0; lb_pa <= '0; lb_d <= '0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
@@ -345,7 +352,7 @@ always_ff @(posedge clk) begin
 		inv_hold    <= 1'b0;
 
 		//------------------------------------------------------------------
-		// queue: shift out what D1 consumed, append F2
+		// queue: shift out what D1 consumed, append F3; F2 -> F3
 		//------------------------------------------------------------------
 		keep = cnt - {2'b00, consume};
 		for (int i = 0; i < QN; i++) begin
@@ -360,16 +367,19 @@ always_ff @(posedge clk) begin
 				qd[i] <= qd[src[4:0]];
 				qa[i] <= qa[src[4:0]];
 			end
-			else if (k < {2'b00, f2_n}) begin
-				qw[i] <= f2_w[k[1:0]];
-				qp[i] <= f2_p[k[1:0]];
-				qf[i] <= f2_f;
-				qd[i] <= f2_d;
-				qa[i] <= f2_a;
+			else if (k < {2'b00, f3_n}) begin
+				qw[i] <= f3_w[k[1:0]];
+				qp[i] <= f3_p[k[1:0]];
+				qf[i] <= f3_f;
+				qd[i] <= f3_d;
+				qa[i] <= f3_a;
 			end
 		end
-		cnt   <= keep + {2'b00, f2_n};
+		cnt   <= keep + {2'b00, f3_n};
 		qpc_r <= qpc_r + {28'd0, consume, 1'b0};
+		f3_n  <= f2_n;
+		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
+		for (int i = 0; i < 4; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
 		f2_n  <= '0;
 
 		//------------------------------------------------------------------
@@ -527,7 +537,7 @@ always_ff @(posedge clk) begin
 				else st <= S_RUN;
 			end
 			else if (!busy && !b_req_r && !b_gnt && !redir_any &&
-			         {1'b0, cnt} + {3'd0, f2_n} <= 6'(QN - 4))
+			         {1'b0, cnt} + {3'd0, f2_n} + {3'd0, f3_n} <= 6'(QN - 4))
 				b_req_r <= 1'b1;        // the next long word of the stream
 		end
 		default: ;
@@ -541,6 +551,7 @@ always_ff @(posedge clk) begin
 		if (redir_any) begin
 			cnt   <= '0;
 			f2_n  <= '0;
+			f3_n  <= '0;
 			f1_v  <= 1'b0;
 			fpc   <= {redir_npc[31:1], 1'b0};
 			qpc_r <= redir_npc;

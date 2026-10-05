@@ -21,6 +21,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -30,7 +31,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO / "tools" / "cputest"))
 from replay_gen import generate  # noqa: E402
 
-SIM = REPO / "obj" / "obj_cputest" / "tb_cputest"
+SIM = Path(os.environ.get("CPUTEST_SIM", REPO / "obj" / "obj_cputest" / "tb_cputest"))
 MON = HERE / "build" / "cputest_mon.bin"
 
 GROUPS = {
@@ -87,9 +88,12 @@ def image(group_dir: Path, name: str, cache: Path) -> Path:
     key = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
     out = cache / (name + "." + key)
     if not out.exists():
+        # parallel slices share the cache: publish the file atomically
         cache.mkdir(parents=True, exist_ok=True)
         data = gzip.open(src).read() if src.suffix == ".gz" else src.read_bytes()
-        out.write_bytes(data)
+        tmp = out.with_name(out.name + ".%d.%d" % (os.getpid(), threading.get_ident()))
+        tmp.write_bytes(data)
+        os.replace(tmp, out)
     return out
 
 

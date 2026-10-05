@@ -275,7 +275,7 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 endfunction
 
 wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm_b, 1'b0);
+wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm_b, 1'b0);
 
 // memory request to the DMU, issued as the uop leaves AG
 logic s_bit;
@@ -817,6 +817,12 @@ always_comb begin
 	endcase
 end
 
+// a store into the instruction stream just ahead (see EX -> WB)
+wire ex_smc = (ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
+              ((ex_ea[31:6] == ex_u.npc[31:6]) ||
+               (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1));
+logic smc_pend;
+
 // mispredict: the actual path differs from the one the front end took
 wire        ex_br      = (ex_u.br != BR_NONE) || (ex_u.op == OP_RTE);
 wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
@@ -1051,6 +1057,7 @@ always_ff @(posedge clk) begin
 		ipend_lvl <= 3'd0;
 		rt_armed <= 1'b0;
 		rt_pc    <= 32'd0;
+		smc_pend <= 1'b0;
 		rte_fmt7 <= 1'b0;
 		cm_n_v   <= 1'b0;
 		cm_n_ea  <= 32'd0;
@@ -1181,10 +1188,13 @@ always_ff @(posedge clk) begin
 			// queue and the instructions in flight) refetches after itself:
 			// the 68040 does not promise this, the previous core's AmigaOS
 			// boot depended on it (t_integer 192)
+			// (a store from a uop before the last one -- MOVEM, a bit
+			// field, CAS2 -- defers the refetch to the instruction's end:
+			// redirecting there would drop the instruction's remaining uops)
 			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we ||
-			               ((ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
-			                ((ex_ea[31:6] == ex_u.npc[31:6]) ||
-			                 (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1)));
+			               (ex_u.last && (smc_pend || ex_smc));
+			if (ex_u.last) smc_pend <= 1'b0;
+			else if (ex_smc) smc_pend <= 1'b1;
 			// where execution continues, predicted correctly or not
 			wb_redir_pc <= ex_br ? ex_next : ex_u.npc;
 			wb_sr_we    <= ex_sr_we;
@@ -1352,6 +1362,7 @@ always_ff @(posedge clk) begin
 			logic [15:0] vw;
 			rt_armed <= 1'b0;
 			cm_pend  <= 1'b0;
+			smc_pend <= 1'b0;
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			redir_v  <= 1'b0;

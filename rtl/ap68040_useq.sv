@@ -384,6 +384,10 @@ always_comb begin
 			end
 		end
 	end
+	// ADDA.L (A0)+,A0 / CMPA.L -(A0),A0: the destination register is read
+	// after the source EA's update (the 68000 family computes the EA first)
+	nu.b_upd = nu.upd_v && !me_ea1 && (me.m == EM_AIP || me.m == EM_APD) &&
+	           nu.b_src == OS_REG && nu.b_reg == nu.upd_reg;
 	// the deferred update lands on the upd2 uop, memory or not (FRESTORE
 	// commits (An)+ only after its frame check)
 	if (uw.upd2 && def_v) begin

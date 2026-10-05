@@ -234,6 +234,8 @@ typedef struct packed {
 	logic  [7:0] exc;       // decode-time exception vector, 0 = none
 	logic        ser;       // serialize: flush and refetch npc after WB
 	logic        t0cof;     // the instruction is on the 68040 T0 trace list
+	logic        b_upd;     // operand B is this uop's own (An)+/-(An) register:
+	                        // it reads the updated value (source EA updates)
 } uop_t;
 
 //--------------------------------------------------------------------------
