@@ -244,7 +244,19 @@ wire [31:0] ag_ea   = ag_base + ag_ix + ag_u.disp;
 wire [31:0] ag_pinc = ag_base + {{24{ag_u.upd_amt[7]}}, ag_u.upd_amt};
 wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_ea;
 wire [31:0] ag_u2v  = rf_f[ag_u.upd2_reg] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
-wire [31:0] ag_maddr = ag_ea;
+// bit field memory transfers sized by the field (see ucode.py _bf_mem_load)
+wire        ag_bfh    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hE);
+wire        ag_bft    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hD);
+wire        ag_rte7   = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hB);
+wire        ag_cancel = (ag_bft && !(bf_nb == 3'd3 || bf_nb == 3'd5)) ||
+                        (ag_rte7 && !rte_fmt7);
+// a continued MOVEM transfers from the stacked EA
+wire        ag_cm     = cm_pend && (ag_u.pc == cm_pc) && (ag_u.mem != M_NONE) &&
+                        (ag_u.op == OP_MOV) && (ag_u.cond == 4'hC);
+wire  [1:0] ag_msz    = ag_bfh ? ((bf_nb == 3'd1) ? SZ_B : (bf_nb <= 3'd3) ? SZ_W : SZ_L)
+                               : ag_u.msz;
+wire [31:0] ag_maddr  = ag_cm ? cm_ea + ag_u.target :
+                        (ag_bft && bf_nb == 3'd3) ? ag_ea - 32'd2 : ag_ea;
 
 // operand read with the EX broadcast of this cycle (see the snoop below)
 logic        exw_v;           // EX writes the front file this cycle
@@ -268,10 +280,10 @@ wire [31:0] ag_b = opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm_b, 1'b0);
 // memory request to the DMU, issued as the uop leaves AG
 logic s_bit;
 assign s_bit      = sr_r[13];
-assign dm_req     = adv_ag && (ag_u.mem != M_NONE) && (ag_u.exc == 8'd0);
+assign dm_req     = adv_ag && (ag_u.mem != M_NONE) && (ag_u.exc == 8'd0) && !ag_cancel;
 assign dm_va      = ag_maddr;
 assign dm_mem     = ag_u.mem;
-assign dm_msz     = ag_u.msz;
+assign dm_msz     = ag_msz;
 assign dm_lock    = ag_u.mlock;
 assign dm_locke   = ag_u.mlocke;
 // FC2 of the access selects the root and the supervisor checks: MOVES
@@ -408,6 +420,15 @@ logic [31:0] ex_latch;
 //--------------------------------------------------------------------------
 logic [31:0] bf_off;
 logic  [5:0] bf_w;
+logic  [2:0] bf_nb;             // memory form: bytes holding the field (1..5)
+
+// MOVEM continuation (MC68040UM 8.4.6.5, SSW CM)
+logic        rte_fmt7;          // the RTE's frame is format $7
+logic        cm_n_v;            // ... and its SSW has CM set
+logic [31:0] cm_n_ea;           // ... its EA
+logic        cm_pend;           // the next instruction continues a MOVEM
+logic [31:0] cm_ea, cm_pc;
+logic [31:0] wb_mv_ea;          // the WB MOVEM transfer's calculated EA
 
 // leading zero count of a nonzero 32-bit value, as a balanced tree
 function automatic logic [4:0] clz32(input logic [31:0] v);
@@ -442,7 +463,15 @@ always_comb begin
 	end
 	else begin
 		o   = {2'b00, bf_off[2:0]};
-		win = {ex_bv, ex_latch[7:0]};
+		// the bytes read, left justified: B holds the head transfer (byte,
+		// word or long), the latch the tail byte
+		case (bf_nb)
+			3'd1:    win = {ex_bv[7:0], 32'd0};
+			3'd2:    win = {ex_bv[15:0], 24'd0};
+			3'd3:    win = {ex_bv[15:0], ex_latch[7:0], 16'd0};
+			3'd4:    win = {ex_bv, 8'd0};
+			default: win = {ex_bv, ex_latch[7:0]};
+		endcase
 		rot = win[39:8] << o | ({24'd0, win[7:0]} >> (6'd8 - {1'b0, o}));
 		mask40 = {top, 8'h00} >> o;
 		ins40  = {ins_top, 8'h00} >> o;
@@ -474,14 +503,18 @@ always_comb begin
 		zflag = zf == 32'd0;
 	end
 	bf_flags = {ccr_f[4], nflag, zflag, 1'b0, 1'b0};
-	bf_lo_out = nwin[7:0];
+	// the bytes written back: the head right justified, the tail byte
+	bf_lo_out = (bf_nb == 3'd3) ? nwin[23:16] : nwin[7:0];
 	case (t)
 		3'd1: bf_res = fld;                                            // BFEXTU
 		3'd3: bf_res = (bf_w == 6'd32) ? fld :                         // BFEXTS
 		               (fld | (rot[31] ? (32'hFFFF_FFFF << bf_w) : 32'd0));
 		3'd5: bf_res = bf_off + {26'd0, lz};                           // BFFFO
 		3'd0: bf_res = ex_bv;                                          // BFTST
-		default: bf_res = ex_u.cond[3] ? nwin[39:8] : nreg;
+		default: bf_res = !ex_u.cond[3] ? nreg :
+		                  (bf_nb == 3'd1) ? {24'd0, nwin[39:32]} :
+		                  (bf_nb == 3'd2 || bf_nb == 3'd3) ? {16'd0, nwin[39:24]} :
+		                  nwin[39:8];
 	endcase
 end
 
@@ -866,7 +899,9 @@ wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != s
 // the trace is held (trace_defer) and taken at the end of the interrupt's
 // exception processing, stacking the handler's entry address
 wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
-wire take_irq    = irq_pend && (wb_bound || (stopped && !wb_v));
+// a MOVEM continuation armed by RTE runs before a pending interrupt
+wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v);
+wire take_irq    = irq_pend && !cm_block && (wb_bound || (stopped && !wb_v));
 wire take_trace  = trace_due && !take_irq;
 // a speculative fetch fault (code 1) is no exception: WB refetches the
 // instruction once on demand, and only a second fault there is an access
@@ -912,6 +947,8 @@ logic [15:0] x_osr, x_ssw, x_nsr;
 logic  [3:0] x_kind;
 logic  [4:0] x_ssp;
 logic        x_wfault;
+logic        x_cm;             // SSW CM: a MOVEM continues from x_cm_ea
+logic [31:0] x_cm_ea;
 always_comb begin
 	logic [15:0] cur;
 	// the SR the exception sees: after this instruction when it completed
@@ -928,6 +965,7 @@ always_comb begin
 		x_vec  = wb_exc;
 		x_addr = wb_exc_addr;
 		x_ssw  = wb_exc_ssw;
+		if (x_cm) x_ssw = x_ssw | 16'h1000;
 		// TRAP #n, TRAPcc, CHK and divide-by-zero stack the next
 		// instruction; faults and illegal opcodes the instruction
 		x_pc   = ((wb_exc >= 8'd32 && wb_exc < 8'd48) ||
@@ -952,6 +990,7 @@ always_comb begin
 	         (x_fmt == 4'h7) ? EK_FMT7 : (x_fmt == 4'h2) ? EK_FMT2 : EK_FMT0;
 	x_ssp  = cur[12] ? R_MSP : R_ISP;
 	x_wfault = (x_fmt == 4'h7) && !x_ssw[8];
+
 	// the SR inside the handler: S set, T cleared; an interrupt raises the
 	// mask to its level and clears M
 	x_nsr  = {2'b00, 1'b1, cur[12], cur[11:0]};
@@ -959,6 +998,15 @@ always_comb begin
 		x_nsr[12]   = 1'b0;
 		x_nsr[10:8] = irq_lvl;
 	end
+end
+
+// an access error of a MOVEM transfer in an indexed or PC-relative mode,
+// or of a continued MOVEM (also its refetch), sets CM and stacks the EA
+always_comb begin
+	x_cm    = adv_wb && wb_is_exc && (wb_exc == 8'd2) &&
+	          ((wb_u.op == OP_MOV && wb_u.cond == 4'hC && wb_u.mem != M_NONE) ||
+	           (cm_pend && wb_u.pc == cm_pc));
+	x_cm_ea = (cm_pend && wb_u.pc == cm_pc) ? cm_ea : wb_mv_ea;
 end
 
 always_ff @(posedge clk) begin
@@ -1003,6 +1051,12 @@ always_ff @(posedge clk) begin
 		ipend_lvl <= 3'd0;
 		rt_armed <= 1'b0;
 		rt_pc    <= 32'd0;
+		rte_fmt7 <= 1'b0;
+		cm_n_v   <= 1'b0;
+		cm_n_ea  <= 32'd0;
+		cm_pend  <= 1'b0;
+		cm_ea    <= 32'd0;
+		cm_pc    <= 32'd0;
 		stopped <= 1'b0;
 		stop_pc <= 32'd0;
 		trace_defer <= 1'b0;
@@ -1042,9 +1096,15 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (adv_ag) begin
 			dc1_u   <= ag_u;
+			dc1_u.msz <= ag_msz;
+			if (ag_cancel) begin
+				// no tail byte: a load gives zero, a store nothing
+				dc1_u.mem   <= M_NONE;
+				dc1_u.a_src <= OS_ZERO;
+			end
 			dc1_a   <= ag_a;
 			dc1_b   <= ag_b;
-			dc1_ea  <= ag_u.ag ? ag_ea : 32'd0;
+			dc1_ea  <= ag_u.ag ? ag_maddr : 32'd0;
 			dc1_upd <= ag_updv;
 			dc1_upd2 <= ag_u2v;
 			if (ag_u.upd_v)  rf_f[ag_u.upd_reg]  <= ag_updv;
@@ -1186,10 +1246,23 @@ always_ff @(posedge clk) begin
 			else wb_ccr <= ccr_f;
 			if (ex_u.op == OP_MDHI)  md_hiin  <= ex_av;
 			if (ex_u.op == OP_LATCH || (ex_u.op == OP_IACKV && !ex_u.cond[0])) ex_latch <= ex_av;
-			if (ex_u.op == OP_RTEF) rte_fmt1 <= (ex_av[15:12] == 4'h1);
+			if (ex_u.op == OP_RTEF && !ex_u.cond[0]) begin
+				rte_fmt1 <= (ex_av[15:12] == 4'h1);
+				rte_fmt7 <= (ex_av[15:12] == 4'h7);
+			end
+			if (ex_u.op == OP_MISC && ex_u.cond == 4'd6) begin
+				cm_n_v  <= rte_fmt7 && ex_bv[12];
+				cm_n_ea <= ex_av;
+			end
+			wb_mv_ea <= ex_ea - ex_u.target;
 			if (ex_u.op == OP_BFSET && !ex_u.cond[0]) begin
+				logic [5:0] w;
+				logic [6:0] e;
+				w = (ex_bv[4:0] == 5'd0) ? 6'd32 : {1'b0, ex_bv[4:0]};
+				e = {4'd0, ex_av[2:0]} + {1'b0, w} + 7'd7;
 				bf_off <= ex_av;
-				bf_w   <= (ex_bv[4:0] == 5'd0) ? 6'd32 : {1'b0, ex_bv[4:0]};
+				bf_w   <= w;
+				bf_nb  <= e[5:3];
 			end
 			if (ex_u.op == OP_BF) bf_lonew <= bf_lo_out;
 		end
@@ -1249,6 +1322,14 @@ always_ff @(posedge clk) begin
 			end
 			if (wb_bound) trace_defer <= 1'b0;
 			if (wb_bound) rt_armed <= 1'b0;
+			if (wb_bound) begin
+				// RTE of a format $7 frame with CM arms the continuation of
+				// the MOVEM it returns to; any other instruction ends it
+				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
+				cm_ea   <= cm_n_ea;
+				cm_pc   <= wb_next;
+				if (wb_u.op == OP_RTE) cm_n_v <= 1'b0;
+			end
 		end
 		if (wb_refetch) begin
 			flush    <= 1'b1;
@@ -1270,6 +1351,7 @@ always_ff @(posedge clk) begin
 		if (x_go) begin
 			logic [15:0] vw;
 			rt_armed <= 1'b0;
+			cm_pend  <= 1'b0;
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			redir_v  <= 1'b0;
@@ -1329,6 +1411,9 @@ always_ff @(posedge clk) begin
 			// format $7 write fault: WB3A mirrors the fault address and
 			// WB3D carries the store data (WB3S stays clear: the core
 			// restarts the instruction, nothing is left to write back)
+			// T5: the frame's EA field (the MOVEM EA with CM, else FA)
+			rf_b[R_T0 + 5]  <= x_cm ? x_cm_ea : x_addr;
+			rf_f[R_T0 + 5]  <= x_cm ? x_cm_ea : x_addr;
 			rf_b[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;
 			rf_b[R_T0 + 7]  <= x_wfault ? wb_st_data : 32'd0;
 			rf_f[R_T0 + 6]  <= x_wfault ? x_addr : 32'd0;

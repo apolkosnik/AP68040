@@ -313,10 +313,10 @@ always_ff @(posedge clk) begin
 				end
 			end
 		end
-		// IPEND: a claimed request is processed at the next boundary (a
-		// trace due there goes first and takes the request into its own
-		// handler's first boundary)
-		if (dut.be.wb_bound && !dut.be.take_irq &&
+		// IPEND: a claimed request is processed at the next boundary,
+		// except the RTE boundary that resumes a MOVEM (SSW CM): the
+		// continued MOVEM completes first
+		if (dut.be.wb_bound && !dut.be.take_irq && !dut.be.cm_block &&
 		    dut.be.ipl_q != 3'd0 && dut.be.ipl_q != 3'd7 && tb_qual[dut.be.ipl_q]) begin
 			errors <= errors + 1;
 			$display("FAIL: claimed level %0d request not taken at the boundary of pc=%h",

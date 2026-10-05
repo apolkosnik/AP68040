@@ -581,6 +581,13 @@ always_comb begin
 				nu.base_v = 1'b1; nu.base = R_T0 + 5'd11;
 				nu.idx_v = 1'b0; nu.disp = 32'd0;
 			end
+			// MOVEM continuation (SSW CM): for the indexed and PC-relative
+			// modes a transfer carries its offset from the calculated EA;
+			// a fault stacks that EA, and RTE resumes from it
+			if (src.ea0.m == EM_AX || src.ea0.m == EM_PC16 || src.ea0.m == EM_PCX) begin
+				nu.cond   = 4'hC;
+				nu.target = off;
+			end
 			// address of this transfer
 			nu.disp = nu.disp + off;
 			if (pd) nu.disp = off;          // undo the generic -(An) offset

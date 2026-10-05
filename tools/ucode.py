@@ -369,11 +369,18 @@ R('MOVEP_RM',
 # on a five-byte window: T2 = long at EA + offset/8, T3 = the next byte.
 # cond 'BFR'/'BFM' = opword 10:8 with the memory flag clear/set.
 _BFSETUP = U(op='BFSET', cond=0, sz='L', a='BFO', b='BFW', d='T0')
+# A memory bit field touches only the bytes that hold it (WinUAE
+# x_get_bitfield/x_put_bitfield): n = ((offset & 7) + width + 7) / 8 bytes
+# as a byte, a word, a word and a byte, a long, or a long and a byte.  n is
+# known only once BFSETUP has executed, so the head transfer (cond 14) and
+# the tail byte (cond 13) are sized at AG: the head becomes B/W/L, the tail
+# moves to +2 (n = 3), stays at +4 (n = 5) or is no transfer at all.
 def _bf_mem_load():
     return [U(ag='LEA0', agw='T1'),
             U(ag='ADDT0', agb='T1', agw='T1'),
-            U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='T1', const=0),
-            U(op='MOV', sz='B', msz='B', a='LD', b='ZERO', d='T3', ag='BASED', agb='T1', const=4),
+            U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='T1', const=0, cond=14),
+            U(op='MOV', sz='B', msz='B', a='LD', b='ZERO', d='T3', ag='BASED', agb='T1', const=4,
+              cond=13),
             U(op='LATCH', sz='L', a='T3')]
 R('BF_TST',
   U(jc='EA0_DN', jt='BF_TST.8'),
@@ -392,8 +399,9 @@ R('BF_MOD',
   _BFSETUP, *_bf_mem_load(),
   U(op='BF', cond='BFM', a='X1DL', b='T2', d='T2', ccr='NZVC'),
   U(op='BFSET', cond=1, sz='L', d='T3'),
-  U(op='MOV', sz='L', msz='L', a='T2', mem='ST', ag='BASED', agb='T1', const=0),
-  U(op='MOV', sz='B', msz='B', a='T3', mem='ST', ag='BASED', agb='T1', const=4, last=1),
+  U(op='MOV', sz='L', msz='L', a='T2', mem='ST', ag='BASED', agb='T1', const=0, cond=14),
+  U(op='MOV', sz='B', msz='B', a='T3', mem='ST', ag='BASED', agb='T1', const=4, cond=13,
+    last=1),
   _BFSETUP,
   U(op='BF', cond='BFR', a='X1DL', b='EA0', d='EA0', ccr='NZVC', last=1))
 
@@ -429,12 +437,20 @@ R('CHK2',
 # length (exception 14 on an unknown format; format $1 marks a throwaway
 # frame), SP += length, then RTE loads SR and jumps -- for a throwaway
 # frame back to this RTE, which then runs on the stack the new SR selects
+# A format $7 frame also gives its EA and SSW (cond 11: these two reads
+# exist only for format $7, decided at AG once RTEF has executed): with SSW
+# CM set the MOVEM at the frame's PC continues from the stacked EA (MISC 6
+# arms it; MC68040UM 8.4.6.5).
 R('RTE',
   U(op='MOV', sz='W', msz='W', a='LD', d='T1', ag='BASED', agb='SP', const=0),
   U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2),
   U(op='MOV', sz='W', msz='W', a='LD', d='T3', ag='BASED', agb='SP', const=6),
   U(op='RTEF', sz='W', a='T3', d='T0'),
   U(ag='ADDT0', agb='SP', agw='SP'),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T4', ag='BASED', agb='SP', const=-52, cond=11),
+  U(op='MOV', sz='L', msz='W', a='LD', b='ZERO', d='T5', ag='BASED', agb='SP', const=-48,
+    cond=11),
+  U(op='MISC', cond=6, sz='L', a='T4', b='T5'),
   U(op='RTE', sz='W', a='T1', b='T2', last=1))
 # RTR: CCR = (SP)+ word, PC = (SP)+ long
 R('RTR',
@@ -502,7 +518,7 @@ R('EXC_FMT7',
   U(op='MOV', sz='L', a='ZERO', ag='BASED', agb='SSP', const=-44, msz='L', mem='ST', mfc='SUP'), # WB2S WB1S
   U(op='MOV', sz='W', a='ZERO', ag='BASED', agb='SSP', const=-46, msz='W', mem='ST', mfc='SUP'), # WB3S
   U(op='MOV', sz='W', a='T13', ag='BASED', agb='SSP', const=-48, msz='W', mem='ST', mfc='SUP'),  # SSW
-  U(op='MOV', sz='L', a='T11', ag='BASED', agb='SSP', const=-52, msz='L', mem='ST', mfc='SUP'),  # EA
+  U(op='MOV', sz='L', a='T5',  ag='BASED', agb='SSP', const=-52, msz='L', mem='ST', mfc='SUP'),  # EA
   U(op='MOV', sz='W', a='T12', ag='BASED', agb='SSP', const=-54, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='SSP', const=-58, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='SSP', const=-60, msz='W', mem='ST', mfc='SUP'),
