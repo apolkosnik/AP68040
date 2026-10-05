@@ -3,7 +3,7 @@
 # Usage: run_tests.sh [program ...]   (default: the passing set)
 set -e
 cd "$(dirname "$0")"
-PROGS=${*:-"smoke t_integer"}
+PROGS=${*:-"smoke t_integer t_exceptions"}
 ./build_asm.sh $PROGS
 ./build_sim.sh > build/sim_build.log 2>&1 || { tail -30 build/sim_build.log; exit 1; }
 SIM=$(cd .. && pwd)/obj/obj_prog/tb_ap68040

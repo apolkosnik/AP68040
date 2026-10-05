@@ -382,18 +382,21 @@ always_comb begin
 				n_def_amt = (me.m == EM_AIP) ? {3'd0, amt} : -{3'd0, amt};
 			end
 		end
-		if (uw.upd2 && def_v) begin
-			logic same;
-			same = nu.base_v && nu.base == def_reg && (me.mi == 2'd0 || mi_stage1);
-			if (same) begin
-				nu.disp = nu.disp + {{24{def_amt[7]}}, def_amt};
-				if (me.m == EM_AIP) nu.upd_amt = nu.upd_amt + def_amt;
-			end
-			if (!(same && (me.m == EM_AIP || me.m == EM_APD))) begin
-				nu.upd2_v   = 1'b1;
-				nu.upd2_reg = def_reg;
-				nu.upd2_amt = def_amt;
-			end
+	end
+	// the deferred update lands on the upd2 uop, memory or not (FRESTORE
+	// commits (An)+ only after its frame check)
+	if (uw.upd2 && def_v) begin
+		logic same;
+		same = nu.ag && nu.base_v && nu.base == def_reg &&
+		       (me.mi == 2'd0 || !(me_ea1 ? ind1 : ind0));
+		if (same) begin
+			nu.disp = nu.disp + {{24{def_amt[7]}}, def_amt};
+			if (me.m == EM_AIP) nu.upd_amt = nu.upd_amt + def_amt;
+		end
+		if (!(same && (me.m == EM_AIP || me.m == EM_APD))) begin
+			nu.upd2_v   = 1'b1;
+			nu.upd2_reg = def_reg;
+			nu.upd2_amt = def_amt;
 		end
 	end
 

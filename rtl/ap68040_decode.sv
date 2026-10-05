@@ -29,6 +29,7 @@ module ap68040_decode
 
 	input  logic [15:0] win [8],
 	input  logic  [7:0] win_flt,
+	input  logic  [7:0] win_fdem,     // the faulted fetch was a demand fetch
 	input  pd_t         pd0,
 	input  logic  [3:0] qcnt,
 	input  logic [31:0] qpc,
@@ -215,6 +216,7 @@ logic        go;            // a record is produced
 logic        go_part;       // a slow-path phase completes (no record yet)
 logic  [3:0] use_n;
 logic        flt;
+logic        fltd;           // a used faulted word came from a demand fetch
 logic [31:0] ntarget;
 ph_t         nph;
 
@@ -226,6 +228,7 @@ always_comb begin
 	go_part = 1'b0;
 	use_n   = 4'd0;
 	flt     = 1'b0;
+	fltd    = 1'b0;
 	nredir  = 1'b0;
 	ntarget = '0;
 	disp    = '0;
@@ -242,6 +245,7 @@ always_comb begin
 		if ({1'b0, l} <= qcnt) begin
 			use_n = {1'b0, l};
 			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
+			fltd  = |(win_flt & win_fdem & ((8'd1 << l) - 8'd1));
 			if (ph == PH_EA0)
 				nrec.ea0 = mk_ea(i, part.opw[2:0], part_len, il,
 				                 part.pc + {27'd0, part_len, 1'b0},
@@ -264,7 +268,7 @@ always_comb begin
 			end
 			nrec.npc = part.pc + {27'd0, part_len + {1'b0, l}, 1'b0};
 			if (flt) begin
-				nrec.exc = 8'd2;
+				nrec.exc = fltd ? 8'd2 : 8'd1;
 				nrec.rt  = UA_DEC_EXC;
 			end
 		end
@@ -304,6 +308,7 @@ always_comb begin
 			use_n    = 4'd1;
 			go       = 1'b1;
 			flt      = win_flt[0];
+			fltd     = win_flt[0] & win_fdem[0];
 			nrec.exc = (opw[15:12] == 4'hA) ? 8'd10 :
 			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
@@ -312,6 +317,7 @@ always_comb begin
 				go    = 1'b1;
 				use_n = pd0.tot;
 				flt   = |(win_flt & ((9'd1 << pd0.tot) - 9'd1));
+				fltd  = |(win_flt & win_fdem & ((9'd1 << pd0.tot) - 9'd1));
 				nrec.ea0 = mk_ea(pd0.i0, opw[2:0], {1'b0, fb},
 				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
 				                 qpc + {28'd0, fb, 1'b0},
@@ -330,6 +336,7 @@ always_comb begin
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
 			use_n = {1'b0, pd0.b};
 			flt   = |(win_flt & ((8'd1 << pd0.b) - 8'd1));
+			fltd  = |(win_flt & win_fdem & ((8'd1 << pd0.b) - 8'd1));
 			if (flt) begin
 				go = 1'b1;                   // stop at the faulted part
 			end
@@ -377,7 +384,9 @@ always_comb begin
 			else if (a0.rt == UA_ILLEGAL || a0.rt == UA_BKPT)
 				nrec.exc = 8'd4;
 		end
-		if (flt) nrec.exc = 8'd2;
+		// a faulted word that came from a speculative prefetch is not an
+		// access error yet: code 1 makes the back end refetch it on demand
+		if (flt) nrec.exc = fltd ? 8'd2 : 8'd1;
 		if (nrec.exc != 8'd0) begin
 			nrec.rt = UA_DEC_EXC;
 			if (go_part) begin

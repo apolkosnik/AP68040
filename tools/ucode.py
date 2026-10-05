@@ -269,7 +269,7 @@ R('EXG_DA', U(op='MOV', sz='L', a='DX', d='T0'),
 R('BCC',    U(op='BCC', cond='CC', br='COND', last=1))
 R('BSR',    U(op='MOV', sz='L', a='NPC', ag='PUSH', msz='L', mem='ST', br='IMM', last=1))
 R('DBCC',   U(op='DBCC', cond='CC', b='DY', d='DY', br='COND', last=1))
-R('JMP',    U(ag='LEA0', br='EA', last=1))
+R('JMP',    U(ag='LEA0', b='OPW', br='EA', last=1))   # OPW: the odd-target frame PC
 R('JSR',    U(ag='LEA0', agw='T0'),
             U(op='MOV', sz='L', a='NPC', b='T0', ag='PUSH', msz='L', mem='ST', br='B', last=1))
 R('RTS',    U(op='MOV', sz='L', a='LD', ag='POP', msz='L', mem='LD', br='A', last=1))
@@ -446,7 +446,9 @@ R('RTR',
 # FSAVE/FRESTORE with the FPU in its reset state: a four-byte NULL frame
 # (replaced by the FPU's frames when the FPU is attached)
 R('FSAVE',    U(op='MOV', sz='L', msz='L', a='ZERO', d='EA0', last=1))
-R('FRESTORE', U(op='MOV', sz='L', msz='L', a='EA0', d='T0', last=1))
+R('FRESTORE',
+  U(op='MOV', sz='L', msz='L', a='EA0', d='T0', noupd=1),
+  U(op='RTEF', cond=1, sz='L', a='T0', upd2=1, last=1))
 
 # MOVES: ext bit 11 = register to memory (DFC), else memory to register
 # (SFC); an address register takes the operand sign-extended to 32 bits
@@ -480,14 +482,14 @@ R('EXC_FMT0',
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='SSP', const=-6, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='SSP', const=-8, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
-    a='LD', br='A', last=1))
+    a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 R('EXC_FMT2',
   U(op='MOV', sz='L', a='T11', ag='BASED', agb='SSP', const=-4, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T12', ag='BASED', agb='SSP', const=-6, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='SSP', const=-10, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='SSP', const=-12, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
-    a='LD', br='A', last=1))
+    a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 _f7 = [U(op='MOV', sz='L', a='ZERO', ag='BASED', agb='SSP', const=-4 * (k + 1),
          msz='L', mem='ST', mfc='SUP') for k in range(10)]
 _f7[7] = U(op='MOV', sz='L', a='T7', ag='BASED', agb='SSP', const=-32,
@@ -505,7 +507,7 @@ R('EXC_FMT7',
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='SSP', const=-58, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='SSP', const=-60, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
-    a='LD', br='A', last=1))
+    a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 R('EXC_RESET',
   U(op='MOV', sz='L', ag='BASED', agb='ZERO', const=0, msz='L', mem='LD', mfc='SUP',
     a='LD', d='ISP'),
@@ -523,7 +525,7 @@ R('EXC_IRQ',
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='ISP', const=-6, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T10', ag='BASEDU', agb='ISP', const=-8, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
-    a='LD', br='A', last=1))
+    a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 # with M set (68020-68040): format $0 on the master stack, then a format $1
 # throwaway frame on the interrupt stack with S set in its SR
 R('EXC_IRQM',
@@ -539,7 +541,7 @@ R('EXC_IRQM',
   U(op='MOV', sz='L', a='T9',  ag='BASED', agb='ISP', const=-6, msz='L', mem='ST', mfc='SUP'),
   U(op='MOV', sz='W', a='T6',  ag='BASEDU', agb='ISP', const=-8, msz='W', mem='ST', mfc='SUP'),
   U(op='MOV', sz='L', ag='BASED', agb='T8', const=0, msz='L', mem='LD', mfc='SUP',
-    a='LD', br='A', last=1))
+    a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 
 # ------------------------------------------------------------ entry params
 EOP = {

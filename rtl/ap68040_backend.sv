@@ -149,6 +149,9 @@ logic [31:0] wb_upd_val, wb_upd2_val;
 logic        wb_redir;        // the uop redirects the front end
 logic [31:0] wb_redir_pc;
 logic  [7:0] wb_exc;          // exception vector, 0 none
+logic        wb_exc_pcv;      // the frame PC is wb_exc_pc (odd change of flow)
+logic [31:0] wb_exc_pc;
+logic        wb_oddrte;       // RTE to an odd PC: its SR is committed first
 logic [31:0] wb_exc_addr;
 logic [15:0] wb_exc_ssw;
 logic        wb_st;           // store at WB
@@ -696,7 +699,14 @@ always_comb begin
 			// "the MC68040 does not generate or recognize" (MC68040UM 8.4.5;
 			// only the LC/EC040 use it)
 			xs.flags = ccr_f;
-			case (ex_av[15:12])
+			if (ex_u.cond[0]) begin
+				// FRESTORE header (FPU in reset state): only a NULL frame
+				// (version byte $00) is compatible, anything else is a
+				// format error at the FRESTORE
+				xs.res = ex_av;
+				if (ex_av[31:24] != 8'd0) xs.xvec = 8'd14;
+			end
+			else case (ex_av[15:12])
 				4'h0, 4'h1: xs.res = 32'd8;
 				4'h2, 4'h3: xs.res = 32'd12;
 				4'h7:       xs.res = 32'd60;
@@ -778,9 +788,34 @@ wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
 wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
                                    (ex_taken && ex_u.pred && ex_target != ex_u.target));
 
+// a change of flow to an odd address is an address error at the
+// instruction (format $2, the address with A0 cleared), before any of its
+// side effects -- the BSR/JSR push, the RTS/RTR pop -- except that RTE has
+// committed its SR and RTR its CCR.  Bcc and DBcc validate their target
+// taken or not (DBcc before its condition: Dn is left untouched).
+// The frame PC follows gencpu, as the cputest 68040 AE group records it:
+// the instruction, except JMP (opcode + 2; + 6 for the indexed modes), JSR
+// (the odd target: the fault is the fetch there) and the handler fetch of
+// an exception (the vector offset, without VBR).
+wire [31:0] ex_otgt = ex_taken ? ex_target : ex_u.target;
+wire        ex_odd  = ex_br && ex_otgt[0] &&
+                      (ex_taken || ex_u.op == OP_BCC || ex_u.op == OP_DBCC);
+logic [31:0] ex_odd_pc;
+always_comb begin
+	ex_odd_pc = ex_u.pc;
+	if (ex_u.br == BR_EA)
+		ex_odd_pc = ex_u.pc + (((ex_u.imm_b[5:3] == 3'd6) ||
+		                        (ex_u.imm_b[5:0] == 6'o73)) ? 32'd6 : 32'd2);
+	else if (ex_u.br == BR_B && ex_u.op == OP_MOV)
+		ex_odd_pc = ex_otgt;
+	else if (ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF)
+		ex_odd_pc = ex_ea - vbr_r;
+end
+
 // front-file write by EX, and its broadcast to younger operands
 wire ex_d_eff = ex_u.d_v && !ex_dkill && !(ex_u.op == OP_CAS && cas_eq);
-assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && (ex_u.exc == 8'd0);
+assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd &&
+                 (ex_u.exc == 8'd0);
 assign exw_reg = ex_u.d_reg;
 assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
 
@@ -792,7 +827,18 @@ assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm))
 logic  [2:0] ipl_q;
 logic        nmi_edge;
 logic  [2:0] irq_lvl_r;       // level being acknowledged
-wire         irq_pend = nmi_edge || (ipl_q != 3'd7 && ipl_q > sr_r[10:8]);
+// the mask in force at the boundary: an instruction that writes SR (MOVE
+// to SR, RTE, ANDI/ORI/EORI to SR) decides with its new mask, so a request
+// it unmasks is taken at that very boundary (cputest irq/all).  A request
+// that already beat the mask holds IPEND (ipend_r) and is taken at the next
+// boundary although the instruction raises the mask; IPEND lasts only while
+// the request is held at that level or above.
+logic        ipend_r;
+logic  [2:0] ipend_lvl;
+wire  [2:0]  irq_mask = (wb_v && wb_sr_we && wb_exc == 8'd0) ? wb_sr_new[10:8] : sr_r[10:8];
+wire         irq_pend = nmi_edge ||
+                        (ipl_q != 3'd7 && (ipl_q > irq_mask ||
+                                           (ipend_r && ipl_q >= ipend_lvl)));
 wire  [2:0]  irq_lvl  = nmi_edge ? 3'd7 : ipl_q;
 
 logic        stopped;         // STOP: waiting for an interrupt
@@ -805,7 +851,7 @@ logic        wb_cof;          // the uop's control transfer was taken
 wire wb_is_exc   = wb_v && (wb_exc != 8'd0);
 wire wb_commit   = adv_wb && !wb_is_exc;
 wire wb_bound    = wb_commit && wb_u.last;
-wire [31:0] wb_next = wb_redir ? wb_redir_pc : wb_u.npc;
+wire [31:0] wb_next = wb_redir_pc;
 
 // trace uses the T bits the instruction started with (sr_r before its own
 // SR write): T1 every instruction, T0 taken transfers and the 68040 list
@@ -814,9 +860,19 @@ wire wb_is_stop  = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd2);
 // STOP is traced under T1, and under T0 only when it changes the upper SR
 // byte (WinUAE MakeFromSR_x); a traced STOP does not stop
 wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != sr_r[15:8])));
-wire take_trace  = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
-wire take_irq    = irq_pend && ((wb_bound && !take_trace) || (stopped && !wb_v));
-wire x_go        = (adv_wb && wb_is_exc) || take_trace || take_irq;
+// an interrupt accepted at a boundary where a trace is also due goes first;
+// the trace is held (trace_defer) and taken at the end of the interrupt's
+// exception processing, stacking the handler's entry address
+wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
+wire take_irq    = irq_pend && (wb_bound || (stopped && !wb_v));
+wire take_trace  = trace_due && !take_irq;
+// a speculative fetch fault (code 1) is no exception: WB refetches the
+// instruction once on demand, and only a second fault there is an access
+// error (rt_armed/rt_pc)
+wire wb_refetch  = adv_wb && wb_v && (wb_exc == 8'd1);
+logic        rt_armed;
+logic [31:0] rt_pc;
+wire x_go        = (adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_irq;
 
 // WB holds: store not accepted yet; RESET until RSTO is done
 wire wb_reset    = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd1);
@@ -857,6 +913,7 @@ always_comb begin
 	cur = wb_commit ? (wb_sr_we ? (wb_sr_new & 16'hF71F) : {sr_r[15:5], wb_ccr})
 	                : {sr_r[15:5], wb_ccr};
 	if (stopped && !wb_v) cur = {sr_r[15:5], ccr_b};
+	if (adv_wb && wb_is_exc && wb_oddrte) cur = wb_sr_new & 16'hF71F;
 	x_osr  = cur;
 	x_ssw  = 16'd0;
 	x_addr = wb_u.pc;
@@ -870,6 +927,7 @@ always_comb begin
 		// instruction; faults and illegal opcodes the instruction
 		x_pc   = ((wb_exc >= 8'd32 && wb_exc < 8'd48) ||
 		          wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7) ? wb_u.npc : wb_u.pc;
+		if (wb_exc_pcv) x_pc = wb_exc_pc;
 	end
 	else if (take_irq) begin
 		x_vec  = 8'd24 + {5'd0, irq_lvl};   // replaced by the IACK result
@@ -936,6 +994,10 @@ always_ff @(posedge clk) begin
 		ipl_q   <= 3'd0;
 		nmi_edge <= 1'b0;
 		irq_lvl_r <= 3'd0;
+		ipend_r  <= 1'b0;
+		ipend_lvl <= 3'd0;
+		rt_armed <= 1'b0;
+		rt_pc    <= 32'd0;
 		stopped <= 1'b0;
 		stop_pc <= 32'd0;
 		trace_defer <= 1'b0;
@@ -961,6 +1023,12 @@ always_ff @(posedge clk) begin
 		end
 
 		ipl_q <= ipl;
+		if (ipl_q == 3'd0 || ipl_q == 3'd7 || (ipend_r && ipl_q < ipend_lvl))
+			ipend_r <= 1'b0;
+		else if (ipl_q > sr_r[10:8] && (!ipend_r || ipl_q > ipend_lvl)) begin
+			ipend_r   <= 1'b1;
+			ipend_lvl <= ipl_q;
+		end
 		if (ipl == 3'd7 && ipl_q != 3'd7) nmi_edge <= 1'b1;
 		else if (ipl != 3'd7) nmi_edge <= 1'b0;
 
@@ -1052,25 +1120,38 @@ always_ff @(posedge clk) begin
 			               ((ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
 			                ((ex_ea[31:6] == ex_u.npc[31:6]) ||
 			                 (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1)));
-			wb_redir_pc <= ex_mispred ? ex_next : ex_u.npc;
+			// where execution continues, predicted correctly or not
+			wb_redir_pc <= ex_br ? ex_next : ex_u.npc;
 			wb_sr_we    <= ex_sr_we;
 			wb_cof      <= ex_br && ex_taken;
 			wb_sr_new   <= ex_sr_new;
 			if (ex_u.exc != 8'd0) begin
-				wb_exc      <= ex_u.exc;
+				wb_exc      <= (ex_u.exc == 8'd1 && rt_armed && rt_pc == ex_u.pc) ? 8'd2 : ex_u.exc;
 				wb_exc_addr <= ex_u.pc;
-				wb_exc_ssw  <= 16'd0;
+				// a faulted instruction fetch: read, long, TT normal, TM
+				// program space of the instruction's privilege
+				wb_exc_ssw  <= (ex_u.exc == 8'd2 || ex_u.exc == 8'd1) ?
+				               {7'd0, 1'b1, 3'b000, 2'b00, sr_r[13] ? 3'd6 : 3'd2} : 16'd0;
 			end
 			else if (ex_fault) begin
 				wb_exc      <= ex_fvec;
 				wb_exc_addr <= ex_faddr;
 				wb_exc_ssw  <= ex_fssw;
 			end
+			else if (ex_xvec == 8'd0 && ex_odd) begin
+				wb_exc      <= 8'd3;
+				wb_exc_addr <= {ex_otgt[31:1], 1'b0};
+				wb_exc_ssw  <= 16'd0;
+			end
 			else begin
 				wb_exc      <= ex_xvec;
 				wb_exc_addr <= ex_u.pc;
 				wb_exc_ssw  <= 16'd0;
 			end
+			wb_exc_pcv <= ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && ex_odd;
+			wb_exc_pc  <= ex_odd_pc;
+			wb_oddrte  <= ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && ex_odd &&
+			              ex_u.op == OP_RTE;
 			// CCR after this uop (CHK, CHK2, TRAPcc and divide-by-zero set
 			// their flags and then trap: the stacked SR carries them)
 			if (ex_u.exc == 8'd0 && !ex_fault) begin
@@ -1144,6 +1225,16 @@ always_ff @(posedge clk) begin
 				ccr_f <= wb_sr_we ? wb_sr_new[4:0] : wb_ccr;
 			end
 			if (wb_bound) trace_defer <= 1'b0;
+			if (wb_bound) rt_armed <= 1'b0;
+		end
+		if (wb_refetch) begin
+			flush    <= 1'b1;
+			redir_v  <= 1'b1;
+			redir_pc <= wb_u.pc;
+			for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
+			ccr_f    <= ccr_b;
+			rt_armed <= 1'b1;
+			rt_pc    <= wb_u.pc;
 		end
 
 		//------------------------------------------------------------------
@@ -1155,6 +1246,7 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (x_go) begin
 			logic [15:0] vw;
+			rt_armed <= 1'b0;
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			redir_v  <= 1'b0;
@@ -1172,9 +1264,10 @@ always_ff @(posedge clk) begin
 			stopped  <= 1'b0;
 			if (take_irq && !(adv_wb && wb_is_exc)) begin
 				irq_lvl_r <= irq_lvl;
+				ipend_r   <= 1'b0;
 				if (irq_lvl == 3'd7) nmi_edge <= 1'b0;
 				// a trace due at this boundary is taken at the handler
-				if (take_trace || (wb_bound && tr_now)) begin
+				if (trace_due) begin
 					trace_defer <= 1'b1;
 					trace_addr  <= wb_u.pc;
 				end

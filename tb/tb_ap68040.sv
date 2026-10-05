@@ -14,12 +14,22 @@
 //   $F120       writes must carry FC=1 (MOVES/DFC check)                   //
 //   $F130 word  DMA-style poke: memory $3500 = data, $3502 = 0             //
 //   $F142       arm a one-shot bus error on the next access to $F140       //
+//               (armed at reset: the first access to $F140 is rejected)    //
 //   $F146       arm a one-shot bus error on the next table search access  //
 //   $F148 word  raise IPL 2 after the written number of clocks            //
 //   $F14C word  IPL = bits 2:0, withdrawn after bits 15:8 clocks          //
 //   $F150 word  IPL = bits 2:0, falls to bits 6:4 after bits 15:8 clocks  //
 //   $F154 word  arm a one-shot bus error on an instruction fetch at the   //
 //               written address (0 disarms)                               //
+//   $F160 word  (read) bench capability word, +cap=<n> (default 7)        //
+//   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
+//               or below the boundary mask, after the request qualified   //
+//               against an earlier, lower mask                            //
+//                                                                          //
+// Interrupt invariants checked on every run: no interrupt is accepted     //
+// long after IPL went idle (phantom), none at or below the mask without   //
+// an IPEND claim, and a claimed request is taken at the next instruction  //
+// boundary.                                                               //
 //                                                                          //
 // Plusargs: +waits (random wait states), +tbi=<0|1|2>, +retry=<percent>,  //
 // +bclk2 (bus at half the processor clock), +timeout=<cycles>, +trace.    //
@@ -144,7 +154,7 @@ always_ff @(posedge clk) begin
 	cycles <= cycles + 1;
 	if (!rsti_n) begin
 		ipl_lvl     <= 3'd0;
-		berr_armed  <= 1'b0;
+		berr_armed  <= 1'b1;     // the first access to $F140 is rejected (old bench)
 		wberr_arm   <= 1'b0;
 		fberr_armed <= 1'b0;
 		fberr_addr  <= '0;
@@ -257,6 +267,72 @@ always_ff @(posedge clk)
 		         dut.be.wb_u.upd_v, dut.be.wb_u.upd_reg, dut.be.wb_upd_val,
 		         dut.be.wb_st, dut.be.wb_exc, dut.be.wb_redir, dut.be.wb_redir_pc);
 
+// Interrupt invariants.  tb_qual models the IPEND claims from the core's
+// synchronized level and its SR alone: level L is claimed once it is the
+// visible level and beats the mask, until the level falls below L (the
+// device let go) or an acceptance at L consumes it.  A level hidden behind
+// a higher request holds no claim of its own.
+logic [6:1] tb_qual;
+logic [15:0] ipl_idle_for;
+logic [15:0] ipend_takes;
+wire        tb_irq_acc = dut.be.take_irq && !(dut.be.adv_wb && dut.be.wb_is_exc);
+always_ff @(posedge clk) begin
+	if (!rsti_n) begin
+		tb_qual      <= '0;
+		ipl_idle_for <= '0;
+		ipend_takes  <= '0;
+	end
+	else begin
+		for (int l = 1; l <= 6; l++) begin
+			if (dut.be.ipl_q < 3'(l))
+				tb_qual[l] <= 1'b0;
+			else if (dut.be.ipl_q == 3'(l) && 3'(l) > dut.be.sr_r[10:8])
+				tb_qual[l] <= 1'b1;
+		end
+		if (ipl_lvl == 3'd0) begin
+			if (ipl_idle_for != 16'hFFFF) ipl_idle_for <= ipl_idle_for + 1'd1;
+		end
+		else ipl_idle_for <= '0;
+		if (tb_irq_acc && !dut.be.nmi_edge) begin
+			if (dut.be.irq_lvl != 3'd0 && dut.be.irq_lvl != 3'd7)
+				tb_qual[dut.be.irq_lvl] <= 1'b0;
+			if (ipl_idle_for > 16'd12) begin
+				errors <= errors + 1;
+				$display("FAIL: interrupt accepted %0d cycles after IPL went idle (phantom)",
+				         ipl_idle_for);
+			end
+			if (dut.be.irq_lvl <= dut.be.irq_mask) begin
+				if (dut.be.irq_lvl == 3'd0 || !tb_qual[dut.be.irq_lvl]) begin
+					errors <= errors + 1;
+					$display("FAIL: level %0d interrupt accepted at or below mask %0d without a claim (pc=%h)",
+					         dut.be.irq_lvl, dut.be.irq_mask, dbg_pc);
+				end
+				else begin
+					ipend_takes <= ipend_takes + 1'd1;
+					mem.mem[16'hF164 >> 2] <= {ipend_takes + 16'd1, 16'h0000};
+				end
+			end
+		end
+		// IPEND: a claimed request is processed at the next boundary (a
+		// trace due there goes first and takes the request into its own
+		// handler's first boundary)
+		if (dut.be.wb_bound && !dut.be.take_irq &&
+		    dut.be.ipl_q != 3'd0 && dut.be.ipl_q != 3'd7 && tb_qual[dut.be.ipl_q]) begin
+			errors <= errors + 1;
+			$display("FAIL: claimed level %0d request not taken at the boundary of pc=%h",
+			         dut.be.ipl_q, dut.be.wb_u.pc);
+		end
+	end
+end
+
+logic [2:0] ipl_seen;
+always_ff @(posedge clk) begin
+	ipl_seen <= ipl_lvl;
+	if (trace && ipl_lvl != ipl_seen)
+		$display("%8d IPL %0d -> %0d (sr=%04x ipend=%b)", cycles, ipl_seen, ipl_lvl,
+		         dut.be.sr_r, dut.be.ipend_r);
+end
+
 //--------------------------------------------------------------------------
 // run
 //--------------------------------------------------------------------------
@@ -283,6 +359,7 @@ initial begin
 	load_prog();
 	if (!$value$plusargs("cap=%d", cap)) cap = 7;
 	mem.mem[16'hF160 >> 2] = {cap[15:0], 16'h0000};
+	mem.mem[16'hF164 >> 2] = 32'd0;
 	repeat (8) @(posedge clk);
 	rsti_n = 1'b1;
 	while (result == 0 && cycles < timeout && !dbg_halted) @(posedge clk);

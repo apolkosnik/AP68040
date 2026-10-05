@@ -10,6 +10,10 @@
 // cycle.  Fetches run ahead sequentially while there is room; a redirect  //
 // (D1 branch or a WB redirect) empties the queue.  A bus error on a fetch //
 // marks the words; D1 raises the fault only if it uses them (8.2.1).      //
+// Only the first fetch of a redirected stream is a demand fetch; the     //
+// sequential lookahead after it is speculative, and a fault there is     //
+// retried by the back end as a demand fetch (refetch from the            //
+// instruction) before it becomes an access error.                         //
 //--------------------------------------------------------------------------//
 
 module ap68040_fetch
@@ -29,6 +33,7 @@ module ap68040_fetch
 	// decoder side
 	output logic [15:0] win [8],
 	output logic  [7:0] win_flt,      // the word came from a faulted fetch
+	output logic  [7:0] win_fdem,     // ... the first of a redirected stream
 	output pd_t         pd0,          // predecode of win[0]
 	output logic  [3:0] qcnt,
 	output logic [31:0] qpc,
@@ -50,6 +55,9 @@ localparam int QN = 12;
 logic [15:0] qw   [QN];
 pd_t         qp   [QN];
 logic [QN-1:0] qf;
+logic [QN-1:0] qd;            // fault came from a demand fetch
+logic        fdem;            // the fetch on the bus was issued on demand
+logic        fnew;            // the next fetch starts a redirected stream
 logic  [3:0] cnt;
 logic [31:0] qpc_r;
 
@@ -67,6 +75,7 @@ always_comb begin
 	for (int i = 0; i < 8; i++) begin
 		win[i]     = qw[i];
 		win_flt[i] = qf[i];
+		win_fdem[i] = qd[i];
 	end
 end
 
@@ -95,6 +104,9 @@ always_ff @(posedge clk) begin
 	if (!nreset) begin
 		cnt   <= '0;
 		qf    <= '0;
+		qd    <= '0;
+		fdem  <= 1'b0;
+		fnew  <= 1'b1;
 		fpc   <= '0;
 		qpc_r <= '0;
 		busy  <= 1'b0;
@@ -103,7 +115,11 @@ always_ff @(posedge clk) begin
 		for (int i = 0; i < QN; i++) begin qw[i] <= '0; qp[i] <= '0; end
 	end
 	else begin
-		if (b_gnt) busy <= 1'b1;
+		if (b_gnt) begin
+			busy <= 1'b1;
+			fdem <= fnew;
+			fnew <= 1'b0;
+		end
 		if (busy && (b_done || b_err)) begin
 			busy  <= 1'b0;
 			stale <= 1'b0;
@@ -118,15 +134,16 @@ always_ff @(posedge clk) begin
 				qw[i] <= qw[src[3:0]];
 				qp[i] <= qp[src[3:0]];
 				qf[i] <= qf[src[3:0]];
+				qd[i] <= qd[src[3:0]];
 			end
 			else if (nin == 2'd2 && 4'(i) == keep) begin
-				qw[i] <= b_rdata[31:16]; qp[i] <= pd_hi; qf[i] <= b_err;
+				qw[i] <= b_rdata[31:16]; qp[i] <= pd_hi; qf[i] <= b_err; qd[i] <= fdem;
 			end
 			else if (nin == 2'd2 && 4'(i) == keep + 4'd1) begin
-				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err;
+				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err; qd[i] <= fdem;
 			end
 			else if (nin == 2'd1 && 4'(i) == keep) begin
-				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err;
+				qw[i] <= b_rdata[15:0];  qp[i] <= pd_lo; qf[i] <= b_err; qd[i] <= fdem;
 			end
 		end
 		cnt   <= keep + {2'b00, nin};
@@ -136,6 +153,7 @@ always_ff @(posedge clk) begin
 			logic [31:0] npc;
 			npc = redir_v ? redir_pc : d_redir_pc;
 			cnt   <= '0;
+			fnew  <= 1'b1;
 			fpc   <= {npc[31:1], 1'b0};
 			qpc_r <= npc;
 			odd   <= npc[0];

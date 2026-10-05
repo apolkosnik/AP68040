@@ -184,7 +184,7 @@ ap68040_dmu dmu (
 
 // front end
 logic [15:0] win [8];
-logic  [7:0] win_flt;
+logic  [7:0] win_flt, win_fdem;
 pd_t         pd0;
 logic  [3:0] qcnt;
 logic [31:0] qpc;
@@ -200,7 +200,7 @@ ap68040_fetch fetch (
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.stop(1'b0), .smode(sr[13]),
-	.win(win), .win_flt(win_flt), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),
+	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .consume(consume),
 	.q_odd(q_odd),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
@@ -210,7 +210,7 @@ assign b_wdata[1] = '0;
 
 ap68040_decode dec (
 	.clk(clk), .nreset(nreset), .flush(flush),
-	.win(win), .win_flt(win_flt), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
+	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .pd0(pd0), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop)
