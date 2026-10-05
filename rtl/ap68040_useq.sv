@@ -157,6 +157,8 @@ always_comb begin
 	opsel_t oa, ob, od;
 	ea_t    me;              // the uop's memory EA
 	logic   me_v, me_ea1;
+	logic [31:0] disp_pre;       // the uop's displacement before a deferred-update merge
+	logic        dmerge;         // ... which applies (see the upd2 block)
 	logic [1:0] osz, msz;
 	logic [2:0] mszf;
 	logic [4:0] amt;
@@ -435,7 +437,11 @@ always_comb begin
 	nu.a_upd = nu.upd_v && (me.m == EM_AIP || me.m == EM_APD) &&
 	           src.opw[15:8] == 8'h0E && nu.a_src == OS_REG && nu.a_reg == nu.upd_reg;
 	// the deferred update lands on the upd2 uop, memory or not (FRESTORE
-	// commits (An)+ only after its frame check)
+	// commits (An)+ only after its frame check).  Its displacement merge is
+	// applied after the MOVEM block (no MOVEM uop has upd2), so the two
+	// additions are parallel rather than chained.
+	disp_pre = nu.disp;
+	dmerge   = 1'b0;
 	if (uw.upd2 && def_v) begin
 		logic same, m16;
 		same = nu.ag && nu.base_v && nu.base == def_reg &&
@@ -448,7 +454,7 @@ always_comb begin
 			// the destination's own (An)+ is the only update
 		end
 		else if (same) begin
-			nu.disp = nu.disp + {{24{def_amt[7]}}, def_amt};
+			dmerge = 1'b1;
 			if (me.m == EM_AIP) nu.upd_amt = nu.upd_amt + def_amt;
 		end
 		if (!(same && (me.m == EM_AIP || me.m == EM_APD || m16))) begin
@@ -703,6 +709,8 @@ always_comb begin
 	// PC-relative and immediate sources
 	if (uw.mfc == MFC_EAP)
 		nu.mprog = (src.ea0.m == EM_PC16 || src.ea0.m == EM_PCX || src.ea0.m == EM_IMM);
+
+	if (dmerge) nu.disp = disp_pre + {{24{def_amt[7]}}, def_amt};
 
 	// a pointer load replaces the uop this cycle
 	if (n_ptr) begin

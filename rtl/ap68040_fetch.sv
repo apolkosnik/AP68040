@@ -448,8 +448,9 @@ always_ff @(posedge clk) begin
 			cfl = 1'b0; cj = 3'd0;
 			for (int i = 6; i >= 0; i--)
 				if (3'(i) < consume && qb[i]) begin cfl = 1'b1; cj = 3'(i); end
-			qpc_r <= cfl ? ({tq[0], 1'b0} + {28'd0, consume - cj - 3'd1, 1'b0})
-			             : qpc_r + {28'd0, consume, 1'b0};
+			// (a decode that ran past the flag is refetched at WB: the PC
+			// of what follows it does not matter)
+			qpc_r <= cfl ? {tq[0], 1'b0} : qpc_r + {28'd0, consume, 1'b0};
 			for (int i = 0; i < 4; i++) tqn[i] = tq[i];
 			n = tq_n;
 			if (cfl && n != 3'd0) begin

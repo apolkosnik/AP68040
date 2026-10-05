@@ -14,10 +14,12 @@
 //                                                                          //
 // Records go to D2 through a two-entry FIFO, so neither side depends on   //
 // the other combinationally.  PC-relative displacements, branch targets   //
-// and the next PC are added here.  Unconditional and statically          //
-// predicted (backward) branches redirect fetch.  Illegal, line A/F,      //
-// privilege, TRAP #n, odd PC and fetch faults become records carrying    //
-// their exception vector.                                                 //
+// and the next PC are added here.  Branches are predicted here (Bcc by    //
+// the static rule and a history table, JSR/JMP absolute and PC-relative,  //
+// RTS by a return stack) and redirect fetch, unless the fetch BTB already //
+// took the same branch; D1 checks every word the BTB flagged.  Illegal,  //
+// line A/F, privilege, TRAP #n, odd PC and fetch faults become records    //
+// carrying their exception vector.                                        //
 //--------------------------------------------------------------------------//
 
 module ap68040_decode
@@ -492,27 +494,48 @@ end
 // Words the fetch BTB flagged (the end of a branch it took).  A flag on
 // the last word of a complete decode is checked against D1's own
 // prediction; a flag anywhere else (a stale or aliased entry: the words
-// after it came from its target) drops the entry and restarts the fetch
-// at this instruction, consuming nothing.
-logic [7:0] bt_lm;
-logic       bt_any, bt_last, bt_pre, bt_end, bt_restart;
+// after it came from its target) drops the entry and marks the record
+// (or, for a multi-part decode, the instruction's final record) to be
+// refetched at WB (EXC_SNR): this check stays off the consume path.
+logic [7:0] bt_lm, bt_lb;
+logic       bt_any, bt_end, bt_restart, part_bt;
 logic [2:0] bt_j;
 always_comb begin
-	bt_lm   = (use_n >= 4'd8) ? 8'hFF : 8'((9'd1 << use_n) - 9'd1);
+	// the consumed words, and the last of them (tables, no arithmetic)
+	case (use_n)
+		4'd0: begin bt_lm = 8'h00; bt_lb = 8'h00; end
+		4'd1: begin bt_lm = 8'h01; bt_lb = 8'h01; end
+		4'd2: begin bt_lm = 8'h03; bt_lb = 8'h02; end
+		4'd3: begin bt_lm = 8'h07; bt_lb = 8'h04; end
+		4'd4: begin bt_lm = 8'h0F; bt_lb = 8'h08; end
+		4'd5: begin bt_lm = 8'h1F; bt_lb = 8'h10; end
+		4'd6: begin bt_lm = 8'h3F; bt_lb = 8'h20; end
+		4'd7: begin bt_lm = 8'h7F; bt_lb = 8'h40; end
+		default: begin bt_lm = 8'hFF; bt_lb = 8'h80; end
+	endcase
 	bt_any  = |(win_bt & bt_lm);
-	bt_last = (use_n != 4'd0) && win_bt[3'(use_n - 4'd1)];
-	bt_pre  = |(win_bt & (bt_lm >> 1));
-	bt_end  = go && !go_part && (ph == PH_IDLE) && bt_last && !bt_pre;
+	bt_end  = go && !go_part && (ph == PH_IDLE) && ((win_bt & bt_lm) == bt_lb);
 	bt_restart = (go || go_part) && bt_any && !bt_end;
 	bt_j = 3'd0;
 	for (int i = 7; i >= 0; i--) if (win_bt[i] && bt_lm[i]) bt_j = 3'(i);
+end
+// the record as it enters the FIFO: refetched at WB if a flag was inside
+// the instruction (now, or in an earlier part)
+dinst_t nrec_q;
+always_comb begin
+	nrec_q = nrec;
+	if (go && (bt_restart || part_bt)) begin
+		nrec_q.exc  = EXC_SNR;
+		nrec_q.rt   = UA_DEC_EXC;
+		nrec_q.pred = 1'b0;
+	end
 end
 wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
 wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.rt != UA_RTS) && (nrec.exc == 8'd0);
 
 wire room  = (rq_n != 2'd2);
 wire stall = flush || hold_redir || d_redir_v || !room;
-wire fire  = (go || go_part) && !stall && !bt_restart;
+wire fire  = (go || go_part) && !stall;
 wire push  = fire && go;
 wire pop   = rq_pop && (rq_n != 2'd0);
 
@@ -537,6 +560,7 @@ always_ff @(posedge clk) begin
 		btb_wtag   <= '0;
 		btb_wslot  <= 1'b0;
 		btb_wtgt   <= '0;
+		part_bt    <= 1'b0;
 		ras_tp     <= '0;
 		ras_n      <= '0;
 		for (int i = 0; i < 8; i++) ras[i] <= '0;
@@ -546,22 +570,22 @@ always_ff @(posedge clk) begin
 		hold_redir <= d_redir_v;
 		btb_we     <= 1'b0;
 
-		if (bt_restart && !stall) begin
-			// a flagged word inside an instruction: drop the entry, fetch
-			// the instruction again
+		if (bt_restart && fire) begin
+			// a flagged word inside an instruction: drop the entry (the
+			// record is refetched at WB)
 			logic [31:0] fa;
 			fa = qpc + {28'd0, bt_j, 1'b0};
-			d_redir_v  <= 1'b1;
-			d_redir_pc <= (ph == PH_IDLE) ? qpc : part.pc;
-			ph         <= PH_IDLE;
 			btb_we     <= 1'b1;
 			btb_wv     <= 1'b0;
 			btb_wi     <= fa[7:2];
 			btb_wtag   <= fa[31:8];
 		end
+		// the flag of an earlier part stays with the instruction
+		if (fire) part_bt <= go_part && (part_bt || bt_restart);
+		if (flush) part_bt <= 1'b0;
 
 		// the return stack follows the records in program order
-		if (push && nrec.exc == 8'd0) begin
+		if (push && nrec_q.exc == 8'd0) begin
 			if (nrec.rt == UA_BSR || nrec.rt == UA_JSR) begin
 				ras[ras_tp + 3'd1] <= nrec.npc;
 				ras_tp <= ras_tp + 3'd1;
@@ -576,12 +600,12 @@ always_ff @(posedge clk) begin
 		case ({push, pop})
 			2'b01: begin rq0 <= rq1; rq_n <= rq_n - 2'd1; end
 			2'b10: begin
-				if (rq_n == 2'd0) rq0 <= nrec; else rq1 <= nrec;
+				if (rq_n == 2'd0) rq0 <= nrec_q; else rq1 <= nrec_q;
 				rq_n <= rq_n + 2'd1;
 			end
 			2'b11: begin
-				if (rq_n == 2'd1) rq0 <= nrec;
-				else begin rq0 <= rq1; rq1 <= nrec; end
+				if (rq_n == 2'd1) rq0 <= nrec_q;
+				else begin rq0 <= rq1; rq1 <= nrec_q; end
 			end
 			default: ;
 		endcase
@@ -612,7 +636,7 @@ always_ff @(posedge clk) begin
 					btb_wtgt   <= ntarget[31:1];
 				end
 			end
-			else if (push && nrec.pred && ph == PH_IDLE) begin
+			else if (push && nrec_q.pred && ph == PH_IDLE) begin
 				d_redir_v  <= 1'b1;
 				d_redir_pc <= ntarget;
 				// next time the fetch takes it

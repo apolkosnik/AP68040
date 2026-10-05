@@ -272,17 +272,22 @@ assign ag_hold = ag_interlock;
 
 ap68040_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
 ap68040_rf #(.NR(5)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
-assign rra[0] = ag_u.base;
-assign rra[1] = ag_u.idx;
+// AG's base and index are read as the uop enters AG (ports 0/1 address
+// the incoming uop) and kept in registers, so AG's address adders, and the
+// data cache's set index after them, start from flip-flops
+assign rra[0] = in_u.base;
+assign rra[1] = in_u.idx;
 assign rra[2] = ag_u.upd2_reg;
 assign rra[3] = ag_u.a_reg;
 assign rra[4] = ag_u.b_reg;
 always_comb for (int i = 0; i < 5; i++) rrd[i] = fv[rra[i]] ? frd[i] : brd[i];
 
-wire [31:0] ag_base = ag_u.base_v ? rrd[0] : 32'd0;
-wire [31:0] ag_ix_r = rrd[1];
-wire [31:0] ag_ix   = ag_u.idx_v ? ((ag_u.idx_l ? ag_ix_r : {{16{ag_ix_r[15]}}, ag_ix_r[15:0]})
-                                    << ag_u.scale) : 32'd0;
+logic [31:0] agb_q, agx_q;     // the base, and the index sign-extended and scaled
+wire  [31:0] ag_base = agb_q;
+wire  [31:0] ag_ix   = agx_q;
+function automatic logic [31:0] ixf(input logic [31:0] v, input uop_t u);
+	ixf = u.idx_v ? ((u.idx_l ? v : {{16{v[15]}}, v[15:0]}) << u.scale) : 32'd0;
+endfunction
 wire [31:0] ag_ea   = ag_base + ag_ix + ag_u.disp;
 wire [31:0] ag_pinc = ag_base + {{24{ag_u.upd_amt[7]}}, ag_u.upd_amt};
 wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_ea;
@@ -1643,5 +1648,26 @@ assign pst_code = xstk ? 4'hB :
 assign pst_st   = halted ? 4'h5 : stopped ? 4'hD : xstk ? 4'hF :
                   (wb_v && wb_u.op == OP_RTE) ? 4'hE :
                   tw_busy ? {sr_r[13], 3'b100} : {sr_r[13], 3'b000};
+
+// AG's base and index registers: loaded with the incoming uop (with the
+// front-file writes of that cycle bypassed in), then following EX's
+// writes while AG holds (an interlocked base or index is written there)
+always_ff @(posedge clk) begin
+	if (!flush && !stall_ag && in_v && !stopped) begin
+		logic [31:0] b, x;
+		b = rrd[0];
+		x = rrd[1];
+		for (int i = 0; i < 3; i++) begin
+			if (fwe[i] && fwa[i] == in_u.base) b = fwd[i];
+			if (fwe[i] && fwa[i] == in_u.idx)  x = fwd[i];
+		end
+		agb_q <= in_u.base_v ? b : 32'd0;
+		agx_q <= ixf(x, in_u);
+	end
+	else if (ag_v) begin
+		if (exw_v && ag_u.base_v && exw_reg == ag_u.base) agb_q <= exw_val;
+		if (exw_v && exw_reg == ag_u.idx) agx_q <= ixf(exw_val, ag_u);
+	end
+end
 
 endmodule

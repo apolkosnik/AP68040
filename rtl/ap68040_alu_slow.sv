@@ -92,7 +92,20 @@ always_comb begin
 	logic [31:0] win;
 	n  = a[5:0];
 	nm = n & (nbits - 6'd1);
-	nx = n % (nbits + 6'd1);
+	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider)
+	nx = n;
+	case (nbits)
+		6'd8: begin
+			if (nx >= 6'd36) nx = nx - 6'd36;
+			if (nx >= 6'd18) nx = nx - 6'd18;
+			if (nx >= 6'd9)  nx = nx - 6'd9;
+		end
+		6'd16: begin
+			if (nx >= 6'd34) nx = nx - 6'd34;
+			if (nx >= 6'd17) nx = nx - 6'd17;
+		end
+		default: if (nx >= 6'd33) nx = nx - 6'd33;
+	endcase
 	ne = (n > nbits) ? nbits : n;
 	cmask = (33'd2 << nbits) - 33'd1;
 	w  = ({32'd0, f_x} << nbits) | {1'b0, bm};
