@@ -2,3 +2,5 @@ tb/build/
 *.vvp
 *.hex
 *.bin
+obj/
+tb/build/

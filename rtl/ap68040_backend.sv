@@ -1,0 +1,859 @@
+//--------------------------------------------------------------------------//
+// AP68040-60 - pipelined MC68040                                            //
+//                                                                          //
+// ap68040_backend.sv - AG, DC1, DC2, EX and WB stages                       //
+//                                                                          //
+//   AG   read the front register file, effective address, (An)+/-(An)     //
+//        and LEA-class register updates (written to the front file)       //
+//   DC1  data ATC / cache lookup (ap68040_dmu)                             //
+//   DC2  way select and operand alignment (ap68040_dmu)                    //
+//   EX   ALU, shifter, multiply/divide, branch resolution, front-file      //
+//        result write                                                      //
+//   WB   back (architectural) register file, CCR/SR, stores, exceptions,  //
+//        interrupts, trace, serialization                                  //
+//                                                                          //
+// Operand values are read at AG.  A result produced by an older uop in EX  //
+// is broadcast and captured by every younger uop in AG/DC1/DC2 whose       //
+// operand names that register, so EX never forwards; address operands     //
+// (base, index, register updates) instead interlock at AG on any older    //
+// uop that will write the register in EX.                                  //
+//                                                                          //
+// Every redirect (branch mispredict, exception, serialization) happens in  //
+// WB, from state registered at the end of EX.                              //
+//--------------------------------------------------------------------------//
+
+module ap68040_backend
+	import ap68040_pkg::*;
+(
+	input  logic        clk,
+	input  logic        nreset,
+
+	// uops from the sequencer
+	input  logic        in_v,
+	input  uop_t        in_u,
+	output logic        in_rdy,
+
+	// redirect of the front end (registered)
+	output logic        redir_v,
+	output logic [31:0] redir_pc,
+	output logic        flush,          // kill everything younger than WB
+
+	// exception entry for the sequencer
+	output logic        exc_go,         // pulse: run the exception routine
+	output logic  [3:0] exc_kind,       // routine selector (see EK_*)
+	output logic  [4:0] exc_ssp,        // supervisor stack register to use
+
+	// micro-branch result back to the sequencer
+	output logic        ucond_v,
+	output logic        ucond,
+
+	// architectural state the front end needs
+	output logic [15:0] sr,
+	output logic [31:0] vbr,
+	output logic [31:0] cacr,
+	output logic  [2:0] sfc,
+	output logic  [2:0] dfc,
+
+	// data memory unit (DC1/DC2 lookups; WB stores)
+	output logic        dm_req,         // AG -> DC1: a memory uop advances
+	output logic [31:0] dm_va,
+	output logic  [1:0] dm_mem,
+	output logic  [1:0] dm_msz,
+	output logic  [2:0] dm_fc,
+	output logic        dm_lock,
+	output logic        dm_super,
+	output logic        dm_noalloc,     // exception stacking / vector fetch
+	output logic        adv_dc1,        // DC1 -> DC2
+	output logic        adv_dc2,        // DC2 -> EX
+	output logic        adv_ex,         // EX -> WB
+	output logic        adv_wb,         // WB completes
+	input  logic        dm_dc2_rdy,     // DC2 memory op has its result
+	input  logic [31:0] dm_ldata,       // load data, right aligned
+	input  logic        dm_fault,       // DC2 access fault (with info below)
+	input  logic  [7:0] dm_fvec,        // 2 access error, 3 address error
+	input  logic [31:0] dm_faddr,
+	input  logic [15:0] dm_fssw,
+	output logic        dm_st_v,        // WB store data valid this cycle
+	output logic [31:0] dm_st_data,
+	input  logic        dm_st_rdy,      // store accepted (WB may complete)
+	input  logic        dm_st_fault,
+	input  logic [15:0] dm_st_fssw,
+
+	// interrupts (synchronized level, 0-7)
+	input  logic  [2:0] ipl,
+
+	output logic        kill_now,       // this cycle: younger uops are discarded
+	output logic        adv_ag,         // AG -> DC1
+	output logic [31:0] dtt0,
+	output logic [31:0] dtt1,
+	output logic [31:0] itt0,
+	output logic [31:0] itt1,
+	output logic [31:0] tc,
+
+	// debug
+	output logic [31:0] dbg_pc,
+	output logic        dbg_retire,
+	output logic        halted
+);
+
+//--------------------------------------------------------------------------
+// exception routine kinds (sequencer entry points)
+//--------------------------------------------------------------------------
+localparam logic [3:0] EK_FMT0  = 4'd0;   // format $0 (PC = exc_pc)
+localparam logic [3:0] EK_FMT2  = 4'd1;   // format $2 (+ address)
+localparam logic [3:0] EK_FMT7  = 4'd2;   // access error
+localparam logic [3:0] EK_IRQ   = 4'd3;   // interrupt (IACK + format $0/$1)
+localparam logic [3:0] EK_RESET = 4'd4;   // reset: SSP/PC from 0/4
+
+//--------------------------------------------------------------------------
+// pipeline registers
+//--------------------------------------------------------------------------
+logic        ag_v, dc1_v, dc2_v, ex_v, wb_v;
+uop_t        ag_u, dc1_u, dc2_u, ex_u, wb_u;
+
+// operand values carried with the uop
+logic [31:0] dc1_a, dc1_b, dc1_ea;
+logic [31:0] dc2_a, dc2_b, dc2_ea;
+logic [31:0] ex_a,  ex_b,  ex_ea,  ex_ld;
+logic        ex_fault;
+logic  [7:0] ex_fvec;
+logic [31:0] ex_faddr;
+logic [15:0] ex_fssw;
+
+// results carried into WB
+logic [31:0] wb_res;
+logic  [4:0] wb_ccr;          // CCR after this uop
+logic        wb_dwe;          // result register write (after EX kills)
+logic [31:0] wb_upd_val, wb_upd2_val;
+logic        wb_redir;        // the uop redirects the front end
+logic [31:0] wb_redir_pc;
+logic  [7:0] wb_exc;          // exception vector, 0 none
+logic [31:0] wb_exc_addr;
+logic [15:0] wb_exc_ssw;
+logic        wb_st;           // store at WB
+logic [31:0] wb_st_data;
+logic [15:0] wb_sr_new;       // SR write
+logic        wb_sr_we;
+
+// AG register updates travel with the uop for the back file
+logic [31:0] dc1_upd, dc1_upd2, dc2_upd, dc2_upd2, ex_upd, ex_upd2;
+
+//--------------------------------------------------------------------------
+// register files
+//--------------------------------------------------------------------------
+logic [31:0] rf_f [32];       // front: newest values
+logic [31:0] rf_b [32];       // back: architectural
+logic  [4:0] ccr_f, ccr_b;
+
+// special registers (architectural, written at WB)
+logic [15:0] sr_r;            // T1 T0 S M 0 I2 I1 I0 (CCR lives in ccr_b)
+logic [31:0] vbr_r, cacr_r;
+logic  [2:0] sfc_r, dfc_r;
+logic [31:0] tc_r, itt0_r, itt1_r, dtt0_r, dtt1_r, mmusr_r, urp_r, srp_r;
+
+// exception information for the exception microroutine
+logic [31:0] xi_pc, xi_addr;
+logic [15:0] xi_sr, xi_vecw, xi_ssw;
+
+assign sr   = {sr_r[15:5], ccr_b};
+assign dtt0 = dtt0_r;
+assign dtt1 = dtt1_r;
+assign itt0 = itt0_r;
+assign itt1 = itt1_r;
+assign tc   = tc_r;
+assign vbr  = vbr_r;
+assign cacr = cacr_r;
+assign sfc  = sfc_r;
+assign dfc  = dfc_r;
+
+//--------------------------------------------------------------------------
+// stall / advance (bubbles collapse: a stage moves into an empty one)
+//--------------------------------------------------------------------------
+logic wb_hold, ex_hold, dc2_hold, ag_hold;
+logic stall_wb, stall_ex, stall_dc2, stall_dc1, stall_ag;
+
+// EX holds for a multicycle unit; DC2 for memory; WB for stores/serial ops
+logic md_busy;                // multiply/divide running (register)
+logic ex_md_start;
+// DC2 holds until the data memory unit has its result
+assign dc2_hold  = dc2_v && (dc2_u.mem != M_NONE) && (dc2_u.exc == 8'd0) && !dm_dc2_rdy;
+assign stall_wb  = wb_v  && wb_hold;
+assign stall_ex  = ex_v  && (ex_hold  || stall_wb);
+assign stall_dc2 = dc2_v && (dc2_hold || stall_ex);
+assign stall_dc1 = dc1_v && stall_dc2;
+assign stall_ag  = ag_v  && (ag_hold  || stall_dc1);
+
+assign adv_wb  = wb_v  && !stall_wb;
+assign adv_ex  = ex_v  && !stall_ex;
+assign adv_dc2 = dc2_v && !stall_dc2;
+assign adv_dc1 = dc1_v && !stall_dc1;
+assign adv_ag  = ag_v  && !stall_ag;
+
+assign in_rdy  = !stall_ag && !flush;
+
+//--------------------------------------------------------------------------
+// AG
+//--------------------------------------------------------------------------
+// interlock: base, index and update registers must not have an older
+// writer in DC1/DC2/EX (their value only exists after EX)
+function automatic logic pend_w(input logic [4:0] r);
+	pend_w = (dc1_v && dc1_u.d_v && dc1_u.d_reg == r) ||
+	         (dc2_v && dc2_u.d_v && dc2_u.d_reg == r) ||
+	         (ex_v  && ex_u.d_v  && ex_u.d_reg  == r);
+endfunction
+
+wire ag_interlock = ag_v && (
+	(ag_u.base_v && pend_w(ag_u.base)) ||
+	(ag_u.idx_v  && pend_w(ag_u.idx))  ||
+	(ag_u.upd_v  && pend_w(ag_u.upd_reg)) ||
+	(ag_u.upd2_v && pend_w(ag_u.upd2_reg)));
+
+assign ag_hold = ag_interlock;
+
+wire [31:0] ag_base = ag_u.base_v ? rf_f[ag_u.base] : 32'd0;
+wire [31:0] ag_ix_r = rf_f[ag_u.idx];
+wire [31:0] ag_ix   = ag_u.idx_v ? ((ag_u.idx_l ? ag_ix_r : {{16{ag_ix_r[15]}}, ag_ix_r[15:0]})
+                                    << ag_u.scale) : 32'd0;
+wire [31:0] ag_ea   = ag_base + ag_ix + ag_u.disp;
+wire [31:0] ag_pinc = ag_base + {{24{ag_u.upd_amt[7]}}, ag_u.upd_amt};
+wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_ea;
+wire [31:0] ag_u2v  = rf_f[ag_u.upd2_reg] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
+wire [31:0] ag_maddr = ag_ea;
+
+// operand read with the EX broadcast of this cycle (see the snoop below)
+logic        exw_v;           // EX writes the front file this cycle
+logic  [4:0] exw_reg;
+logic [31:0] exw_val;
+
+function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
+                                     input logic [31:0] imm, input logic sxw);
+	logic [31:0] v;
+	case (src)
+		OS_REG:  v = (exw_v && exw_reg == r) ? exw_val : rf_f[r];
+		OS_IMM:  v = imm;
+		default: v = 32'd0;
+	endcase
+	opnd = v;
+endfunction
+
+wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, ag_u.imm, ag_u.a_sxw);
+wire [31:0] ag_b = opnd(ag_u.b_src, ag_u.b_reg, ag_u.imm, 1'b0);
+
+// memory request to the DMU, issued as the uop leaves AG
+logic s_bit;
+assign s_bit      = sr_r[13];
+assign dm_req     = adv_ag && (ag_u.mem != M_NONE) && (ag_u.exc == 8'd0);
+assign dm_va      = ag_maddr;
+assign dm_mem     = ag_u.mem;
+assign dm_msz     = ag_u.msz;
+assign dm_lock    = ag_u.mlock;
+assign dm_super   = (ag_u.mfc == MFC_SUP) ? 1'b1 : s_bit;
+assign dm_noalloc = (ag_u.mfc == MFC_SUP);
+always_comb begin
+	case (ag_u.mfc)
+		MFC_SFC: dm_fc = sfc_r;
+		MFC_DFC: dm_fc = dfc_r;
+		MFC_SUP: dm_fc = 3'd5;
+		default: dm_fc = ag_u.mprog ? {s_bit, 2'b10} : {s_bit, 2'b01};
+	endcase
+end
+
+//--------------------------------------------------------------------------
+// EX
+//--------------------------------------------------------------------------
+// operand values entering EX: A or B may be the load data
+wire [31:0] ex_av0 = (ex_u.a_src == OS_MEM) ? ex_ld : ex_a;
+wire [31:0] ex_av  = ex_u.a_sxw ? {{16{ex_av0[15]}}, ex_av0[15:0]} : ex_av0;
+wire [31:0] ex_bv  = (ex_u.b_src == OS_MEM) ? ex_ld : ex_b;
+
+logic [31:0] alu_res;
+logic  [4:0] alu_flags;
+logic        alu_cc, alu_trap;
+
+ap68040_alu alu (
+	.op(ex_u.op), .sz(ex_u.sz), .cond(ex_u.cond),
+	.a(ex_av), .b(ex_bv), .ea(ex_ea),
+	.flags_in(ccr_f),
+	.res(alu_res), .flags_out(alu_flags),
+	.cc_true(alu_cc), .trap(alu_trap)
+);
+
+// multiply / divide
+logic        md_done, md_ovf;
+logic [31:0] md_hi, md_lo;
+logic [31:0] md_hiin;         // OP_MDHI latch (64-bit dividend high)
+logic [31:0] md_rem;          // remainder / product high, for OP_MDRES
+logic [31:0] md_lol;          // quotient / product low, for OP_MDRES
+logic        md_ovfl;         // the last divide overflowed
+logic        md_go;           // this EX uop has started the unit
+wire         ex_is_md   = (ex_u.op == OP_MUL) || (ex_u.op == OP_DIV);
+wire         ex_div0    = (ex_u.op == OP_DIV) &&
+                          ((ex_u.sz == SZ_W) ? (ex_av[15:0] == 16'd0) : (ex_av == 32'd0));
+assign ex_md_start = ex_v && ex_is_md && !md_go && !ex_div0 && !md_busy && !ex_fault;
+
+// word forms: DIVU.W/DIVS.W divide the 32-bit Dn by a 16-bit source;
+// MULU.W/MULS.W multiply the low words
+wire        md_sign = ex_u.cond[0];
+wire [31:0] md_a    = (ex_u.sz == SZ_W) ?
+                      (md_sign ? {{16{ex_av[15]}}, ex_av[15:0]} : {16'd0, ex_av[15:0]}) : ex_av;
+wire [31:0] md_blo  = (ex_u.op == OP_MUL && ex_u.sz == SZ_W) ?
+                      (md_sign ? {{16{ex_bv[15]}}, ex_bv[15:0]} : {16'd0, ex_bv[15:0]}) : ex_bv;
+wire [31:0] md_bhi  = (ex_u.op == OP_DIV) ?
+                      ((ex_u.cond[1]) ? md_hiin : (md_sign ? {32{ex_bv[31]}} : 32'd0)) : 32'd0;
+
+ap68040_muldiv md (
+	.clk(clk), .nreset(nreset), .kill(kill_now),
+	.start(ex_md_start), .is_div(ex_u.op == OP_DIV), .sign_op(md_sign),
+	.op_a(md_a), .op_hi(md_bhi), .op_lo(md_blo),
+	.busy(md_busy), .done(md_done), .res_hi(md_hi), .res_lo(md_lo), .ovf(md_ovf)
+);
+
+// EX holds while the unit runs, until the cycle its result is presented
+assign ex_hold = ex_v && ex_is_md && !ex_div0 && !ex_fault && !md_done;
+
+// multiply/divide result and flags
+logic [31:0] md_res;
+logic  [4:0] md_flags;
+logic        md_dkill;
+always_comb begin
+	md_res   = ex_bv;
+	md_flags = ccr_f;
+	md_dkill = 1'b0;
+	if (ex_u.op == OP_MUL) begin
+		if (ex_u.sz == SZ_W || !ex_u.cond[1]) begin
+			// 32-bit product (MULx.W is 16x16 -> 32)
+			md_res   = md_lo;
+			md_flags = {ccr_f[4], md_lo[31], md_lo == 32'd0,
+			            (ex_u.sz == SZ_L) &&
+			            (md_sign ? (md_hi != {32{md_lo[31]}}) : (md_hi != 32'd0)),
+			            1'b0};
+		end
+		else begin
+			// 64-bit: this uop writes Dl; OP_MDRES writes Dh
+			md_res   = md_lo;
+			md_flags = {ccr_f[4], md_hi[31], {md_hi, md_lo} == 64'd0, 1'b0, 1'b0};
+		end
+	end
+	else begin
+		// divide
+		if (ex_u.sz == SZ_W) begin
+			// quotient must fit 16 bits
+			logic ovf16;
+			ovf16 = md_ovf ||
+			        (md_sign ? (md_lo[31:15] != {17{md_lo[15]}}) : (md_lo[31:16] != 16'd0));
+			if (ovf16) begin
+				md_dkill = 1'b1;
+				md_flags = {ccr_f[4], ccr_f[3], ccr_f[2], 1'b1, 1'b0};
+			end
+			else begin
+				md_res   = {md_hi[15:0], md_lo[15:0]};
+				md_flags = {ccr_f[4], md_lo[15], md_lo[15:0] == 16'd0, 1'b0, 1'b0};
+			end
+		end
+		else begin
+			if (md_ovf) begin
+				md_dkill = 1'b1;
+				md_flags = {ccr_f[4], ccr_f[3], ccr_f[2], 1'b1, 1'b0};
+			end
+			else begin
+				md_res   = md_lo;
+				md_flags = {ccr_f[4], md_lo[31], md_lo == 32'd0, 1'b0, 1'b0};
+			end
+		end
+	end
+end
+
+// latch for CAS / bit fields
+logic [31:0] ex_latch;
+
+// CHK2/CMP2 lower-bound result kept between the two uops
+logic        chk2_lo_lt, chk2_lo_eq;
+
+//--------------------------------------------------------------------------
+// EX result selection
+//--------------------------------------------------------------------------
+logic [31:0] ex_res;
+logic  [4:0] ex_flags;
+logic        ex_dkill;        // suppress the register write
+logic        ex_taken;        // control transfer taken
+logic [31:0] ex_target;
+logic  [7:0] ex_xvec;         // exception raised in EX
+logic [31:0] ex_st;           // store data
+logic        ex_sr_we;
+logic [15:0] ex_sr_new;
+
+// special register read
+function automatic logic [31:0] spr_read(input logic [7:0] n);
+	case (n)
+		8'h00: spr_read = {29'd0, sfc_r};
+		8'h01: spr_read = {29'd0, dfc_r};
+		8'h02: spr_read = cacr_r;
+		8'h03: spr_read = tc_r;
+		8'h04: spr_read = itt0_r;
+		8'h05: spr_read = itt1_r;
+		8'h06: spr_read = dtt0_r;
+		8'h07: spr_read = dtt1_r;
+		8'h09: spr_read = vbr_r;
+		8'h0D: spr_read = mmusr_r;
+		8'h0E: spr_read = urp_r;
+		8'h0F: spr_read = srp_r;
+		8'h10: spr_read = {16'd0, sr_r[15:5], ccr_f};     // SR
+		8'h11: spr_read = {27'd0, ccr_f};                   // CCR
+		8'h20: spr_read = xi_pc;
+		8'h21: spr_read = {16'd0, xi_sr};
+		8'h22: spr_read = {16'd0, xi_vecw};
+		8'h23: spr_read = xi_addr;
+		8'h24: spr_read = {16'd0, xi_ssw};
+		8'h25: spr_read = vbr_r + {22'd0, xi_vecw[9:0]};  // vector address
+		default: spr_read = 32'd0;
+	endcase
+endfunction
+
+always_comb begin
+	ex_res    = alu_res;
+	ex_flags  = alu_flags;
+	ex_dkill  = 1'b0;
+	ex_taken  = 1'b0;
+	ex_target = ex_u.target;
+	ex_xvec   = 8'd0;
+	ex_sr_we  = 1'b0;
+	ex_sr_new = {sr_r[15:5], alu_flags};
+
+	case (ex_u.op)
+		OP_MUL, OP_DIV: begin
+			ex_res   = md_res;
+			ex_flags = md_flags;
+			ex_dkill = md_dkill;
+			if (ex_div0) ex_xvec = 8'd5;
+		end
+		OP_MDRES: begin
+			ex_res   = ex_u.cond[0] ? md_lol : md_rem;
+			ex_dkill = md_ovfl;
+		end
+		OP_MDHI:  ex_res = ex_av;
+		OP_BCC: begin
+			ex_taken = alu_cc;
+		end
+		OP_DBCC: begin
+			ex_taken = !alu_cc && (alu_res[15:0] != 16'hFFFF);
+			ex_dkill = alu_cc;
+		end
+		OP_TRAPCC: if (alu_trap) ex_xvec = 8'd7;
+		OP_CHK:    if (alu_trap) ex_xvec = 8'd6;
+		OP_CHK2A, OP_CHK2B: begin
+			// b = value, a = bound; cond[1] signed compare
+			logic lt, eq, oob;
+			logic [32:0] d;
+			logic [31:0] am2, bm2;
+			am2 = ex_av; bm2 = ex_bv;
+			case (ex_u.sz)
+				SZ_B: begin am2 = ex_u.cond[1] ? {{24{ex_av[7]}},  ex_av[7:0]}  : {24'd0, ex_av[7:0]};
+				            bm2 = ex_u.cond[1] ? {{24{ex_bv[7]}},  ex_bv[7:0]}  : {24'd0, ex_bv[7:0]}; end
+				SZ_W: begin am2 = ex_u.cond[1] ? {{16{ex_av[15]}}, ex_av[15:0]} : {16'd0, ex_av[15:0]};
+				            bm2 = ex_u.cond[1] ? {{16{ex_bv[15]}}, ex_bv[15:0]} : {16'd0, ex_bv[15:0]}; end
+				default: ;
+			endcase
+			eq = (am2 == bm2);
+			lt = ex_u.cond[1] ? ($signed(bm2) < $signed(am2)) : (bm2 < am2);
+			ex_res   = ex_bv;
+			ex_dkill = 1'b1;
+			if (ex_u.op == OP_CHK2B) begin
+				// out of bounds: value < lower or value > upper
+				oob = chk2_lo_lt || (!lt && !eq);
+				ex_flags = {ccr_f[4], ccr_f[3], chk2_lo_eq || eq, ccr_f[1], oob};
+				if (oob && ex_u.cond[0]) ex_xvec = 8'd6;
+			end
+		end
+		OP_CCRLOG: ex_res = ex_bv;
+		OP_SRLOG: begin
+			logic [15:0] cur;
+			cur = {sr_r[15:5], ccr_f};
+			case (ex_u.cond[1:0])
+				2'd0:    ex_sr_new = cur & ex_av[15:0];
+				2'd1:    ex_sr_new = cur | ex_av[15:0];
+				2'd2:    ex_sr_new = cur ^ ex_av[15:0];
+				default: ex_sr_new = ex_av[15:0];
+			endcase
+			ex_sr_new = ex_sr_new & 16'hF71F;
+			ex_sr_we  = 1'b1;
+			ex_flags  = ex_sr_new[4:0];
+		end
+		OP_SPR: begin
+			logic [31:0] v, m;
+			v = spr_read(ex_u.imm[7:0]);
+			m = (ex_u.sz == SZ_B) ? 32'h0000_00FF : (ex_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
+			ex_res = (v & m) | (ex_bv & ~m);
+		end
+		OP_SPW: ex_res = ex_av;
+		OP_LATCH: ex_res = ex_av;
+		OP_CAS: begin
+			// compare memory (B) with Dc (latch); equal: store Du (A),
+			// else: Dc = memory and the memory value is written back
+			logic [32:0] d;
+			ex_flags = alu_flags;     // the uop runs OP_CAS through CMP below
+			ex_res   = ex_bv;
+		end
+		default: ;
+	endcase
+
+	// control transfers
+	case (ex_u.br)
+		BR_IMM:  begin ex_taken = 1'b1; ex_target = ex_u.target; end
+		BR_EA:   begin ex_taken = 1'b1; ex_target = ex_ea; end
+		BR_A:    begin ex_taken = 1'b1; ex_target = ex_av; end
+		BR_B:    begin ex_taken = 1'b1; ex_target = ex_bv; end
+		default: ;
+	endcase
+end
+
+// CAS: flags of (memory - Dc) and the equal decision
+wire [31:0] cas_dc_m = ex_latch;
+logic [31:0] cas_res;
+logic  [4:0] cas_flags;
+logic        cas_cc, cas_tr;
+ap68040_alu cas_alu (
+	.op(OP_CMP), .sz(ex_u.sz), .cond(4'd0),
+	.a(cas_dc_m), .b(ex_bv), .ea(32'd0), .flags_in(ccr_f),
+	.res(cas_res), .flags_out(cas_flags), .cc_true(cas_cc), .trap(cas_tr)
+);
+wire cas_eq = cas_flags[2];
+
+// store data
+always_comb begin
+	if (ex_u.op == OP_CAS)
+		ex_st = cas_eq ? ex_av : ex_bv;
+	else
+		ex_st = ex_res;
+end
+
+// mispredict: the actual path differs from the one the front end took
+wire        ex_br      = (ex_u.br != BR_NONE);
+wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
+wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
+                                   (ex_taken && ex_u.pred && ex_target != ex_u.target));
+
+// front-file write by EX, and its broadcast to younger operands
+wire ex_d_eff = ex_u.d_v && !ex_dkill && !(ex_u.op == OP_CAS && cas_eq);
+assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && (ex_u.exc == 8'd0);
+assign exw_reg = ex_u.d_reg;
+assign exw_val = (ex_u.op == OP_CAS) ? ex_bv : ex_res;
+
+//--------------------------------------------------------------------------
+// WB
+//--------------------------------------------------------------------------
+// interrupt recognition at instruction boundaries
+logic  [2:0] ipl_q;
+logic        nmi_edge, nmi_seen;
+wire         irq_pend = (ipl_q == 3'd7) ? nmi_edge : (ipl_q > sr_r[10:8]);
+
+// trace: T1 traces every instruction (T0 change-of-flow is TODO)
+logic        trace_armed;     // T1 was set when the instruction began
+
+wire wb_is_exc   = wb_v && (wb_exc != 8'd0);
+wire wb_boundary = wb_v && wb_u.last && !wb_is_exc;
+wire wb_take_irq = wb_boundary && irq_pend && !wb_redir;   // TODO: irq after branch
+
+// WB holds: store not accepted yet
+assign wb_hold = wb_v && wb_st && !wb_is_exc && !dm_st_rdy;
+
+logic        rst_seq;         // reset exception pending (first cycles)
+
+// same-cycle kill of every younger uop: WB takes an exception or redirects
+assign kill_now = adv_wb && (wb_is_exc || wb_redir);
+
+always_ff @(posedge clk) begin
+	redir_v <= 1'b0;
+	exc_go  <= 1'b0;
+	flush   <= 1'b0;
+	ucond_v <= 1'b0;
+	dbg_retire <= 1'b0;
+
+	if (!nreset) begin
+		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		for (int i = 0; i < 32; i++) begin rf_f[i] <= 32'd0; rf_b[i] <= 32'd0; end
+		ccr_f   <= 5'd0;
+		ccr_b   <= 5'd0;
+		sr_r    <= 16'h2700;
+		vbr_r   <= 32'd0;
+		cacr_r  <= 32'd0;
+		sfc_r   <= 3'd0;
+		dfc_r   <= 3'd0;
+		tc_r    <= 32'd0;
+		itt0_r  <= 32'd0; itt1_r <= 32'd0; dtt0_r <= 32'd0; dtt1_r <= 32'd0;
+		mmusr_r <= 32'd0; urp_r  <= 32'd0; srp_r  <= 32'd0;
+		xi_pc   <= 32'd0; xi_addr <= 32'd0; xi_sr <= 16'd0; xi_vecw <= 16'd0; xi_ssw <= 16'd0;
+		md_go   <= 1'b0;
+		md_hiin <= 32'd0;
+		md_rem  <= 32'd0;
+		md_lol  <= 32'd0;
+		md_ovfl <= 1'b0;
+		ex_latch <= 32'd0;
+		chk2_lo_lt <= 1'b0; chk2_lo_eq <= 1'b0;
+		ipl_q   <= 3'd0;
+		nmi_edge <= 1'b0;
+		nmi_seen <= 1'b0;
+		halted  <= 1'b0;
+		rst_seq <= 1'b1;
+		exc_kind <= EK_RESET;
+		exc_ssp <= R_ISP;
+		redir_pc <= 32'd0;
+	end
+	else begin
+		//------------------------------------------------------------------
+		// reset exception: the routine loads ISP and PC from 0 and 4
+		//------------------------------------------------------------------
+		if (rst_seq) begin
+			rst_seq  <= 1'b0;
+			exc_go   <= 1'b1;
+			exc_kind <= EK_RESET;
+			exc_ssp  <= R_ISP;
+		end
+
+		ipl_q <= ipl;
+		if (ipl == 3'd7 && ipl_q != 3'd7) nmi_edge <= 1'b1;
+
+		//------------------------------------------------------------------
+		// AG -> DC1
+		//------------------------------------------------------------------
+		if (adv_ag) begin
+			dc1_u   <= ag_u;
+			dc1_a   <= ag_a;
+			dc1_b   <= ag_b;
+			dc1_ea  <= ag_u.ag ? ag_ea : 32'd0;
+			dc1_upd <= ag_updv;
+			dc1_upd2 <= ag_u2v;
+			if (ag_u.upd_v)  rf_f[ag_u.upd_reg]  <= ag_updv;
+			if (ag_u.upd2_v) rf_f[ag_u.upd2_reg] <= ag_u2v;
+		end
+		if (!stall_dc1) dc1_v <= adv_ag;
+		else begin
+			if (exw_v && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) dc1_a <= exw_val;
+			if (exw_v && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) dc1_b <= exw_val;
+		end
+		// snoop into the uop entering DC1
+		if (adv_ag && exw_v) begin
+			if (ag_u.a_src == OS_REG && ag_u.a_reg == exw_reg) dc1_a <= exw_val;
+			if (ag_u.b_src == OS_REG && ag_u.b_reg == exw_reg) dc1_b <= exw_val;
+		end
+
+		//------------------------------------------------------------------
+		// DC1 -> DC2
+		//------------------------------------------------------------------
+		if (adv_dc1) begin
+			dc2_u    <= dc1_u;
+			dc2_a    <= (exw_v && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) ? exw_val : dc1_a;
+			dc2_b    <= (exw_v && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) ? exw_val : dc1_b;
+			dc2_ea   <= dc1_ea;
+			dc2_upd  <= dc1_upd;
+			dc2_upd2 <= dc1_upd2;
+		end
+		else if (dc2_v && exw_v) begin
+			if (dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) dc2_a <= exw_val;
+			if (dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) dc2_b <= exw_val;
+		end
+		if (!stall_dc2) dc2_v <= adv_dc1;
+
+		//------------------------------------------------------------------
+		// DC2 -> EX
+		//------------------------------------------------------------------
+		if (adv_dc2) begin
+			ex_u     <= dc2_u;
+			ex_a     <= (exw_v && dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) ? exw_val : dc2_a;
+			ex_b     <= (exw_v && dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) ? exw_val : dc2_b;
+			ex_ea    <= dc2_ea;
+			ex_ld    <= dm_ldata;
+			ex_upd   <= dc2_upd;
+			ex_upd2  <= dc2_upd2;
+			ex_fault <= (dc2_u.mem != M_NONE) && dm_fault;
+			ex_fvec  <= dm_fvec;
+			ex_faddr <= dm_faddr;
+			ex_fssw  <= dm_fssw;
+			md_go    <= 1'b0;
+		end
+		if (!stall_ex) ex_v <= adv_dc2;
+		if (ex_md_start) md_go <= 1'b1;
+
+		//------------------------------------------------------------------
+		// EX -> WB
+		//------------------------------------------------------------------
+		if (exw_v) rf_f[exw_reg] <= exw_val;
+		if (adv_ex) begin
+			wb_u        <= ex_u;
+			wb_res      <= (ex_u.op == OP_CAS) ? ex_bv : ex_res;
+			wb_dwe      <= ex_d_eff;
+			wb_upd_val  <= ex_upd;
+			wb_upd2_val <= ex_upd2;
+			wb_st       <= (ex_u.mem == M_ST || ex_u.mem == M_RMW);
+			wb_st_data  <= ex_st;
+			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we;
+			wb_redir_pc <= ex_mispred ? ex_next : ex_u.npc;
+			wb_sr_we    <= ex_sr_we;
+			wb_sr_new   <= ex_sr_new;
+			if (ex_u.exc != 8'd0) begin
+				wb_exc      <= ex_u.exc;
+				wb_exc_addr <= ex_u.pc;
+				wb_exc_ssw  <= 16'd0;
+			end
+			else if (ex_fault) begin
+				wb_exc      <= ex_fvec;
+				wb_exc_addr <= ex_faddr;
+				wb_exc_ssw  <= ex_fssw;
+			end
+			else begin
+				wb_exc      <= ex_xvec;
+				wb_exc_addr <= ex_u.pc;
+				wb_exc_ssw  <= 16'd0;
+			end
+			// CCR after this uop
+			if (ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0) begin
+				logic [4:0] nf;
+				nf = (ex_u.op == OP_CAS) ? cas_flags : ex_flags;
+				ccr_f  <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
+				wb_ccr <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
+			end
+			else wb_ccr <= ccr_f;
+			if (ex_u.op == OP_MDHI)  md_hiin  <= ex_av;
+			if (ex_u.op == OP_LATCH) ex_latch <= ex_av;
+			if (ex_u.op == OP_CHK2A) begin
+				logic [31:0] am2, bm2;
+				am2 = ex_av; bm2 = ex_bv;
+				case (ex_u.sz)
+					SZ_B: begin am2 = ex_u.cond[1] ? {{24{ex_av[7]}},  ex_av[7:0]}  : {24'd0, ex_av[7:0]};
+					            bm2 = ex_u.cond[1] ? {{24{ex_bv[7]}},  ex_bv[7:0]}  : {24'd0, ex_bv[7:0]}; end
+					SZ_W: begin am2 = ex_u.cond[1] ? {{16{ex_av[15]}}, ex_av[15:0]} : {16'd0, ex_av[15:0]};
+					            bm2 = ex_u.cond[1] ? {{16{ex_bv[15]}}, ex_bv[15:0]} : {16'd0, ex_bv[15:0]}; end
+					default: ;
+				endcase
+				chk2_lo_eq <= (am2 == bm2);
+				chk2_lo_lt <= ex_u.cond[1] ? ($signed(bm2) < $signed(am2)) : (bm2 < am2);
+			end
+		end
+		if (md_done) begin
+			md_rem  <= md_hi;
+			md_lol  <= md_lo;
+		end
+		// overflow of the uop leaving EX (word forms check 16 bits)
+		if (adv_ex && ex_u.op == OP_DIV) md_ovfl <= md_dkill;
+		if (!stall_wb) wb_v <= adv_ex;
+
+		//------------------------------------------------------------------
+		// WB commit
+		//------------------------------------------------------------------
+		if (adv_wb) begin
+			dbg_retire <= wb_u.last;
+			if (wb_is_exc) begin
+				// exception: discard this uop's effects, restore the front
+				// file and run the exception routine
+				flush   <= 1'b1;
+				exc_go  <= 1'b1;
+				begin
+					logic [3:0]  fmt;
+					logic [15:0] vw, osr;
+					logic [31:0] spc;
+					fmt = (wb_exc == 8'd2) ? 4'h7 :
+					      (wb_exc == 8'd3 || wb_exc == 8'd5 || wb_exc == 8'd6 ||
+					       wb_exc == 8'd7) ? 4'h2 : 4'h0;
+					vw  = {fmt, 2'b00, wb_exc, 2'b00};
+					osr = {sr_r[15:5], ccr_b};
+					// TRAP #n, TRAPcc, CHK and divide-by-zero stack the next
+					// instruction; faults and illegal opcodes the instruction
+					spc = ((wb_exc >= 8'd32 && wb_exc < 8'd48) ||
+					       wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7) ?
+					      wb_u.npc : wb_u.pc;
+					xi_sr   <= osr;
+					xi_vecw <= vw;
+					xi_pc   <= spc;
+					xi_addr <= wb_exc_addr;
+					xi_ssw  <= wb_exc_ssw;
+					exc_kind <= (fmt == 4'h7) ? EK_FMT7 : (fmt == 4'h2) ? EK_FMT2 : EK_FMT0;
+					// the exception routine's operands
+					rf_b[R_T0 + 8]  <= vbr_r + {22'd0, wb_exc, 2'b00};
+					rf_b[R_T0 + 9]  <= spc;
+					rf_b[R_T0 + 10] <= {16'd0, osr};
+					rf_b[R_T0 + 11] <= wb_exc_addr;
+					rf_b[R_T0 + 12] <= {16'd0, vw};
+					rf_b[R_T0 + 13] <= {16'd0, wb_exc_ssw};
+				end
+				exc_ssp <= sr_r[12] ? R_MSP : R_ISP;
+				sr_r[15:14] <= 2'b00;
+				sr_r[13]    <= 1'b1;
+				for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
+				rf_f[R_T0 + 8]  <= vbr_r + {22'd0, wb_exc, 2'b00};
+				rf_f[R_T0 + 9]  <= ((wb_exc >= 8'd32 && wb_exc < 8'd48) ||
+				                    wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7) ?
+				                   wb_u.npc : wb_u.pc;
+				rf_f[R_T0 + 10] <= {16'd0, sr_r[15:5], ccr_b};
+				rf_f[R_T0 + 11] <= wb_exc_addr;
+				rf_f[R_T0 + 12] <= {16'd0, ((wb_exc == 8'd2) ? 4'h7 :
+				                    (wb_exc == 8'd3 || wb_exc == 8'd5 || wb_exc == 8'd6 ||
+				                     wb_exc == 8'd7) ? 4'h2 : 4'h0), 2'b00, wb_exc, 2'b00};
+				rf_f[R_T0 + 13] <= {16'd0, wb_exc_ssw};
+				ccr_f <= ccr_b;
+			end
+			else begin
+				// architectural commit
+				if (wb_u.upd2_v)   rf_b[wb_u.upd2_reg] <= wb_upd2_val;
+				if (wb_u.upd_v)    rf_b[wb_u.upd_reg] <= wb_upd_val;
+				if (wb_dwe)        rf_b[wb_u.d_reg]   <= wb_res;
+				ccr_b <= wb_ccr;
+				if (wb_u.op == OP_SPW) begin
+					case (wb_u.imm[7:0])
+						8'h00: sfc_r  <= wb_res[2:0];
+						8'h01: dfc_r  <= wb_res[2:0];
+						8'h02: cacr_r <= wb_res & 32'h8000_8000;
+						8'h03: tc_r   <= wb_res & 32'h0000_C000;
+						8'h04: itt0_r <= wb_res & 32'hFFFF_E364;
+						8'h05: itt1_r <= wb_res & 32'hFFFF_E364;
+						8'h06: dtt0_r <= wb_res & 32'hFFFF_E364;
+						8'h07: dtt1_r <= wb_res & 32'hFFFF_E364;
+						8'h09: vbr_r  <= wb_res;
+						8'h0D: mmusr_r <= wb_res & 32'hFFFF_F0FF;
+						8'h0E: urp_r  <= wb_res & 32'hFFFF_FE00;
+						8'h0F: srp_r  <= wb_res & 32'hFFFF_FE00;
+						default: ;
+					endcase
+				end
+				if (wb_sr_we) begin
+					sr_r  <= {wb_sr_new[15:5], 5'd0};
+					ccr_b <= wb_sr_new[4:0];
+				end
+				if (wb_take_irq) begin
+					// TODO: interrupt routine (IACK, format $0/$1)
+				end
+				if (wb_redir) begin
+					flush    <= 1'b1;
+					redir_v  <= 1'b1;
+					redir_pc <= wb_redir_pc;
+					for (int i = 0; i < 32; i++) rf_f[i] <= rf_b[i];
+					// this uop's own writes go to both files
+					if (wb_u.upd2_v) rf_f[wb_u.upd2_reg] <= wb_upd2_val;
+					if (wb_u.upd_v)  rf_f[wb_u.upd_reg] <= wb_upd_val;
+					if (wb_dwe)      rf_f[wb_u.d_reg]   <= wb_res;
+					ccr_f <= wb_sr_we ? wb_sr_new[4:0] : wb_ccr;
+				end
+			end
+		end
+
+		//------------------------------------------------------------------
+		// flush: kill every stage (the redirecting/excepting uop has left)
+		//------------------------------------------------------------------
+		if (flush) begin
+			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		end
+		else begin
+			// D2 -> AG
+			if (!stall_ag) ag_v <= in_v;
+			if (!stall_ag && in_v) ag_u <= in_u;
+		end
+		if (kill_now) begin
+			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		end
+	end
+end
+
+assign dm_st_v    = wb_v && wb_st && !wb_is_exc;
+assign dm_st_data = wb_st_data;
+assign dbg_pc     = wb_u.pc;
+assign ucond      = 1'b0;
+
+endmodule

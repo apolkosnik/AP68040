@@ -1,0 +1,573 @@
+//--------------------------------------------------------------------------//
+// AP68040-60 - pipelined MC68040                                            //
+//                                                                          //
+// ap68040_useq.sv - D2: micro-sequencer                                     //
+//                                                                          //
+// Turns a decoded instruction into uops by walking its microcode routine   //
+// (rtl/gen/ap68040_ucode_rom.svh), one uop per cycle:                       //
+//   * symbolic operands (EA0, DX, IMM, ...) become registers, immediates   //
+//     or the uop's own memory access; A7 maps to USP/ISP/MSP by S and M    //
+//   * an EA with memory indirection gets a pointer load (into T13 for EA0, //
+//     T12 for EA1) before the uop that uses it                             //
+//   * a source (An)+/-(An) update marked noupd is deferred into the uop    //
+//     flagged upd2 (merged when both EAs use the same register), so an     //
+//     instruction that faults on its second access restarts cleanly        //
+//   * the back end's exception entry starts an exception routine           //
+//--------------------------------------------------------------------------//
+
+module ap68040_useq
+	import ap68040_pkg::*;
+	import ap68040_upkg::*;
+(
+	input  logic        clk,
+	input  logic        nreset,
+	input  logic        flush,
+
+	input  logic        rec_v,
+	input  dinst_t      rec,
+	output logic        rec_take,
+
+	input  logic        smode,
+	input  logic        master,     // M bit
+
+	input  logic        exc_go,
+	input  logic  [3:0] exc_kind,
+	input  logic  [4:0] exc_ssp,
+
+	output logic        uo_v,
+	output uop_t        uo,
+	input  logic        uo_rdy      // the back end takes uo this cycle
+);
+
+
+`include "gen/ap68040_ucode_rom.svh"
+
+//--------------------------------------------------------------------------
+// state
+//--------------------------------------------------------------------------
+dinst_t      cur;
+logic        cur_v;
+logic  [8:0] upc;
+logic        first;
+logic        ind0, ind1;        // pointer of EA0 / EA1 already loaded
+logic        def_v;             // a deferred source update is pending
+logic  [4:0] def_reg;
+logic  [7:0] def_amt;
+logic  [4:0] ssp;
+
+wire         can_emit = !uo_v || uo_rdy;
+
+// the record being worked on: the current one, or the next from D1
+wire         src_v   = cur_v || rec_v;
+dinst_t      src;
+logic  [8:0] src_upc;
+logic        src_first;
+always_comb begin
+	src       = cur_v ? cur : rec;
+	src_upc   = cur_v ? upc : rec.rt;
+	src_first = cur_v ? first : 1'b1;
+end
+
+uword_t      uw;
+always_comb uw = ucode_rom(src_upc);
+
+//--------------------------------------------------------------------------
+// register naming
+//--------------------------------------------------------------------------
+wire [4:0] sp_reg = !smode ? R_USP : (master ? R_MSP : R_ISP);
+
+function automatic logic [4:0] areg(input logic [2:0] n, input logic [4:0] spr);
+	areg = (n == 3'd7) ? spr : (R_A0 + {2'b00, n});
+endfunction
+
+function automatic logic [4:0] dreg(input logic [2:0] n);
+	dreg = {2'b00, n};
+endfunction
+
+function automatic logic is_mem(input logic [3:0] m);
+	is_mem = (m >= EM_AI) && (m != EM_IMM) && (m != EM_NONE);
+endfunction
+
+function automatic logic is_reg(input logic [3:0] m);
+	is_reg = (m == EM_DN) || (m == EM_AN);
+endfunction
+
+function automatic logic [2:0] size_bytes(input logic [1:0] s, input logic is_sp);
+	case (s)
+		SZ_B:    size_bytes = is_sp ? 3'd2 : 3'd1;
+		SZ_W:    size_bytes = 3'd2;
+		default: size_bytes = 3'd4;
+	endcase
+endfunction
+
+//--------------------------------------------------------------------------
+// one uop from (uw, src)
+//--------------------------------------------------------------------------
+typedef struct packed {
+	logic        v;          // operand present
+	logic  [1:0] src;
+	logic  [4:0] r;
+	logic        imm_v;
+	logic [31:0] imm;
+	logic        mem;        // the operand is this uop's memory EA
+	logic        ea1;        // ... and it is EA1
+} opsel_t;
+
+uop_t        nu;
+logic        n_ptr;          // nu is a pointer load (memory indirect)
+logic        n_ptr_ea1;
+logic        n_jump;         // pure jump micro-instruction
+logic  [8:0] n_jt;
+logic        n_def_set;      // nu defers its source update
+logic  [4:0] n_def_reg;
+logic  [7:0] n_def_amt;
+
+always_comb begin
+	opsel_t oa, ob, od;
+	ea_t    me;              // the uop's memory EA
+	logic   me_v, me_ea1;
+	logic [1:0] osz, msz;
+	logic [2:0] amt;
+	logic       me_sp;
+	logic [31:0] q, shc;
+	logic [6:0] op;
+	logic [3:0] cnd;
+	logic       jc_true;
+	logic [31:0] dval;
+	logic [31:0] pcx;
+
+	nu        = '0;
+	n_ptr     = 1'b0;
+	n_ptr_ea1 = 1'b0;
+	n_jump    = 1'b0;
+	n_jt      = uw.jt;
+	n_def_set = 1'b0;
+	n_def_reg = '0;
+	n_def_amt = '0;
+
+	osz = (uw.sz  == 2'd0) ? src.sz : (uw.sz  - 2'd1);
+	msz = (uw.msz == 2'd0) ? osz    : (uw.msz - 2'd1);
+	q   = (src.opw[11:9] == 3'd0) ? 32'd8 : {29'd0, src.opw[11:9]};
+
+	// pure jump words (a routine's first jump is resolved in D1)
+	case (uw.jc)
+		JC_NEVER:    jc_true = 1'b0;
+		JC_ALWAYS:   jc_true = 1'b1;
+		JC_EXT10:    jc_true = src.ext1[10];
+		JC_EXT11:    jc_true = src.ext1[11];
+		JC_EA0_MEM:  jc_true = is_mem(src.ea0.m);
+		JC_EA0_DN:   jc_true = (src.ea0.m == EM_DN);
+		JC_EA0_IMM:  jc_true = (src.ea0.m == EM_IMM);
+		JC_SZ_L:     jc_true = (src.sz == SZ_L);
+		JC_AY7:      jc_true = (src.opw[2:0] == 3'd7);
+		JC_SUPER:    jc_true = smode;
+		default:     jc_true = 1'b0;
+	endcase
+	// a micro-instruction with a jump condition is a pure jump
+	n_jump = (uw.jc != JC_NEVER);
+
+	//----------------------------------------------------------------------
+	// operand selectors
+	//----------------------------------------------------------------------
+	for (int k = 0; k < 3; k++) begin
+		logic [5:0] s;
+		opsel_t o;
+		s = (k == 0) ? uw.a : (k == 1) ? uw.b : uw.d;
+		o = '0;
+		o.v = (s != S_NONE);
+		o.src = OS_REG;
+		if (s >= 6'd32) o.r = s[4:0];
+		else case (s)
+			S_EA0, S_EA0R, S_EA1, S_EA1R: begin
+				ea_t e;
+				e = (s == S_EA0 || s == S_EA0R) ? src.ea0 : src.ea1;
+				if (e.m == EM_DN) o.r = dreg(e.r);
+				else if (e.m == EM_AN) o.r = areg(e.r, sp_reg);
+				else if (e.m == EM_IMM) begin
+					o.src = OS_IMM; o.imm_v = 1'b1; o.imm = e.bd;
+				end
+				else if (s == S_EA0R || s == S_EA1R) o.v = 1'b0;
+				else begin
+					o.src = OS_MEM; o.mem = 1'b1; o.ea1 = (s == S_EA1);
+				end
+			end
+			S_DX:    o.r = dreg(src.opw[11:9]);
+			S_DY:    o.r = dreg(src.opw[2:0]);
+			S_AX:    o.r = areg(src.opw[11:9], sp_reg);
+			S_AY:    o.r = areg(src.opw[2:0], sp_reg);
+			S_SP:    o.r = sp_reg;
+			S_SSP:   o.r = ssp;
+			S_X1R:   o.r = src.ext1[15] ? areg(src.ext1[14:12], sp_reg) : dreg(src.ext1[14:12]);
+			S_X1DL:  o.r = dreg(src.ext1[14:12]);
+			S_X1DH:  o.r = dreg(src.ext1[2:0]);
+			S_X1DU:  o.r = dreg(src.ext1[8:6]);
+			S_X2DC:  o.r = dreg(src.ext2[2:0]);
+			S_X2DU:  o.r = dreg(src.ext2[8:6]);
+			S_X2R:   o.r = src.ext2[15] ? areg(src.ext2[14:12], sp_reg) : dreg(src.ext2[14:12]);
+			S_IMM:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.imm; end
+			S_QUICK: begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = q; end
+			S_MOVEQ: begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {{24{src.opw[7]}}, src.opw[7:0]}; end
+			S_SHCNT: begin
+				if (src.opw[5]) o.r = dreg(src.opw[11:9]);
+				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = q; end
+			end
+			S_NPC:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.npc; end
+			S_PC:    begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.pc; end
+			S_CONST: begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {{16{uw.cval[15]}}, uw.cval}; end
+			S_ZERO:  o.src = OS_ZERO;
+			S_LD:    o.src = OS_MEM;
+			S_CREG:  begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {28'd0, src.ext1[11], src.ext1[2:0]}; end
+			S_CREGR: o.r = (src.ext1[2:0] == 3'd0) ? R_USP : (src.ext1[2:0] == 3'd3) ? R_MSP : R_ISP;
+			default: o.v = 1'b0;
+		endcase
+		if (k == 0) oa = o; else if (k == 1) ob = o; else od = o;
+	end
+
+	//----------------------------------------------------------------------
+	// operation fields
+	//----------------------------------------------------------------------
+	op  = uw.op_inst ? src.eop : uw.op;
+	case (uw.cond_inst)
+		2'd1:    cnd = src.opw[11:8];
+		2'd2:    cnd = src.econd;
+		2'd3:    cnd = {2'b00, src.ext1[10], src.ext1[11]};
+		default: cnd = uw.cond;
+	endcase
+	nu.op     = op;
+	nu.sz     = osz;
+	nu.msz    = msz;
+	nu.cond   = cnd;
+	nu.ccr_we = uw.ccr_inst ? src.ccr : uw.ccr;
+	nu.a_src  = oa.v ? oa.src : OS_ZERO;
+	nu.a_reg  = oa.r;
+	nu.a_sxw  = (uw.sxw == 2'd1) || (uw.sxw == 2'd2 && src.sz == SZ_W);
+	nu.b_src  = ob.v ? ob.src : OS_ZERO;
+	nu.b_reg  = ob.r;
+	nu.imm    = oa.imm_v ? oa.imm : ob.imm_v ? ob.imm : {{16{uw.cval[15]}}, uw.cval};
+	nu.mfc    = uw.mfc;
+	nu.mlock  = uw.lock;
+	nu.br     = uw.br;
+	nu.target = src.target;
+	nu.pred   = src.pred && (uw.br == BR_COND || uw.br == BR_IMM);
+	nu.ser    = uw.ser;
+	nu.pc     = src.pc;
+	nu.npc    = src.npc;
+	nu.first  = src_first;
+	nu.last   = uw.last;
+	nu.exc    = (src.exc != 8'd0) ? src.exc : 8'd0;
+
+	// destination
+	if (od.v && od.src == OS_REG) begin
+		nu.d_v   = 1'b1;
+		nu.d_reg = od.r;
+	end
+
+	//----------------------------------------------------------------------
+	// memory access and address generation
+	//----------------------------------------------------------------------
+	me_v   = oa.mem || ob.mem || od.mem;
+	me_ea1 = oa.mem ? oa.ea1 : ob.mem ? ob.ea1 : od.ea1;
+	me     = me_ea1 ? src.ea1 : src.ea0;
+	if (uw.ag == AGM_EA0 || uw.ag == AGM_LEA0) begin me = src.ea0; me_ea1 = 1'b0; end
+	if (uw.ag == AGM_EA1) begin me = src.ea1; me_ea1 = 1'b1; end
+	me_sp  = (me.r == 3'd7);
+	amt    = size_bytes(msz, me_sp && (me.m == EM_AIP || me.m == EM_APD));
+
+	if (uw.mem != 2'd0)
+		nu.mem = uw.mem;
+	else if (me_v) begin
+		if ((ob.mem || oa.mem) && od.mem) nu.mem = M_RMW;
+		else if (od.mem)                  nu.mem = M_ST;
+		else                              nu.mem = M_LD;
+	end
+
+	pcx = src.pc + {28'd0, me.xoff, 1'b0};
+
+	if (me_v || uw.ag == AGM_EA0 || uw.ag == AGM_EA1 || uw.ag == AGM_LEA0) begin
+		logic [4:0] bre;
+		logic       mi_stage1;
+		nu.ag = 1'b1;
+		bre   = areg(me.r, sp_reg);
+		mi_stage1 = (me.mi != 2'd0) && !(me_ea1 ? ind1 : ind0);
+		case (me.m)
+			EM_AI: begin nu.base_v = 1'b1; nu.base = bre; end
+			EM_AIP: begin
+				nu.base_v = 1'b1; nu.base = bre;
+				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = bre;
+				nu.upd_amt = {5'd0, amt};
+			end
+			EM_APD: begin
+				nu.base_v = 1'b1; nu.base = bre;
+				nu.disp = -{29'd0, amt};
+				nu.upd_v = 1'b1; nu.upd_reg = bre;
+			end
+			EM_AD16: begin nu.base_v = 1'b1; nu.base = bre; nu.disp = me.bd; end
+			EM_ABSW, EM_ABSL: nu.disp = me.bd;
+			EM_PC16: begin nu.disp = pcx + me.bd; nu.mprog = 1'b1; end
+			EM_AX, EM_PCX: begin
+				logic [4:0] xr;
+				xr = me.xa ? areg(me.xr, sp_reg) : dreg(me.xr);
+				if (me.mi == 2'd0 || mi_stage1) begin
+					// address (or the pointer address) from base/index/bd
+					if (me.m == EM_AX) begin nu.base_v = !me.bs; nu.base = bre; nu.disp = me.bd; end
+					else begin nu.disp = (me.bs ? 32'd0 : pcx) + me.bd; nu.mprog = !me.bs; end
+					nu.idx_v = !me.is && (me.mi != 2'd2);
+					nu.idx   = xr;
+					nu.idx_l = me.xl;
+					nu.scale = me.sc;
+				end
+				else begin
+					// through the pointer: T13 (EA0) / T12 (EA1) + index + od
+					nu.base_v = 1'b1;
+					nu.base   = me_ea1 ? (R_T0 + 5'd12) : (R_T0 + 5'd13);
+					nu.disp   = me.od;
+					nu.idx_v  = !me.is && (me.mi == 2'd2);
+					nu.idx    = xr;
+					nu.idx_l  = me.xl;
+					nu.scale  = me.sc;
+					nu.mprog  = 1'b0;
+				end
+				if (mi_stage1) begin
+					// this cycle: the pointer load only
+					n_ptr     = 1'b1;
+					n_ptr_ea1 = me_ea1;
+				end
+			end
+			default: ;
+		endcase
+
+		// deferral of the source update into a later uop
+		if (uw.noupd && !me_ea1 && (me.m == EM_AIP || me.m == EM_APD)) begin
+			logic xuse;
+			// an EA1 index naming the same register cannot see a deferred
+			// value: update in place then
+			xuse = (src.ea1.m == EM_AX || src.ea1.m == EM_PCX) && !src.ea1.is &&
+			       src.ea1.xa && (areg(src.ea1.xr, sp_reg) == bre);
+			if (!xuse) begin
+				nu.upd_v  = 1'b0;
+				nu.pinc   = 1'b0;
+				n_def_set = 1'b1;
+				n_def_reg = bre;
+				n_def_amt = (me.m == EM_AIP) ? {5'd0, amt} : -{5'd0, amt};
+			end
+		end
+		if (uw.upd2 && def_v) begin
+			logic same;
+			same = nu.base_v && nu.base == def_reg && (me.mi == 2'd0 || mi_stage1);
+			if (same) begin
+				nu.disp = nu.disp + {{24{def_amt[7]}}, def_amt};
+				if (me.m == EM_AIP) nu.upd_amt = nu.upd_amt + def_amt;
+			end
+			if (!(same && (me.m == EM_AIP || me.m == EM_APD))) begin
+				nu.upd2_v   = 1'b1;
+				nu.upd2_reg = def_reg;
+				nu.upd2_amt = def_amt;
+			end
+		end
+	end
+
+	//----------------------------------------------------------------------
+	// explicit AG modes
+	//----------------------------------------------------------------------
+	begin
+		logic [4:0]  rb, rw;
+		logic        rb_v;
+		logic [31:0] dsv;
+		rb_v = (uw.agb != S_NONE) && (uw.agb != S_ZERO);
+		case (uw.agb)
+			S_AX:  rb = areg(src.opw[11:9], sp_reg);
+			S_AY:  rb = areg(src.opw[2:0], sp_reg);
+			S_SP:  rb = sp_reg;
+			S_SSP: rb = ssp;
+			default: rb = uw.agb[4:0];
+		endcase
+		case (uw.agw)
+			S_AX:  rw = areg(src.opw[11:9], sp_reg);
+			S_AY:  rw = areg(src.opw[2:0], sp_reg);
+			S_SP:  rw = sp_reg;
+			S_SSP: rw = ssp;
+			default: rw = uw.agw[4:0];
+		endcase
+		case (uw.dsel)
+			DS_IMM:    dsv = src.imm;
+			DS_NIMM:   dsv = -((src.sz == SZ_W) ? {{16{src.ea0.bd[15]}}, src.ea0.bd[15:0]} : src.ea0.bd);
+			DS_QUICK:  dsv = q;
+			DS_NQUICK: dsv = -q;
+			DS_IMMC:   dsv = src.imm + {{16{uw.cval[15]}}, uw.cval};
+			default:   dsv = {{16{uw.cval[15]}}, uw.cval};
+		endcase
+		case (uw.ag)
+			AGM_PUSH: begin
+				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = sp_reg;
+				nu.disp = -{29'd0, size_bytes(msz, 1'b1)};
+				nu.upd_v = 1'b1; nu.upd_reg = sp_reg;
+			end
+			AGM_POP: begin
+				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = sp_reg;
+				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = sp_reg;
+				nu.upd_amt = {5'd0, size_bytes(msz, 1'b1)};
+			end
+			AGM_POPR: begin
+				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = rb;
+				nu.pinc = 1'b1; nu.upd_v = 1'b1; nu.upd_reg = rw;
+				nu.upd_amt = {5'd0, size_bytes(msz, 1'b0)};
+			end
+			AGM_BASED, AGM_BASEDU: begin
+				nu.ag = 1'b1; nu.base_v = rb_v; nu.base = rb; nu.disp = dsv;
+				if (uw.ag == AGM_BASEDU) begin
+					nu.upd_v = 1'b1;
+					nu.upd_reg = (uw.agw != S_NONE) ? rw : rb;
+				end
+				else if (uw.agw != S_NONE) begin
+					nu.upd_v = 1'b1; nu.upd_reg = rw;
+				end
+			end
+			AGM_ADDC: begin
+				nu.ag = 1'b1; nu.base_v = rb_v; nu.base = rb; nu.disp = dsv;
+				nu.upd_v = 1'b1; nu.upd_reg = rw;
+			end
+			AGM_VAL0, AGM_ADDV: begin
+				nu.ag = 1'b1;
+				nu.base_v = (uw.ag == AGM_ADDV); nu.base = rb;
+				if (src.ea0.m == EM_IMM)
+					nu.disp = (src.sz == SZ_W) ? {{16{src.ea0.bd[15]}}, src.ea0.bd[15:0]} : src.ea0.bd;
+				else begin
+					nu.idx_v = 1'b1;
+					nu.idx   = (src.ea0.m == EM_AN) ? areg(src.ea0.r, sp_reg) : dreg(src.ea0.r);
+					nu.idx_l = (src.sz == SZ_L);
+				end
+				nu.upd_v = 1'b1; nu.upd_reg = rw;
+			end
+			AGM_LEA0: begin
+				if (uw.agw != S_NONE) begin nu.upd_v = !n_ptr; nu.upd_reg = rw; end
+				nu.mem = M_NONE;
+			end
+			default: ;
+		endcase
+	end
+
+	// a pointer load replaces the uop this cycle
+	if (n_ptr) begin
+		uop_t p;
+		p = '0;
+		p.pc = nu.pc; p.npc = nu.npc; p.first = nu.first; p.last = 1'b0;
+		p.op = OP_MOV; p.sz = SZ_L; p.msz = SZ_L; p.ccr_we = 5'd0;
+		p.a_src = OS_MEM; p.b_src = OS_ZERO;
+		p.ag = 1'b1;
+		p.base_v = nu.base_v; p.base = nu.base;
+		p.idx_v = nu.idx_v; p.idx = nu.idx; p.idx_l = nu.idx_l; p.scale = nu.scale;
+		p.disp = nu.disp;
+		p.mem = M_LD; p.mprog = nu.mprog;
+		p.d_v = 1'b1;
+		p.d_reg = n_ptr_ea1 ? (R_T0 + 5'd12) : (R_T0 + 5'd13);
+		p.exc = nu.exc;
+		nu = p;
+		n_def_set = 1'b0;
+	end
+end
+
+//--------------------------------------------------------------------------
+// sequencing
+//--------------------------------------------------------------------------
+wire step = src_v && can_emit && !flush && !exc_go;
+
+assign rec_take = step && !cur_v;
+
+always_ff @(posedge clk) begin
+	if (!nreset) begin
+		cur_v <= 1'b0;
+		cur   <= '0;
+		upc   <= '0;
+		first <= 1'b1;
+		ind0  <= 1'b0;
+		ind1  <= 1'b0;
+		def_v <= 1'b0;
+		def_reg <= '0;
+		def_amt <= '0;
+		ssp   <= R_ISP;
+		uo_v  <= 1'b0;
+		uo    <= '0;
+	end
+	else begin
+		if (uo_rdy) uo_v <= 1'b0;
+
+		if (step) begin
+			if (!cur_v) begin
+				cur   <= rec;
+				ind0  <= 1'b0;
+				ind1  <= 1'b0;
+				def_v <= 1'b0;
+			end
+			cur_v <= 1'b1;
+			if (n_jump) begin
+				upc <= jc_now ? uw.jt : src_upc + 9'd1;
+			end
+			else begin
+				uo_v  <= 1'b1;
+				uo    <= nu;
+				first <= 1'b0;
+				if (n_ptr) begin
+					upc <= src_upc;
+					if (n_ptr_ea1) ind1 <= 1'b1; else ind0 <= 1'b1;
+				end
+				else begin
+					if (n_def_set) begin
+						def_v   <= 1'b1;
+						def_reg <= n_def_reg;
+						def_amt <= n_def_amt;
+					end
+					if (uw.last) begin
+						cur_v <= 1'b0;
+						first <= 1'b1;
+					end
+					else upc <= src_upc + 9'd1;
+				end
+			end
+		end
+
+		if (flush) begin
+			cur_v <= 1'b0;
+			first <= 1'b1;
+			uo_v  <= 1'b0;
+		end
+		if (exc_go) begin
+			// exception routine: a pseudo instruction with no fields
+			cur   <= '0;
+			cur_v <= 1'b1;
+			first <= 1'b1;
+			ind0  <= 1'b0;
+			ind1  <= 1'b0;
+			def_v <= 1'b0;
+			ssp   <= exc_ssp;
+			uo_v  <= 1'b0;
+			case (exc_kind)
+				4'd1:    upc <= UA_EXC_FMT2;
+				4'd2:    upc <= UA_EXC_FMT7;
+				4'd3:    upc <= UA_EXC_IRQ;
+				4'd4:    upc <= UA_EXC_RESET;
+				default: upc <= UA_EXC_FMT0;
+			endcase
+		end
+	end
+end
+
+// jump condition of the current word (named for the sequencing block)
+logic jc_now;
+always_comb begin
+	case (uw.jc)
+		JC_ALWAYS:   jc_now = 1'b1;
+		JC_EXT10:    jc_now = src.ext1[10];
+		JC_EXT11:    jc_now = src.ext1[11];
+		JC_EA0_MEM:  jc_now = is_mem(src.ea0.m);
+		JC_EA0_DN:   jc_now = (src.ea0.m == EM_DN);
+		JC_EA0_IMM:  jc_now = (src.ea0.m == EM_IMM);
+		JC_SZ_L:     jc_now = (src.sz == SZ_L);
+		JC_AY7:      jc_now = (src.opw[2:0] == 3'd7);
+		JC_SUPER:    jc_now = smode;
+		JC_CREG_RF:  jc_now = (src.ext1[11:0] == 12'h800) || (src.ext1[11:0] == 12'h803) ||
+		                      (src.ext1[11:0] == 12'h804);
+		default:     jc_now = 1'b0;
+	endcase
+end
+
+endmodule
