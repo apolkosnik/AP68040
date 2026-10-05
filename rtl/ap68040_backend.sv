@@ -906,9 +906,12 @@ wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
 // the instruction, except JMP (opcode + 2; + 6 for the indexed modes), JSR
 // (the odd target: the fault is the fetch there) and the handler fetch of
 // an exception (the vector offset, without VBR).
-wire [31:0] ex_otgt = ex_taken ? ex_target : ex_u.target;
-wire        ex_odd  = ex_br && ex_otgt[0] &&
-                      (ex_taken || ex_u.op == OP_BCC || ex_u.op == OP_DBCC);
+// (Bcc/DBcc: the decoded target, so the check does not wait for the ALU
+// result that decides taken -- that path ends in the register file write
+// enable.  Every other change of flow is unconditional or an FPU one.)
+wire        ex_bdb  = (ex_u.op == OP_BCC) || (ex_u.op == OP_DBCC);
+wire [31:0] ex_otgt = (ex_bdb || !ex_taken) ? ex_u.target : ex_target;
+wire        ex_odd  = ex_br && (ex_bdb ? ex_u.target[0] : (ex_taken && ex_target[0]));
 logic [31:0] ex_odd_pc;
 always_comb begin
 	ex_odd_pc = ex_u.pc;
