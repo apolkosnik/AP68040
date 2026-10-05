@@ -33,7 +33,7 @@ localparam logic [31:0] CAPV  = 32'h4210_0000;   // VBR: the vector table
 localparam logic [31:0] MONB  = 32'h4211_0000;   // monitor image base
 localparam int          MONN  = 32'h0003_0000;   // monitor, mailbox, stack
 localparam logic [31:0] CAPT  = 32'h4211_1000;   // capture routine
-localparam logic [31:0] IDLE  = 32'h4211_1052;   // monitor reset entry
+localparam logic [31:0] IDLE  = 32'h4211_1800;   // monitor reset entry
 localparam logic [31:0] MBOX  = 32'h4212_0000;
 localparam logic [31:0] MSTK  = 32'h4213_0000;
 localparam logic [31:0] RND2  = 32'h524E_4432;
@@ -257,10 +257,13 @@ endtask
 task automatic mismatch(input string what, input logic [31:0] exp, input logic [31:0] got);
 	mism++;
 	if (mism <= report_lim)
-		$display("MISMATCH j%0d t%0d r%0d %s: expected %08x got %08x (op=%02x%02x%02x%02x%02x%02x)",
+		$display("MISMATCH j%0d t%0d r%0d %s: expected %08x got %08x (op=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x sr=%04x)",
 		         jr, test_idx, round_idx, what, exp, got,
 		         rd8(i_pc), rd8(i_pc + 1), rd8(i_pc + 2), rd8(i_pc + 3),
-		         rd8(i_pc + 4), rd8(i_pc + 5));
+		         rd8(i_pc + 4), rd8(i_pc + 5), rd8(i_pc + 6), rd8(i_pc + 7),
+		         rd8(i_pc + 8), rd8(i_pc + 9), rd8(i_pc + 10), rd8(i_pc + 11),
+		         rd8(i_pc + 12), rd8(i_pc + 13), rd8(i_pc + 14), rd8(i_pc + 15),
+		         i_sr[15:0]);
 endtask
 
 //--------------------------------------------------------------------------

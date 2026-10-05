@@ -295,7 +295,7 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 	opnd = v;
 endfunction
 
-wire [31:0] ag_a = opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
+wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
 wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
 
 // memory request to the DMU, issued as the uop leaves AG

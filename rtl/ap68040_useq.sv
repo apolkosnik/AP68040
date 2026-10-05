@@ -388,17 +388,28 @@ always_comb begin
 	// after the source EA's update (the 68000 family computes the EA first)
 	nu.b_upd = nu.upd_v && !me_ea1 && (me.m == EM_AIP || me.m == EM_APD) &&
 	           nu.b_src == OS_REG && nu.b_reg == nu.upd_reg;
+	// MOVES Rn,<ea> computes the EA first: MOVES.L A6,-(A6) stores the
+	// decremented A6 (WinUAE, the cputest oracle); MOVE reads the source first
+	nu.a_upd = nu.upd_v && (me.m == EM_AIP || me.m == EM_APD) &&
+	           src.opw[15:8] == 8'h0E && nu.a_src == OS_REG && nu.a_reg == nu.upd_reg;
 	// the deferred update lands on the upd2 uop, memory or not (FRESTORE
 	// commits (An)+ only after its frame check)
 	if (uw.upd2 && def_v) begin
-		logic same;
+		logic same, m16;
 		same = nu.ag && nu.base_v && nu.base == def_reg &&
 		       (me.mi == 2'd0 || !(me_ea1 ? ind1 : ind0));
-		if (same) begin
+		// MOVE16 (Ax)+,(Ay)+ with Ax = Ay: both transfers use the original
+		// address and the register advances once (WinUAE, the cputest
+		// oracle); CMPM-style pairs see the first update
+		m16 = (src.opw[15:3] == 13'h1EC4);
+		if (same && m16) begin
+			// the destination's own (An)+ is the only update
+		end
+		else if (same) begin
 			nu.disp = nu.disp + {{24{def_amt[7]}}, def_amt};
 			if (me.m == EM_AIP) nu.upd_amt = nu.upd_amt + def_amt;
 		end
-		if (!(same && (me.m == EM_AIP || me.m == EM_APD))) begin
+		if (!(same && (me.m == EM_AIP || me.m == EM_APD || m16))) begin
 			nu.upd2_v   = 1'b1;
 			nu.upd2_reg = def_reg;
 			nu.upd2_amt = def_amt;

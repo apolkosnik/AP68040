@@ -24,6 +24,7 @@ CAP_D	equ	MBOX+$104	; D0-D7/A0-A6 at the handler entry
 CAP_USP	equ	MBOX+$140
 CAP_SP	equ	MBOX+$144	; the active stack pointer: the frame
 CAP_MSP	equ	MBOX+$148
+CAP_CR	equ	MBOX+$14C	; CACR TC ITT0 ITT1 DTT0 DTT1 of the test
 CMD	equ	MBOX+$200	; word: bench -> monitor, 1 resume, 2 stop
 MSTACK	equ	$42130000
 
@@ -41,6 +42,31 @@ n	set	n+1
 ; $42111000
 capture:
 	movem.l	d0-d7/a0-a6,(CAP_D).l
+	; a tested MOVEC may have enabled the caches (or the MMU): save the
+	; test's control registers, push the saved state out and run the rest
+	; uncached and untranslated, so the mailbox traffic reaches the bus in
+	; both directions.  A resume puts the control registers back.
+	movec	cacr,d0
+	move.l	d0,(CAP_CR).l
+	movec	tc,d0
+	move.l	d0,(CAP_CR+4).l
+	movec	itt0,d0
+	move.l	d0,(CAP_CR+8).l
+	movec	itt1,d0
+	move.l	d0,(CAP_CR+12).l
+	movec	dtt0,d0
+	move.l	d0,(CAP_CR+16).l
+	movec	dtt1,d0
+	move.l	d0,(CAP_CR+20).l
+	cpusha	bc
+	moveq	#0,d0
+	movec	d0,cacr
+	movec	d0,tc
+	movec	d0,itt0
+	movec	d0,itt1
+	movec	d0,dtt0
+	movec	d0,dtt1
+	pflusha
 	move.l	usp,a0
 	move.l	a0,(CAP_USP).l
 	move.l	a7,(CAP_SP).l
@@ -53,14 +79,27 @@ cwait:
 	clr.w	(CMD).l
 	cmp.w	#1,d0
 	bne.s	stop
+	move.l	(CAP_CR+4).l,d0
+	movec	d0,tc
+	move.l	(CAP_CR+8).l,d0
+	movec	d0,itt0
+	move.l	(CAP_CR+12).l,d0
+	movec	d0,itt1
+	move.l	(CAP_CR+16).l,d0
+	movec	d0,dtt0
+	move.l	(CAP_CR+20).l,d0
+	movec	d0,dtt1
+	move.l	(CAP_CR).l,d0
+	movec	d0,cacr
 	movem.l	(CAP_D).l,d0-d7/a0-a6
 	rte
 stop:
 	move.w	#$2700,sr
 	lea	(MSTACK).l,sp
-	bra.s	iwait
+	bra	iwait
 
-; the reset entry
+; the reset entry, at a fixed address (tb_cputest.sv IDLE)
+	ds.b	$42111800-*
 idle:
 	move.w	#$2700,sr
 	lea	(MSTACK).l,sp

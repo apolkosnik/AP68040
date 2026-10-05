@@ -236,6 +236,7 @@ typedef struct packed {
 	logic        t0cof;     // the instruction is on the 68040 T0 trace list
 	logic        b_upd;     // operand B is this uop's own (An)+/-(An) register:
 	                        // it reads the updated value (source EA updates)
+	logic        a_upd;     // the same for operand A (MOVES An,(An)+ / -(An))
 } uop_t;
 
 //--------------------------------------------------------------------------
