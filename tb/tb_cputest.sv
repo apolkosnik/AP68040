@@ -271,6 +271,9 @@ endtask
 //--------------------------------------------------------------------------
 logic [31:0] cap_regs [16];
 logic [31:0] cap_sp, cap_msp;
+logic [15:0] cap_fe [8];
+logic [63:0] cap_fm [8];
+logic [31:0] cap_fpcr, cap_fpsr, cap_fpiar;
 logic  [7:0] cap_vec;
 logic  [7:0] frm_save [8];
 
@@ -290,6 +293,14 @@ task automatic read_capture();
 	cap_sp  = rdv(MBOX + 32'h144, 8'd2);
 	cap_msp = rdv(MBOX + 32'h148, 8'd2);
 	cap_vec = rdv(MBOX + 32'h102, 8'd1);
+	// FMOVEM.X layout: sign/exponent, a zero word, the 64-bit mantissa
+	for (int i = 0; i < 8; i++) begin
+		cap_fe[i] = 16'(rdv(MBOX + 32'h170 + 12 * i, 8'd1));
+		cap_fm[i] = {rdv(MBOX + 32'h174 + 12 * i, 8'd2), rdv(MBOX + 32'h178 + 12 * i, 8'd2)};
+	end
+	cap_fpcr  = rdv(MBOX + 32'h1D0, 8'd2);
+	cap_fpsr  = rdv(MBOX + 32'h1D4, 8'd2);
+	cap_fpiar = rdv(MBOX + 32'h1D8, 8'd2);
 endtask
 
 task automatic command(input logic [15:0] c);
@@ -319,6 +330,22 @@ task automatic check_final();
 	else if (!(flags & F_IGNORE_EXC) && e_exc == 8'd4) begin
 		if (rdv(cap_sp + 2, 8'd2) !== e_pc) mismatch("end PC", e_pc, rdv(cap_sp + 2, 8'd2));
 	end
+	if (flags & F_FPU) begin
+		for (int i = 0; i < 8; i++) begin
+			if (cap_fe[i] !== e_fe[i][15:0])
+				mismatch($sformatf("FP%0d sign/exp", i), e_fe[i], {16'd0, cap_fe[i]});
+			if (cap_fm[i][63:32] !== e_fm[i][63:32])
+				mismatch($sformatf("FP%0d mantissa hi", i), e_fm[i][63:32], cap_fm[i][63:32]);
+			if (cap_fm[i][31:0] !== e_fm[i][31:0])
+				mismatch($sformatf("FP%0d mantissa lo", i), e_fm[i][31:0], cap_fm[i][31:0]);
+		end
+		if (cap_fpcr !== e_fpcr) mismatch("FPCR", e_fpcr, cap_fpcr);
+		if (cap_fpsr !== e_fpsr) mismatch("FPSR", e_fpsr, cap_fpsr);
+		// the native runner checks FPIAR when the result stream names it,
+		// or when execution changed it from the input value
+		if ((flags & F_CHECK_FPIAR) || cap_fpiar !== i_fpiar)
+			if (cap_fpiar !== e_fpiar) mismatch("FPIAR", e_fpiar, cap_fpiar);
+	end
 	for (int i = 0; i < em_cnt; i++) begin
 		if (rdv(em_a[i], em_sz[i]) !== em_v[i])
 			mismatch("memory write", em_v[i], rdv(em_a[i], em_sz[i]));
@@ -347,6 +374,14 @@ task automatic run_round();
 	wrv(MBOX + 32'h044, 8'd2, frm_addr);
 	wrv(MBOX + 32'h048, 8'd2, i_msp);
 	wrv(MBOX + 32'h04C, 8'd2, CAPV);
+	for (int i = 0; i < 8; i++) begin
+		wrv(MBOX + 32'h060 + 12 * i, 8'd2, {i_fe[i][15:0], 16'd0});
+		wrv(MBOX + 32'h064 + 12 * i, 8'd2, i_fm[i][63:32]);
+		wrv(MBOX + 32'h068 + 12 * i, 8'd2, i_fm[i][31:0]);
+	end
+	wrv(MBOX + 32'h0C0, 8'd2, i_fpcr);
+	wrv(MBOX + 32'h0C4, 8'd2, i_fpsr);
+	wrv(MBOX + 32'h0C8, 8'd2, i_fpiar);
 	// the native runner raises the interrupt before its entry RTE
 	ipl = i_level[2:0];
 	evt0  = evt_cnt;
@@ -501,14 +536,12 @@ initial begin
 		post_cnt = 0; clean_cnt = 0; pp_bytes = 0;
 		read_deferred(post_cnt);
 		read_deferred(clean_cnt);
-		if ((flags & F_IGNORE_EXC) || (flags & F_FPU)) begin
-			// FPU rounds wait for the FPU; ignored rounds carry no oracle
-			if (flags & F_FPU) skipped++;
-		end
+		// ignored rounds carry no oracle
+		if (flags & F_IGNORE_EXC) skipped++;
 		else run_round();
 		apply_deferred();
 	end
-	$display("cputest replay: %0d rounds, %0d skipped (FPU), %0d mismatches, %0d harness errors",
+	$display("cputest replay: %0d rounds, %0d skipped (no oracle), %0d mismatches, %0d harness errors",
 	         ran, skipped, mism, errors);
 	if (mism == 0 && errors == 0) $display("ALL TESTS PASSED");
 	else $display("TEST FAILED with %0d errors", mism + errors);

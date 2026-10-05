@@ -6,7 +6,7 @@ RTL=../rtl
 WORK=${WORK:-$(cd .. && pwd)/obj}
 mkdir -p "$WORK"
 python3 ../tools/ucode.py
-./build_asm.sh cputest_mon
+[ "${ASM:-1}" = 1 ] && ./build_asm.sh cputest_mon
 verilator --binary --timing -j 16 --build-jobs 16 -O3 \
 	-Wno-fatal -Werror-PINMISSING -Werror-IMPLICIT -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY \
 	--top-module tb_cputest --Mdir "$WORK/obj_cputest" -o tb_cputest \

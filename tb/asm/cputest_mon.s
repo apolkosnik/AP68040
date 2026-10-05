@@ -18,6 +18,8 @@ IN_USP	equ	MBOX+$040
 IN_FRM	equ	MBOX+$044	; ISP for the entry RTE (the frame)
 IN_MSP	equ	MBOX+$048
 IN_VBR	equ	MBOX+$04C
+IN_FP	equ	MBOX+$060	; FP0-FP7, FMOVEM.X layout, 96 bytes
+IN_FC	equ	MBOX+$0C0	; FPCR FPSR FPIAR
 EVT	equ	MBOX+$100	; word: monitor -> bench, an exception entry
 EVT_VEC	equ	MBOX+$102	; word: its vector number
 CAP_D	equ	MBOX+$104	; D0-D7/A0-A6 at the handler entry
@@ -25,7 +27,10 @@ CAP_USP	equ	MBOX+$140
 CAP_SP	equ	MBOX+$144	; the active stack pointer: the frame
 CAP_MSP	equ	MBOX+$148
 CAP_CR	equ	MBOX+$14C	; CACR TC ITT0 ITT1 DTT0 DTT1 of the test
+CAP_FP	equ	MBOX+$170	; FP0-FP7 at the handler entry, 96 bytes
+CAP_FC	equ	MBOX+$1D0	; FPCR FPSR FPIAR
 CMD	equ	MBOX+$200	; word: bench -> monitor, 1 resume, 2 stop
+CAP_FS	equ	MBOX+$300	; the test's FSAVE frame, put back on a resume
 MSTACK	equ	$42130000
 
 	org	$42110000
@@ -67,6 +72,11 @@ capture:
 	movec	d0,dtt0
 	movec	d0,dtt1
 	pflusha
+	; the FPU: FSAVE first, so a pending exception the test left is kept
+	; in the frame (not taken by the FMOVEMs) and comes back on a resume
+	fsave	(CAP_FS).l
+	fmovem.x	fp0-fp7,(CAP_FP).l
+	fmovem.l	fpcr/fpsr/fpiar,(CAP_FC).l
 	move.l	usp,a0
 	move.l	a0,(CAP_USP).l
 	move.l	a7,(CAP_SP).l
@@ -79,6 +89,7 @@ cwait:
 	clr.w	(CMD).l
 	cmp.w	#1,d0
 	bne.s	stop
+	frestore	(CAP_FS).l
 	move.l	(CAP_CR+4).l,d0
 	movec	d0,tc
 	move.l	(CAP_CR+8).l,d0
@@ -117,6 +128,9 @@ iwait:
 	movec	d0,sfc
 	movec	d0,dfc
 	pflusha
+	frestore	(nullf).l		; reset the FPU: no state left over
+	fmovem.l	(IN_FC).l,fpcr/fpsr/fpiar
+	fmovem.x	(IN_FP).l,fp0-fp7
 	move.l	(IN_USP).l,a0
 	move.l	a0,usp
 	move.l	(IN_MSP).l,a0
@@ -126,3 +140,4 @@ iwait:
 	movem.l	(IN_D).l,d0-d7/a0-a6
 	move.l	(IN_FRM).l,a7
 	rte
+nullf:	dc.l	0
