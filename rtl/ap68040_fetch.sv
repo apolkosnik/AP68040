@@ -16,10 +16,11 @@
 // DMU's engine for a table walk; the walk installs the entry here         //
 // (iatc_wr) and the fetch looks again.                                    //
 //                                                                          //
-// Pipeline, one aligned 8-byte chunk per cycle:                           //
+// Pipeline, one aligned long word (two words) per cycle -- D1 decodes at  //
+// most one instruction a cycle, and the queue absorbs long ones:         //
 //   F0  fpc: I-ATC and ITT lookup, cache tag and data RAM read            //
-//   F1  translation, tag compare; a hit is the chunk's words from the     //
-//       fetch address on.  Anything else rolls fpc back and runs in the   //
+//   F1  translation, tag compare; a hit is the long word's words from    //
+//       the fetch address on.  Anything else rolls fpc back and runs in   //
 //       miss engine (walk, line fill, cache-inhibited stream, fault)      //
 //   F2  predecode                                                          //
 //   F3  append to the queue                                                //
@@ -132,17 +133,17 @@ always_comb begin
 end
 
 // F2: the words of a chunk, predecoded into F3; F3: appended this cycle
-logic  [2:0]  f2_n;
-logic [15:0]  f2_w [4];
+logic  [1:0]  f2_n;
+logic [15:0]  f2_w [2];
 logic         f2_f, f2_d, f2_a;
-pd_t          f2_p [4];
-logic  [2:0]  f3_n;
-logic [15:0]  f3_w [4];
-pd_t          f3_p [4];
+pd_t          f2_p [2];
+logic  [1:0]  f3_n;
+logic [15:0]  f3_w [2];
+pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
 genvar gp;
 generate
-	for (gp = 0; gp < 4; gp++) begin : g_pd
+	for (gp = 0; gp < 2; gp++) begin : g_pd
 		ap68040_predec pd (.op(f2_w[gp]), .pd(f2_p[gp]));
 	end
 endgenerate
@@ -242,7 +243,7 @@ wire [31:0] redir_npc = redir_v ? redir_pc : d_redir_pc;
 logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
-logic [63:0] x_chunk;
+logic [31:0] x_chunk;
 always_comb begin
 	logic tt0, tt1;
 	logic [21:0] tg;
@@ -273,8 +274,8 @@ always_comb begin
 		if (iv[f1_pc[9:4]][i] && ct[i][21:0] == tg) begin x_hit = 1'b1; x_way = 2'(i); end
 	x_hit  = x_hit && x_cach;
 	x_lb   = x_cach && lb_v && lb_pa == x_pa[31:4];
-	x_chunk = x_lb ? (f1_pc[3] ? lb_d[63:0] : lb_d[127:64])
-	               : (f1_pc[3] ? cd[x_way][63:0] : cd[x_way][127:64]);
+	x_chunk = x_lb ? lb_d[127 - 32 * f1_pc[3:2] -: 32]
+	               : cd[x_way][127 - 32 * f1_pc[3:2] -: 32];
 end
 wire f1_go      = f1_v && !redir_any;
 wire f1_deliver = f1_go && (x_hit || x_lb);
@@ -282,8 +283,8 @@ wire f1_deliver = f1_go && (x_hit || x_lb);
 //--------------------------------------------------------------------------
 // F0 issue: room for this chunk and those in flight
 //--------------------------------------------------------------------------
-wire [5:0] inflight = (f1_v ? 6'd4 : 6'd0) + {3'd0, f2_n} + {3'd0, f3_n};
-wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 4);
+wire [5:0] inflight = (f1_v ? 6'd2 : 6'd0) + {4'd0, f2_n} + {4'd0, f3_n};
+wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 2);
 wire       f0_go    = (st == S_RUN) && !odd && !stop && !redir_any &&
                       !iatc_flush_page && !inv_busy && room;
 
@@ -330,9 +331,9 @@ always_ff @(posedge clk) begin
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
 		f2_n  <= '0; f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
-		for (int i = 0; i < 4; i++) f2_w[i] <= '0;
+		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
-		for (int i = 0; i < 4; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
+		for (int i = 0; i < 2; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
 		lb_v  <= 1'b0; lb_pa <= '0; lb_d <= '0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
@@ -367,19 +368,19 @@ always_ff @(posedge clk) begin
 				qd[i] <= qd[src[4:0]];
 				qa[i] <= qa[src[4:0]];
 			end
-			else if (k < {2'b00, f3_n}) begin
-				qw[i] <= f3_w[k[1:0]];
-				qp[i] <= f3_p[k[1:0]];
+			else if (k < {3'b000, f3_n}) begin
+				qw[i] <= f3_w[k[0]];
+				qp[i] <= f3_p[k[0]];
 				qf[i] <= f3_f;
 				qd[i] <= f3_d;
 				qa[i] <= f3_a;
 			end
 		end
-		cnt   <= keep + {2'b00, f3_n};
+		cnt   <= keep + {3'b000, f3_n};
 		qpc_r <= qpc_r + {28'd0, consume, 1'b0};
 		f3_n  <= f2_n;
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
-		for (int i = 0; i < 4; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
+		for (int i = 0; i < 2; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
 		f2_n  <= '0;
 
 		//------------------------------------------------------------------
@@ -394,7 +395,7 @@ always_ff @(posedge clk) begin
 			f1_hit <= atc_hit;
 			f1_e   <= atc_e;
 			fnew   <= 1'b0;
-			fpc    <= {fpc[31:3], 3'b000} + 32'd8;
+			fpc    <= {fpc[31:2], 2'b00} + 32'd4;
 		end
 
 		//------------------------------------------------------------------
@@ -402,12 +403,9 @@ always_ff @(posedge clk) begin
 		// rolls back to the missed address
 		//------------------------------------------------------------------
 		if (f1_deliver) begin
-			f2_n <= 3'd4 - {1'b0, f1_pc[2:1]};
-			for (int i = 0; i < 4; i++) begin
-				logic [2:0] j;
-				j = 3'(i) + {1'b0, f1_pc[2:1]};
-				f2_w[i] <= (j < 3'd4) ? x_chunk[63 - 16 * j[1:0] -: 16] : 16'd0;
-			end
+			f2_n    <= f1_pc[1] ? 2'd1 : 2'd2;
+			f2_w[0] <= f1_pc[1] ? x_chunk[15:0] : x_chunk[31:16];
+			f2_w[1] <= x_chunk[15:0];
 			f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
 		end
 		else if (f1_go) begin
@@ -425,9 +423,9 @@ always_ff @(posedge clk) begin
 				iw_req <= 1'b1;
 			end
 			else if (x_flt) begin
-				// ATC fault: the chunk's words carry it
-				f2_n <= 3'd4 - {1'b0, f1_pc[2:1]};
-				for (int i = 0; i < 4; i++) f2_w[i] <= 16'd0;
+				// ATC fault: the long word's words carry it
+				f2_n <= f1_pc[1] ? 2'd1 : 2'd2;
+				for (int i = 0; i < 2; i++) f2_w[i] <= 16'd0;
 				f2_f <= 1'b1; f2_d <= f1_dem; f2_a <= 1'b1;
 				st   <= S_HALT;
 			end
@@ -487,8 +485,8 @@ always_ff @(posedge clk) begin
 				busy  <= 1'b0;
 				stale <= 1'b0;
 				if (!stale) begin
-					f2_n <= 3'd4 - {1'b0, m_la[2:1]};
-					for (int i = 0; i < 4; i++) f2_w[i] <= 16'd0;
+					f2_n <= m_la[1] ? 2'd1 : 2'd2;
+					for (int i = 0; i < 2; i++) f2_w[i] <= 16'd0;
 					f2_f <= 1'b1; f2_d <= m_dem; f2_a <= 1'b0;
 					st   <= S_HALT;
 				end
@@ -498,11 +496,11 @@ always_ff @(posedge clk) begin
 		S_CI: begin
 			if (busy && b_rvalid && !stale) begin
 				if (m_la[1]) begin
-					f2_n    <= 3'd1;
+					f2_n    <= 2'd1;
 					f2_w[0] <= b_rdata[15:0];
 				end
 				else begin
-					f2_n    <= 3'd2;
+					f2_n    <= 2'd2;
 					f2_w[0] <= b_rdata[31:16];
 					f2_w[1] <= b_rdata[15:0];
 				end
@@ -528,7 +526,7 @@ always_ff @(posedge clk) begin
 				busy  <= 1'b0;
 				stale <= 1'b0;
 				if (!stale) begin
-					f2_n    <= m_la[1] ? 3'd1 : 3'd2;
+					f2_n    <= m_la[1] ? 2'd1 : 2'd2;
 					f2_w[0] <= 16'd0;
 					f2_w[1] <= 16'd0;
 					f2_f <= 1'b1; f2_d <= m_dem; f2_a <= 1'b0;
@@ -537,7 +535,7 @@ always_ff @(posedge clk) begin
 				else st <= S_RUN;
 			end
 			else if (!busy && !b_req_r && !b_gnt && !redir_any &&
-			         {1'b0, cnt} + {3'd0, f2_n} + {3'd0, f3_n} <= 6'(QN - 4))
+			         {1'b0, cnt} + {4'd0, f2_n} + {4'd0, f3_n} <= 6'(QN - 2))
 				b_req_r <= 1'b1;        // the next long word of the stream
 		end
 		default: ;
