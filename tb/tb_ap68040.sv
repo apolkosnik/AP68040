@@ -36,6 +36,8 @@
 //               line, shows whether the write reached the bus first)      //
 //   $F2B0 long  (read) counts its own bus reads into $F2B4              //
 //   $F2C0 word  bit 0 asserts CDIS, bit 1 MDIS                            //
+//   $F2C4 word  random snoop traffic from the alternate master: bit 15    //
+//               on, bits 7:0 bus clocks between transfers (see t_snstress)//
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -73,6 +75,23 @@ logic        br_n, bb_n_o, bb_oe, rsto_n;
 logic  [2:0] ipl_lvl;
 logic [31:0] dbg_pc;
 logic        dbg_retire, dbg_halted;
+
+// random snoop traffic ($F2C4, t_snstress): reads of the CPU's counters
+// at $A000 (SC 01: they must never go backwards) and reads/writes of the
+// shared words at $B000 (each value names its writer and address)
+logic        rs_en;
+logic  [7:0] rs_gap, rs_cnt;
+logic  [2:0] rs_op;
+logic  [5:0] rs_k;
+logic [15:0] rs_seq;
+logic        rs_busy;
+int          rs_last [64];
+int          rs_ops;
+function automatic logic rs_valid(input logic [31:0] v, input logic [5:0] k);
+	logic [15:0] a;
+	a = {8'd0, k, 2'b00};
+	rs_valid = (v == 32'd0) || (v[15:0] == (a ^ 16'h5A5A)) || (v[15:0] == (a ^ 16'hA5A5));
+endfunction
 
 // pins the program drives through $F2C0, and the status pins
 logic  [1:0] pins_r;
@@ -237,6 +256,20 @@ always_ff @(posedge clk) if (rsti_n) begin
 	if (dut.dmu.e_st != dut.dmu.E_IDLE) ej[4]++;
 	if (dut.dmu.m2.r.v && dut.dmu.m2.fast && dut.dmu.hz) ej[5]++;
 end
+// snoops: lookups by where the line was (cache, push buffer, queued push,
+// miss), dirty supplies, sinks, invalidations, snoop-forced refetches
+int snc [8];
+initial for (int i = 0; i < 8; i++) snc[i] = 0;
+always_ff @(posedge clk) if (rsti_n) begin
+	if (dut.dmu.sn_look) begin
+		if (!dut.dmu.sn_hit) snc[3]++;
+		else snc[dut.dmu.sn_src]++;
+	end
+	if (dut.snoop.st == dut.snoop.S_SRC && dut.snoop.bclk_en && !dut.snoop.ta_oe) snc[4]++;
+	if (dut.snoop.dc_wr) snc[5]++;
+	if (dut.snoop.dc_inv) snc[6]++;
+	if (dut.sn_ihit) snc[7]++;
+end
 // BTB: followed, overruled at a branch's end, restarted (flag inside)
 int btc [3];
 initial for (int i = 0; i < 3; i++) btc[i] = 0;
@@ -285,6 +318,9 @@ task automatic prof_report();
 	         100 * pf[PF_DC2] / tot, 100 * pf[PF_DC1] / tot, 100 * pf[PF_AG] / tot,
 	         100 * pf[PF_FE] / tot, 100 * pf[PF_FQE] / tot, pf[PF_REDIR], pf[PF_DREDIR]);
 	$display("PROF BTB: followed %0d, overruled at the end %0d, restarted %0d", btc[0], btc[1], btc[2]);
+	$display("PROF snoops: hit cache %0d, push buffer %0d, queued push %0d, miss %0d; supplied %0d, sunk %0d, invalidated %0d, I-side refetches %0d",
+	         snc[0], snc[1], snc[2], snc[3], snc[4], snc[5], snc[6], snc[7]);
+	for (int i = 0; i < 8; i++) snc[i] = 0;
 	$display("PROF loads at DC1: fast %0d, miss %0d, set written since lookup %0d, engine busy %0d, other %0d",
 	         lsl[0], lsl[1], lsl[2], lsl[3], lsl[4]);
 	for (int i = 0; i < 5; i++) lsl[i] = 0;
@@ -424,6 +460,9 @@ always_ff @(posedge clk) begin
 		fetch_stall <= '0;
 		am_go       <= 1'b0;
 		pins_r      <= 2'b00;
+		rs_en <= 1'b0; rs_gap <= '0; rs_cnt <= '0; rs_op <= '0; rs_k <= '0; rs_seq <= '0;
+		rs_busy <= 1'b0; rs_ops <= 0;
+		for (int i = 0; i < 64; i++) rs_last[i] <= 0;
 		am_n        <= '0;
 		am_trig_en  <= 1'b0;
 		am_trig_a   <= '0;
@@ -432,6 +471,94 @@ always_ff @(posedge clk) begin
 	end
 	else begin
 		am_go <= 1'b0;
+		// random snoop traffic: one transfer at a time
+		if (rs_en && !rs_busy && !am_go && am.st == am.A_IDLE) begin
+			if (rs_cnt != 0) rs_cnt <= rs_cnt - 1'd1;
+			else begin
+				int r;
+				logic [5:0] k;
+				r = $urandom % 100;
+				k = 6'($urandom);
+				rs_k   <= k;
+				rs_seq <= rs_seq + 1'd1;
+				am_n   <= 3'd1;
+				am_trig_en <= 1'b0;
+				am_delay <= '0;
+				if (r < 30) begin       // read a counter, SC 01
+					rs_op <= 3'd0;
+					am_x_addr[0] <= 32'h0000_A000 + {24'd0, k, 2'b00};
+					am_x_ctl[0]  <= 5'b01_00_1;
+				end
+				else if (r < 50) begin  // write a shared word, SC 01
+					rs_op <= 3'd1;
+					am_x_addr[0] <= 32'h0000_B000 + {24'd0, k, 2'b00};
+					am_x_ctl[0]  <= 5'b01_00_0;
+					am_x_wd[0]   <= {{rs_seq, {8'd0, k, 2'b00} ^ 16'h5A5A}, 96'd0};
+				end
+				else if (r < 60) begin  // write a shared line, SC 01
+					logic [127:0] l;
+					rs_op <= 3'd2;
+					for (int i = 0; i < 4; i++)
+						l[127 - 32 * i -: 32] = {rs_seq, {8'd0, k[5:2], 2'(i), 2'b00} ^ 16'h5A5A};
+					am_x_addr[0] <= 32'h0000_B000 + {24'd0, k[5:2], 4'd0};
+					am_x_ctl[0]  <= 5'b01_11_0;
+					am_x_wd[0]   <= l;
+				end
+				else if (r < 68) begin  // write a shared word, SC 10
+					rs_op <= 3'd3;
+					am_x_addr[0] <= 32'h0000_B000 + {24'd0, k, 2'b00};
+					am_x_ctl[0]  <= 5'b10_00_0;
+					am_x_wd[0]   <= {{rs_seq, {8'd0, k, 2'b00} ^ 16'h5A5A}, 96'd0};
+				end
+				else if (r < 88) begin  // read a shared word, SC 01
+					rs_op <= 3'd4;
+					am_x_addr[0] <= 32'h0000_B000 + {24'd0, k, 2'b00};
+					am_x_ctl[0]  <= 5'b01_00_1;
+				end
+				else begin              // read a counter line, SC 01
+					rs_op <= 3'd5;
+					am_x_addr[0] <= 32'h0000_A000 + {24'd0, k[5:2], 4'd0};
+					am_x_ctl[0]  <= 5'b01_11_1;
+				end
+				am_go   <= 1'b1;
+				rs_busy <= 1'b1;
+				rs_cnt  <= rs_gap;
+			end
+		end
+		if (rs_busy && !am_go && am_status != 2'd0 && am.st == am.A_IDLE) begin
+			rs_busy <= 1'b0;
+			rs_ops  <= rs_ops + 1;
+			if (am_status == 2'd2) begin
+				$display("FAIL: snoop traffic: bus error");
+				errors <= errors + 1;
+			end
+			else case (rs_op)
+				3'd0: begin
+					int v;
+					v = am_x_rd[0][127:96];
+					if (v < rs_last[rs_k]) begin
+						$display("FAIL: snoop read of counter %0d went back: %0d after %0d", rs_k, v, rs_last[rs_k]);
+						errors <= errors + 1;
+					end
+					rs_last[rs_k] <= v;
+				end
+				3'd4: if (!rs_valid(am_x_rd[0][127:96], rs_k)) begin
+					$display("FAIL: snoop read of shared word %0d: %08x", rs_k, am_x_rd[0][127:96]);
+					errors <= errors + 1;
+				end
+				3'd5: for (int i = 0; i < 4; i++) begin
+					int v;
+					v = am_x_rd[0][127 - 32 * i -: 32];
+					if (v < rs_last[{rs_k[5:2], 2'(i)}]) begin
+						$display("FAIL: snoop line read of counter %0d went back: %0d after %0d",
+						         {rs_k[5:2], 2'(i)}, v, rs_last[{rs_k[5:2], 2'(i)}]);
+						errors <= errors + 1;
+					end
+					rs_last[{rs_k[5:2], 2'(i)}] <= v;
+				end
+				default: ;
+			endcase
+		end
 		if (fetch_hold) fetch_stall <= fetch_stall - 1'd1;
 		// $F144 mode 1: IPL2 while TRAP #0 starts stacking; mode 2: IPL2
 		// once its vector has been read, the handler's first fetch held
@@ -500,6 +627,11 @@ always_ff @(posedge clk) begin
 				16'hF150: begin ipl_lvl <= w[2:0]; ipl_next <= w[6:4]; ipl_step <= w[15:8]; end
 				16'hF154: begin fberr_armed <= (w != 16'd0); fberr_addr <= w; end
 				16'hF2C0: pins_r <= w[1:0];
+				16'hF2C4: begin
+					rs_en  <= w[15];
+					rs_gap <= w[7:0];
+					if (!w[15]) $display("snoop traffic: %0d transfers", rs_ops);
+				end
 				16'hF280: begin
 					// the command block was written to memory by the slave
 					for (int k = 0; k < 4; k++) begin
