@@ -11,14 +11,15 @@
 | M4 | instruction and data caches, copyback, bus snooping (t_cache, t_snoop) | done |
 | M5 | MMU: ATCs, table walk, TTRs, PTEST/PFLUSH (t_mmu, t_atcprobe) | done |
 | M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
-| M7 | cputest corpus replay (tb_cputest.sv) | FPU groups: only the 4 known generator artifacts fail; integer groups running |
-| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | in progress: 26.1k ALMs, -3.7 ns (FPU divide) before the radix change |
-| M9 | performance: BTB, early restart, posted writes | |
+| M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
+| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: worst setup slack +0.009 ns at 16.667 ns, hold and pulse width met in all four corners; 26,451 ALMs, 18,652 registers (out of context, Quartus 17.0) |
+| M9 | performance: prediction, BTB, return stacks, store forwarding | Dhrystone 2.1: CPI 1.90, about 27.6 DMIPS at 60 MHz |
+| M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
 
 ## Regression
 
 ```
-tb/run_tests.sh                 # the fourteen programs, five bus configurations each
+tb/run_tests.sh                 # the eighteen programs, five bus configurations each
 tb/build_cputest.sh             # the corpus replay bench
 tb/run_cputest.py ~/Downloads/data040.zip                    # smoke slices
 tb/run_cputest.py ~/Downloads/data040.zip --full --group AE  # a group, every slice
@@ -29,7 +30,13 @@ retries, BCLK at half PCLK, and all of those together.
 
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
-t_fpu_frames, t_fpu_resume, t_snoop.
+t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress.
+
+Performance: `tb/build_c.sh dhry` (vbcc; `ASFLAGS=-DCOPYBACK=1` runs it in
+user mode with copyback caches), then `obj/obj_prog/tb_ap68040
++prog=tb/build/dhry.hex +prof`: cycles and instructions between the
+program's stamps, and where the cycles went (stage holds, redirects by
+cause, BTB checks, load fast-path misses, DMU engine jobs).
 
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
@@ -41,7 +48,7 @@ failing slice is a regression.
 ```
 tb/build_asm.sh smoke t_integer      # assemble tb/asm/*.s
 tb/build_sim.sh                      # verilate (objects in ./obj)
-obj/obj_prog/tb_ap68040 +prog=tb/build/smoke.hex [+trace] [+ptrace] [+amtrace] [+waits] [+tbi=2] [+retry=5] [+bclk2]
+obj/obj_prog/tb_ap68040 +prog=tb/build/smoke.hex [+trace] [+ptrace] [+amtrace] [+prof] [+waits] [+tbi=2] [+retry=5] [+bclk2]
 tb/where.sh t_mmu 172                # the source of a failing test number
 ```
 
@@ -80,3 +87,10 @@ small program linked against WinUAE's readcpu.cpp; see tools/README).
   performed only once every older instruction has completed, so nothing
   can restart it after the read.
 * FDIV/FSQRT: two quotient bits (root digits) per clock, 33 iterations.
+* Branch prediction is invisible to programs except for self-modified
+  code: like the 68040 (which prefetches both paths of a branch) the core
+  may fetch a branch target before an older store to it; CPUSHA must
+  precede modified code (MC68040UM 4.5).  A store into the 128 bytes after
+  its own instruction still refetches what follows.  A snoop that drops
+  valid instruction-cache data refetches from the next instruction.
+* CDIS's reset-time selection of the multiplexed bus mode is not provided.

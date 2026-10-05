@@ -1,178 +1,237 @@
 # AP68040-60: a pipelined MC68040 for 60 MHz
 
-This branch (`ap68040-60mhz`) holds a new implementation of the MC68040,
-written for a 60 MHz processor clock on Cyclone V (MiSTer, 5CSEBA6U23I7,
-speed grade I7), validated under Verilator.  The previous sequential core
-is kept unchanged in `rtl_old/` (with its benches in `tb_old/`) as a
-reference model for differential testing.
+This branch (`ap68040-60mhz`) holds an implementation of the MC68040 written
+for a 60 MHz processor clock on Cyclone V (MiSTer, 5CSEBA6U23I7) and validated
+under Verilator.  The previous sequential core is kept in `rtl_old/` (benches
+in `tb_old/`) as a reference.
 
 Architectural ground truth, in order of authority:
 1. Real hardware behaviour where it is known (recorded in tests).
-2. WinUAE (`newcpu*.cpp`, `cpummu.cpp`, `gencpu.cpp`, `table68k`) and its
-   cputest 68040 corpus.
-3. MC68040 User's Manual (MC68040UM), sections 3 (MMU), 4 (caches),
-   7 (bus), 8 (exceptions), 9 (FPU).
+2. WinUAE (`newcpu*.cpp`, `cpummu.cpp`, `gencpu.cpp`) and its cputest 68040
+   corpus, replayed by `tb/tb_cputest.sv`.
+3. The MC68040 User's Manual (MC68040UM): section 3 (MMU), 4 (caches),
+   5 (signals), 7 (bus), 8 (exceptions), 9 (FPU).
 
 ## Clocking
 
-One clock, `clk`, is the 68040's PCLK.  The bus clock is expressed as a
-clock enable, `bclk_en`: every bus output changes, and every bus input is
-sampled, only in a `clk` cycle with `bclk_en` high.  `bclk_en = 1` runs the
-bus at the processor clock; a 1-0-1-0 pattern gives the real 68040's 2:1
-PCLK:BCLK ratio.
+One clock, `clk`, is the 68040's PCLK.  The bus clock is a clock enable,
+`bclk_en`: every bus output changes, and every bus input is sampled, only in a
+`clk` cycle with `bclk_en` high.  `bclk_en = 1` runs the bus at the processor
+clock; 1-0-1-0 gives the real 68040's 2:1 PCLK:BCLK ratio.
 
-## External bus (MC68040UM section 7)
-
-The top level, `ap68040`, presents the 68040 bus as synchronous signals with
-separate in/out/output-enable where the real pin is bidirectional:
+## External bus (MC68040UM sections 5 and 7)
 
 | group | signals |
 |---|---|
-| address/data | `a_o[31:0]`, `d_i[31:0]`, `d_o[31:0]`, `d_oe` |
-| attributes | `rw_n`, `siz[1:0]`, `tt[1:0]`, `tm[2:0]`, `tln[1:0]`, `upa[1:0]`, `ciout_n`, `lock_n`, `locke_n` |
-| control | `ts_n`, `tip_n`, `ta_n`, `tea_n`, `tci_n`, `tbi_n` |
-| snoop | `sc[1:0]`, `mi_n`, plus the alternate master's `a_i`, `siz_i`, `rw_n_i`, `ts_n_i` |
-| arbitration | `br_n`, `bg_n`, `bb_n_i`, `bb_n_o` |
-| interrupts | `ipl_n[2:0]`, `avec_n`, `ipend_n` |
-| status | `pst[3:0]`, `rsti_n`, `rsto_n` |
+| address, data | `a_o`, `a_oe`, `d_i`, `d_o`, `d_oe` |
+| attributes | `rw_n`, `siz`, `tt`, `tm`, `tln`, `upa`, `ciout_n`, `lock_n`, `locke_n` |
+| transfer control | `ts_n`, `tip_n`, `ta_n`, `tea_n`, `tci_n`, `tbi_n` |
+| snooping | `sc`, `mi_n`; the other master's `a_i`, `ts_n_i`, `rw_n_i`, `siz_i`, `tt_i`; the 68040 as a slave: `ta_n_o`, `ta_oe` (and `d_o`/`d_oe`) |
+| arbitration | `br_n`, `bg_n`, `bb_n_i`, `bb_n_o`, `bb_oe` |
+| interrupts | `ipl_n`, `avec_n`, `ipend_n` |
+| control, status | `rsti_n`, `rsto_n`, `cdis_n`, `mdis_n`, `pst` |
 
-Supported transfers: byte/word/long and misaligned splits (Table 7-3), line
-burst read/write with wrap-around addressing, burst-inhibit (TBI) fallback to
-three long-word transfers, cache-inhibit-on-fill (TCI), bus error (TEA),
-retry (TA+TEA), locked read-modify-write (`LOCK`/`LOCKE`) for TAS, CAS,
-CAS2 and descriptor U/M updates, MOVE16 line transfers (TT=1), alternate
-space (TT=2, MOVES), interrupt acknowledge (TT=3, AVEC autovector), table
-search (TM=3/4), push (TM=0) and snooping of alternate masters.
+`ap68040_biu.sv` runs one transaction at a time for its clients (the DMU
+first, then the instruction fetch): byte/word/long transfers (the requester
+splits misaligned operands, table 7-3), line bursts with A3:A2 wrapping,
+TBI fallback to long-word transfers, TCI on fills, TEA bus errors, TA+TEA
+retry (a retry after the first beat of a line is a bus error), locked
+sequences (LOCK/LOCKE) that keep the bus, MOVE16 (TT=1), MOVES alternate
+spaces (TT=2), interrupt acknowledge (TT=3, AVEC), table searches (TM=3/4),
+pushes (TM=0), and RSTO for 512 bus clocks.  Arbitration: the bus is taken
+when BG is asserted and BB is free; a negated BG gives it up after the
+transfer in progress unless a locked sequence is open.
+
+Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
 
 ## Pipeline
 
 ```
- F0  F1  F2 | D1  D2 | AG  DC1  DC2  EX  WB
- PC  I$  Q  | dec seq| RR+EA D$  D$   ALU commit
+ F0  F1  F2  F3 | D1    D2   | AG   DC1  DC2  EX   WB
+ PC  I$  pre Q  | parse useq | EA   D$   D$   ALU  commit
 ```
 
-* **F0** selects the fetch PC (sequential, decode redirect, branch-target
-  buffer hit, execute redirect, exception vector).  **F1** reads the
-  instruction cache (4 KB, 4-way, 64 sets of 16-byte lines) and the I-ATC.
-  **F2** selects the way and writes 8 bytes into the instruction queue.
-* **D1** parses one instruction from the queue head: operation word, the
-  fixed second word if the class has one, immediates and the extension
-  words of each effective address (brief and full formats, base and outer
-  displacements).  Common instructions take one cycle; long ones take one
-  cycle per extension group.  D1 resolves unconditional and predicted-taken
-  PC-relative branches and redirects fetch.
-* **D2** is the micro-sequencer.  Each 68040 instruction maps (through a
-  PLA generated from the instruction table) to a microcode routine of one
-  or more micro-operations (uops).  Most instructions are one uop: a fused
-  `load-op-store` pass through the back end.  Multi-uop routines cover
-  memory-to-memory forms, memory-indirect addressing, MOVEM, bit fields,
-  CAS/CAS2, exceptions, RTE, MOVE16, FPU transfers and MMU instructions.
-* **AG** reads the register file (a future file, see below), forwards, and
-  computes the effective address `base + index*scale + disp` and the
-  postincrement/predecrement update of the base register.
-* **DC1/DC2** look up the D-ATC and the data cache (4 KB, 4-way, copyback),
-  select the way and align the operand.
-* **EX** runs the ALU, shifter, bit-field unit, BCD, condition codes and
-  branch resolution; multiply/divide and the FPU are multi-cycle units
-  that hold EX.
-* **WB** commits: architectural register file, CCR/SR, store into the data
-  cache or the bus, exceptions, interrupts and trace.
-
-### Timing rules
-
-1. Every stall and flush is a function of at most two levels of logic over
-   registered state.  Data-dependent conditions (cache miss, ATC miss,
-   misaligned split, store/load overlap) are registered in the stage that
-   detects them and act in the next cycle.
-2. Block RAMs (M10K) have registered addresses; a stalled stage keeps its
-   address so the RAM re-reads it every cycle.
-3. Long arithmetic (divide, FPU divide/square root, 64-bit multiply) is
-   iterative or pipelined, never a single-cycle cone.
+* **F0** issues one long-word fetch per cycle: I-ATC/ITT lookup, the cache
+  RAM read, and the branch target buffer lookup.  **F1** compares the tags;
+  a hit goes on, a miss starts the miss engine (table walk through the DMU,
+  line fill with critical word first, or a cache-inhibited read) and F0
+  rolls back to the missed address.  **F2** predecodes both words (each
+  could start an instruction).  **F3** appends them to the 12-word queue.
+* **D1** parses one instruction from the queue head per cycle (the fast
+  path, from the predecode: operation word, fixed words, immediate, brief
+  extensions); a full-format extension, an FPU immediate or more than seven
+  words take one cycle per part.  D1 adds PC-relative displacements and
+  branch targets, predicts branches and redirects fetch (see below), and
+  turns illegal/privileged/TRAP/odd-PC/fetch-fault cases into records that
+  carry their exception vector.  Records go to D2 through a 2-entry FIFO.
+* **D2** is the micro-sequencer (`ap68040_useq.sv`).  Each instruction maps
+  to a microcode routine (598 words of 120 bits, M10K, generated by
+  `tools/ucode.py`) of one or more uops, one uop per cycle.  Most
+  instructions are one uop: a `load-op-store` pass through the back end.
+  Multi-uop routines cover memory-to-memory forms, memory indirection (a
+  pointer load into T12/T13 first), MOVEM, bit fields, CAS/CAS2, RTE,
+  MOVE16, FPU transfers, MMU and cache instructions and the exception
+  routines.  A source (An)+/-(An) can be deferred to a later uop so an
+  instruction that faults on its second access restarts cleanly.
+* **AG** reads the front register file and forms `base + index*scale +
+  disp`, the address register updates (into the front file) and the
+  operands.  Base, index and update registers interlock on an older uop
+  that will write them in EX.
+* **DC1/DC2**: the D-ATC/DTT lookup and tag compare (DC1) and the operand
+  from DC2's copy of the set (see the DMU).
+* **EX**: ALU, shifter, bit-field unit, BCD, condition codes, branch
+  resolution (every prediction is verified here), multiply/divide (holds
+  EX), the FPU interface.  EX results go to the front file and are
+  captured by younger uops in AG/DC1/DC2 that name the register.
+* **WB**: the back (architectural) register file, CCR/SR, stores, and every
+  redirect: mispredictions, exceptions, interrupts, trace, serialization.
 
 ### Register files
 
-Integer registers are D0-D7, A0-A6, USP, ISP, MSP and eight microcode
-temporaries.  `A7` is mapped to USP/ISP/MSP at decode time from S and M;
-every instruction that changes S or M serializes the pipeline.
+D0-D7, A0-A6, USP, ISP, MSP and the microcode temporaries T0-T13 (A7 is
+mapped to USP/ISP/MSP at D2 from S and M).  Two copies, both MLAB
+(`ap68040_rf`, three write ports and five read ports through a live-value
+table): the front file (newest values) and the back file (architectural).
+`fv[r]` marks registers whose front copy is current; a redirect or an
+exception clears `fv`, so the back file is read again with no copy.
+Exception entry writes the routine's operands (T5-T13) into the back file
+over three cycles before the routine starts.
 
-* The **front file** holds the newest value of every register.  AG writes
-  postincrement/predecrement updates into it; EX writes results into it.
-  AG reads it (with bypass of the values being written in the same cycle).
-* The **back file** is written by WB in program order and is the
-  architectural state.  A flush (mispredict, exception, serialization)
-  copies the back file into the front file in one cycle.
-* A scoreboard marks registers with a pending EX write.  AG stalls when the
-  base or index register is pending, and when it would write a register an
-  older instruction will still write in EX.  EX operands do not stall:
-  instructions in AG/DC1/DC2 capture an EX result for their source
-  registers when it is broadcast.
+## Branch prediction
 
-### Memory ordering
+* **D1** predicts: Bcc by the static rule (backward taken) overruled by a
+  256-entry table of 2-bit counters indexed by PC[8:1] (a counter counts
+  disagreement with the static rule, so zeros mean "static"; trained in
+  EX); BRA/BSR always; JSR/JMP to absolute and PC-relative addresses; RTS
+  through an 8-entry return stack pushed by BSR/JSR.  A taken prediction
+  redirects fetch (four bubbles).
+* **The fetch BTB** (256 entries, MLAB, indexed by fetch address) remembers
+  D1's taken predictions: branches, calls (BSR/JSR) and returns (RTS).  A
+  hit at F0 ends the chunk at the branch's last word, flags that word, and
+  sends F0 to the target from F1 (one bubble): the entry's target, or for a
+  return the top of the fetch's own return stack, which the calls it takes
+  push and which is resynchronized from D1's stack on every redirect.  The
+  targets travel in a FIFO beside the queue.  D1 checks every flagged word:
+  a flag on the last word of a branch D1 predicts the same way is followed;
+  on the last word of anything else D1 redirects its own way and rewrites
+  or drops the entry; inside an instruction (a stale or aliased entry) D1
+  drops the entry and the instruction is refetched from WB.
+* EX verifies direction and target of every prediction; a misprediction
+  redirects from WB.
 
-Loads read the data cache in DC1.  Stores write it in WB.  A load whose
-physical long word overlaps an older store still in EX or WB, or written by
-WB in the cycle the load read the RAM, is replayed: it and everything
-younger are flushed and refetched.  Noncachable accesses go to the bus in
-program order; serialized noncachable reads wait for older writes.
+## Memory ordering and coherency
 
-## Caches (section 4)
+* Loads read the cache at DC1/DC2; stores write it at WB.  DC2 keeps its
+  own copy of the set and merges every byte write to that set into it
+  (including the two writes the RAM output cannot show yet), so a load
+  after a store to its line stays on the fast path; a load behind an older
+  store to its line still in EX/WB waits for it in DC2.
+* A later read may complete before an earlier write (MC68040UM 7.7), except
+  that a cache-inhibited or locked read waits for older stores, and a read
+  from a serialized page (or a locked read) is performed only once every
+  older instruction has completed.
+* Self-modifying code: a store into the 128 bytes after its own
+  instruction refetches what follows (the previous core's AmigaOS boot
+  needed it).  Otherwise the program keeps the instruction stream
+  coherent, as the 68040 requires: it prefetches branch targets, and
+  CPUSHA must precede modified code (MC68040UM 4.5, 7.7).
+* A snoop that removes a valid instruction-cache line refetches the next
+  instruction to reach AG and everything after it: the front end can run
+  further ahead (through calls and returns) than the 68040's prefetch.
 
-Both caches are 4 KB, 4-way set associative, 64 sets, 16-byte lines,
-physically tagged and indexed by address bits 9-4 (inside the page, so no
-aliasing).  Valid and dirty bits are flip-flops; tags and data are M10K.
+## Data memory unit (`ap68040_dmu.sv`)
 
-* Data cache modes from the ATC/TTR CM field: copyback, write-through,
-  cache-inhibited serialized, cache-inhibited non-serialized.
-* Read miss: line fill by burst (critical long word first, wrapping), with
-  the requested operand forwarded from the bus.  A dirty victim is pushed
-  (line write, TM=0) through the push buffer.
-* Write miss in copyback mode allocates (read line, then write); in
-  write-through it does not allocate.
-* `CINV`/`CPUSH` (line, page, all; data, instruction, both).
-* Snooping: an alternate master's write invalidates matching lines (SC=01)
-  or is sunk into a dirty line (SC=10); a read of a dirty line is sourced
-  with MI asserted.
+* Data cache: 4 KB, 4 ways of 64 sets of 16-byte lines, physically tagged,
+  indexed by PA9-4 (= LA9-4).  Tags and data in M10K; valid and dirty bits
+  in flip-flops with one write port.  Modes from the ATC/TTR CM field:
+  copyback, write-through, cache-inhibited serialized and nonserialized.
+* The fast path: a load that hits, within one line, answers from DC2's copy;
+  a copyback store that hits writes the RAM in its WB cycle.
+* The engine runs everything else, one job at a time: misses (line fill,
+  critical word first; a dirty victim goes to the push buffer and is pushed
+  after the fill), copyback write-allocate, cache-inhibited accesses (a
+  matching line is pushed and invalidated first), operands crossing a line,
+  write-through and locked stores, MOVE16, CINV/CPUSH (line, page, all),
+  PFLUSH/PTEST, and table walks for both ATCs.
+* Table walks (MC68040UM 3.2): root, pointer and page descriptors,
+  indirect descriptors, 4 KB/8 KB pages, accumulated write protection, U
+  and M updates with locked read-modify-write; descriptor reads see the
+  data cache, descriptor updates invalidate a matching line.  As on the
+  68040 (WinUAE `cpummu.cpp`), a failed search still creates an ATC entry
+  with R clear (B set for a bus error).
+* ATCs (`ap68040_atc.sv`): 64 entries, 4-way, 16 sets indexed by LA15-12
+  (4 KB) or LA16-13 (8 KB), tagged with FC2 and the logical page.
+* Snoop port: see below.
 
-## MMU (section 3)
+## Bus snooping (`ap68040_snoop.sv`; MC68040UM 4.4, 4.7, 7.9)
 
-* I-ATC and D-ATC: 64 entries each, 4-way, 16 sets, indexed by logical page
-  number bits, tagged with the logical page, S, and the global bit.
-* 4 KB and 8 KB pages, three-level tables (root, pointer, page; indirect
-  page descriptors), U and M history updates with locked read-modify-write,
-  write protection, supervisor-only pages, U1/U0 (UPA pins), CM.
-* ITT0/1 and DTT0/1 transparent translation with FC matching and S field.
-* Following WinUAE, the 68040 creates an ATC entry for an invalid or
-  bus-errored descriptor (an R-clear entry); a later access through it
-  faults without a search until PFLUSH.
-* PTEST (R/W) writes MMUSR and installs the entry; PFLUSH (page, page with
-  no global, all, all non-global).
-* Access faults produce a format $7 frame with the 68040's SSW, effective
-  address, and fault address; instruction restart (not continuation).
+While another master owns the bus, each of its transfers with TT = normal
+or MOVE16 and SC = 01 or 10 is looked up in the data cache, in the push
+buffer, and in a push queued for the bus.  SC 01: a read of a dirty line is
+supplied by the 68040 (MI held, TA and D31-D0 from it, a line one long word
+per bus clock); a byte/word/long write into a dirty line is sunk into it;
+other write hits invalidate.  SC 10: a read of a dirty line is supplied and
+the line invalidated; any other hit is invalidated.  The instruction cache
+drops a line on any snooped write and on SC 10 reads (a two-entry queue
+into the fetch unit).  MI is asserted whenever another master owns the bus,
+except while memory may answer the current transfer.  The DMU freezes its
+engine and holds DC1 while the snooper uses the cache; an invalidated line
+loses its hit in every in-flight record, so no store lands in a line that
+left.
 
-## Exceptions (section 8)
+## Exceptions (MC68040UM section 8)
 
 Detected per uop, taken when the uop reaches WB (precise).  The back end
-flushes, restores the front file and starts the exception microroutine,
-which builds format $0/$1/$2/$3/$4/$7 frames with ordinary store uops
-sourcing the exception-information registers (vector, old SR, PC, faulted
-address, SSW).  Interrupts and trace are taken at instruction boundaries.
+flushes, and the micro-sequencer runs the exception routine, which builds
+the frame with ordinary store uops from the exception information
+(vector, SR, PC, address, SSW, the access-error writeback fields).
+Interrupts and trace are taken at instruction boundaries (an interrupt
+beats a simultaneous trace; IPEND keeps a request that beat the old mask).
+Access errors use the 68040's restart model with the format $7 frame;
+MOVEM continues from the stacked EA (SSW CM).  Fetch faults on speculative
+prefetch are refetched once on demand before they become access errors.
 
-## FPU (section 9)
+## FPU
 
-The 68040 hardware subset, as in `rtl_old/ap040_fpu.v` (verified against
-the cputest corpus) with its divide/square-root step retimed for 60 MHz.
-Unimplemented instructions and data types trap with the 68040 frames an
-FPSP expects.
+The 68040's hardware subset (`rtl/fpu/ap040_fpu.v`, from the previous core,
+verified against the cputest corpus), behind `ap68040_fpif.sv`, which runs
+the FPU beside the integer pipeline: arithmetic continues in the background
+while integer instructions proceed, and exceptions are reported the 68040
+way (pre-instruction at the next FPU instruction).  Divide and square root
+take two bits per clock.  Unimplemented instructions and data types trap
+with the frames an FPSP expects; `FPU_REVISION` selects the FSAVE frame
+revision ($41 or $40).
+
+## Pins beyond the bus
+
+* IPEND: a request exceeds the mask (on bus clock edges).
+* PST3-PST0 (table 5-6): each instruction's end (branch taken / not taken /
+  other) for one bus clock, else the status: table search, halted,
+  stopped, RTE executing, exception stacking.
+* CDIS disables both caches without flushing them (snooping continues);
+  MDIS disables page translation (the TTRs, PFLUSH and PTEST are not
+  affected).
+
+## Timing rules
+
+1. Block RAMs have registered addresses; a held stage re-presents its
+   address.  The D-cache set index takes AG's address through one LUT
+   (the other sources are merged from registers) and is duplicated per way.
+2. Long arithmetic is iterative or pipelined: divide and square root two
+   bits per clock, the 64x64 multiply in DSP blocks.
+3. Every redirect comes from registered state (D1's records, WB).
 
 ## Source layout
 
 ```
-rtl/        new core (SystemVerilog)
-rtl/gen/    generated tables (decoder PLA, microcode ROM) - do not edit
-tools/      generators for rtl/gen (instruction table, microcode assembler)
-tb/         Verilator benches, 68040 bus model, test runners
-tb/asm/     self-checking 68040 test programs (shared with tb_old)
-rtl_old/    previous sequential core (reference only)
-tb_old/     its benches
-doc/        this document, STATUS.md
+rtl/            the core (SystemVerilog)
+rtl/fpu/        the FPU datapath
+rtl/gen/        generated tables (decoder, microcode ROM) - do not edit
+tools/          ucode.py (microcode and decoder), cputest replay generator
+tb/             Verilator benches, 68040 bus slave, alternate master
+tb/asm/         self-checking 68040 test programs
+tb/c/           C programs (vbcc), Dhrystone
+rtl_old/        the previous sequential core (reference only)
+tb_old/         its benches
+doc/            this document, STATUS.md
 ```
