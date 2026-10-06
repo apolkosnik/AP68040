@@ -12,8 +12,8 @@
 | M5 | MMU: ATCs, table walk, TTRs, PTEST/PFLUSH (t_mmu, t_atcprobe) | done |
 | M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
 | M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
-| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths).  e8e333b: seeds 1, 4 and 5 meet setup and hold in all four corners (worst setup slack +0.370, +0.421, +0.323 ns at 16.667 ns; 27,142 ALMs with seed 1); seeds 2 and 3 miss by 0.47 and 0.15 ns on the FPU rounding path and EX's slow-op result.  938bccc (before the CLR change): seeds 1-3 all closed |
-| M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.50, about 35.0 DMIPS at 60 MHz |
+| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths).  69028f0: seeds 1, 2 and 3 meet setup and hold in all four corners (worst setup slack +0.063, +0.181, +0.222 ns at 16.667 ns); 26,976 ALMs (seed 1) |
+| M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.48, about 35.4 DMIPS at 60 MHz |
 | M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
 
 ## Regression
@@ -56,7 +56,11 @@ Dhrystone history (cycles for the 2000 runs between the stamps):
 2,475,417 with the two-entry record FIFO (D2 idled one cycle in three);
 2,015,434 with three entries and the return stack and BHT repaired;
 1,997,442 with load data handed to AG at DC2; 1,985,428 with mispredicts
-redirecting from EX; 1,951,441 with one-uop JSR.  What is left: about
+redirecting from EX; 1,951,441 with one-uop JSR; 1,927,452 with a WB
+store merged into DC2's copy in its own cycle.  tb/tools/gen_bench_insn.py
+measures 58 instruction forms (bench_insn.s); outliers left: two taken
+branches in one fetch long word thrash the one-slot BTB entry (6 cycles
+each), MOVE16 (about 38), CAS/TAS (locked bus transfers, about 25).  What is left: about
 12,000 mispredictions (loop exits), load- and ALU-to-address interlocks,
 two-uop memory-to-memory MOVE, MOVEM one register a cycle.  A 512-entry
 BTB removes 8,000 D1 redirects (2 %), but failed timing by 0.44 ns

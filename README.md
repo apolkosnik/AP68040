@@ -15,7 +15,7 @@ its benches in `tb_old/`, as a reference.
 |---|---|
 | clock | 60 MHz (16.667 ns): three fitter seeds, all meeting setup, hold and minimum pulse width in all four corners (worst setup slack +0.136 ns; Quartus 17.0, out of context) |
 | area | 26,364 ALMs (63 % of the 5CSEBA6), 16,526 registers |
-| Dhrystone 2.1 | CPI 1.50, about 35.0 DMIPS at 60 MHz (user mode, copyback caches, in simulation) |
+| Dhrystone 2.1 | CPI 1.48, about 35.4 DMIPS at 60 MHz (user mode, copyback caches, in simulation) |
 | cputest 68040 corpus | 3776 of 3801 slices; the other 25 are known WinUAE generator defects (see doc/STATUS.md) |
 
 ## Design
