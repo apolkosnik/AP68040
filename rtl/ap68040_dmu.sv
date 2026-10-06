@@ -492,7 +492,7 @@ wire st_simple = m2.r.v && (m2.r.mem == M_ST) && m2.x.ok && !m2.x.flt && !m2.spl
 typedef enum logic [5:0] {
 	E_IDLE,
 	E_S_START, E_S_XL, E_S_XLW, E_S_XL2, E_S_ACT, E_S_RD, E_S_RDW, E_S_RD2, E_S_BUSD,
-	E_S_NEXT, E_S_DONE, E_SP_W, E_SP_2,
+	E_S_NEXT, E_S_DONE, E_SP_W, E_SP_2, E_SP_3,
 	E_W_START, E_W_PART, E_W_DONE,
 	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE,
 	E_FILL, E_FILLW, E_FILL_W, E_FILL_INS, E_PUSHV, E_PUSHVW, E_PUSHV_W, E_PUSHV_B,
@@ -523,7 +523,7 @@ logic        sp_dw;               // a write to the next set while its
 // lookup captured stay good (a fast split read; the RAM re-reads the held
 // DC1 set after its stolen read, steal_q)
 wire  e_quiet = (e_st == E_IDLE) || (e_st == E_S_START) || (e_st == E_SP_W) ||
-                (e_st == E_SP_2) || (e_st == E_S_DONE && sp_job);
+                (e_st == E_SP_2) || (e_st == E_SP_3) || (e_st == E_S_DONE && sp_job);
 logic        e_job;               // the engine owns the DC2 uop until it is done
 
 // bus operation built by a job, run by E_BUS
@@ -916,14 +916,27 @@ always_ff @(posedge clk) begin
 				e_st   <= m2.x.ok ? E_S_ACT : E_S_XL;
 		end
 		E_SP_W: e_st <= E_SP_2;         // the RAMs register the stolen address
+		E_SP_3: begin
+			logic [2:0] n0;
+			n0 = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
+			if (!e_kill && !hz && !st_line(m3, e_x.pa[31:4]) && !st_line(m4, e_x.pa[31:4]) &&
+			    !sp_dw && !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
+				// the first part from DC2's copy, the rest from the stolen read
+				e_acc <= (take(dq_r[m2.x.way], m2.r.a[3:0], n0) << (8 * (nbytes(m2.r.msz) - n0))) |
+				         take(dq_rn[e_x.way], 4'd0, nbytes(m2.r.msz) - n0);
+				e_st  <= E_S_DONE;
+			end
+			else begin
+				steal  <= 1'b0;
+				sp_job <= 1'b0;
+				e_x    <= m2.x;
+				e_st   <= m2.x.ok ? E_S_ACT : E_S_XL;
+			end
+		end
 		E_SP_2: begin
 			xres_t x;
-			logic [27:0] l1;
-			logic [2:0]  n0;
 			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
 			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m2.r.a[9:4] + 6'd1]);
-			l1 = x.pa[31:4];
-			n0 = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
 			if (!e_kill && m2.sfast && m2.r.mem == M_ST && x.ok && !x.flt && !x.walk &&
 			    x.hit && x.cm == 2'b01) begin
 				// a copyback store across a line: both parts hit, nothing
@@ -932,15 +945,12 @@ always_ff @(posedge clk) begin
 				e_st   <= E_S_DONE;
 			end
 			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && x.ok && !x.flt && !x.walk &&
-			    x.hit && !x.cm[1] &&
-			    !hz && !st_line(m3, l1) && !st_line(m4, l1) && !sp_dw &&
-			    !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
-				// both parts from the cache: the first from the copy, the
-				// rest from the stolen read
-				e_acc  <= (take(dq_r[m2.x.way], m2.r.a[3:0], n0) << (8 * (nbytes(m2.r.msz) - n0))) |
-				          take(dq_rn[x.way], 4'd0, nbytes(m2.r.msz) - n0);
+			    x.hit && !x.cm[1]) begin
+				// both parts hit: the data next cycle (the RAM holds the
+				// stolen set), from the translation registered here
+				e_x    <= x;
 				m2.x1  <= x;
-				e_st   <= E_S_DONE;
+				e_st   <= E_SP_3;
 			end
 			else begin
 				// anything else: the general path, from its start
@@ -1727,7 +1737,7 @@ always_ff @(posedge clk) begin
 		default: e_st <= E_IDLE;
 		endcase
 
-		if (e_st == E_SP_W && dw && dw_set == st_set) sp_dw <= 1'b1;
+		if ((e_st == E_SP_W || e_st == E_SP_2) && dw && dw_set == st_set) sp_dw <= 1'b1;
 
 		if (kill_now) begin
 			// a kill comes with the WB uop leaving (or WB empty): every
