@@ -919,11 +919,21 @@ always_ff @(posedge clk) begin
 		E_SP_3: begin
 			logic [2:0] n0;
 			n0 = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
-			if (!e_kill && !hz && !st_line(m3, e_x.pa[31:4]) && !st_line(m4, e_x.pa[31:4]) &&
+			if (!e_kill && m2.sfast && m2.r.mem == M_ST && e_x.ok && !e_x.flt && !e_x.walk &&
+			    e_x.hit && e_x.cm == 2'b01) begin
+				// a copyback store across a line: both parts hit, nothing
+				// to read; WB writes them
+				m2.x1 <= e_x;
+				e_st  <= E_S_DONE;
+			end
+			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && e_x.ok && !e_x.flt && !e_x.walk &&
+			    e_x.hit && !e_x.cm[1] &&
+			    !hz && !st_line(m3, e_x.pa[31:4]) && !st_line(m4, e_x.pa[31:4]) &&
 			    !sp_dw && !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
 				// the first part from DC2's copy, the rest from the stolen read
 				e_acc <= (take(dq_r[m2.x.way], m2.r.a[3:0], n0) << (8 * (nbytes(m2.r.msz) - n0))) |
 				         take(dq_rn[e_x.way], 4'd0, nbytes(m2.r.msz) - n0);
+				m2.x1 <= e_x;
 				e_st  <= E_S_DONE;
 			end
 			else begin
@@ -937,27 +947,11 @@ always_ff @(posedge clk) begin
 			xres_t x;
 			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
 			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m2.r.a[9:4] + 6'd1]);
-			if (!e_kill && m2.sfast && m2.r.mem == M_ST && x.ok && !x.flt && !x.walk &&
-			    x.hit && x.cm == 2'b01) begin
-				// a copyback store across a line: both parts hit, nothing
-				// to read; WB writes them
-				m2.x1  <= x;
-				e_st   <= E_S_DONE;
-			end
-			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && x.ok && !x.flt && !x.walk &&
-			    x.hit && !x.cm[1]) begin
-				// both parts hit: the data next cycle (the RAM holds the
-				// stolen set), from the translation registered here
-				e_x    <= x;
-				m2.x1  <= x;
-				e_st   <= E_SP_3;
-			end
-			else begin
-				// anything else: the general path, from its start
-				steal  <= 1'b0;
-				sp_job <= 1'b0;
-				e_st  <= m2.x.ok ? E_S_ACT : E_S_XL;
-			end
+			// the second part's translation and lookup, registered (the
+			// decision and the data next cycle; the RAM keeps reading the
+			// stolen set)
+			e_x  <= x;
+			e_st <= E_SP_3;
 		end
 		E_S_XL: begin
 			// look the current part up (translation and tags) via the
