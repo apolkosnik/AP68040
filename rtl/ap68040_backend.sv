@@ -997,8 +997,9 @@ always_comb begin
 	if (ex_u.br == BR_EA)
 		ex_odd_pc = ex_u.pc + (((ex_u.imm_b[5:3] == 3'd6) ||
 		                        (ex_u.imm_b[5:0] == 6'o73)) ? 32'd6 : 32'd2);
-	else if (ex_u.br == BR_B && ex_u.op == OP_MOV)
-		ex_odd_pc = ex_otgt;
+	else if ((ex_u.br == BR_B && ex_u.op == OP_MOV) ||
+	         (ex_u.br == BR_IMM && ex_u.op == OP_MOV && ex_u.imm_b[15:6] == 10'b0100_1110_10))
+		ex_odd_pc = ex_otgt;                 // JSR (JSR_K: the opword in B)
 	else if (ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF)
 		ex_odd_pc = ex_ea - vbr_r;
 end

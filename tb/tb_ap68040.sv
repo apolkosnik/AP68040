@@ -322,6 +322,9 @@ always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_wb && dut.be.wb_u.la
 	pc_last <= cycles;
 end
 int   pc_mp  [int unsigned];
+int   pc_uo  [int unsigned];
+always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_wb)
+	pc_uo[dut.be.wb_u.pc] += 1;
 always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_ex && dut.be.ex_mispred)
 	pc_mp[dut.be.ex_u.pc] += 1;
 // AG interlock cycles by the youngest producer: stage (1 DC1, 2 DC2, 3 EX),
@@ -350,6 +353,7 @@ task automatic pcprof_dump();
 	foreach (il_k[a]) $display("ILK %0d %0d", a, il_k[a]);
 	foreach (pc_cyc[a]) $display("PCPROF %08x %0d %0d", a, pc_n[a], pc_cyc[a]);
 	foreach (pc_mp[a]) $display("PCMISP %08x %0d", a, pc_mp[a]);
+	foreach (pc_uo[a]) $display("PCUOPS %08x %0d", a, pc_uo[a]);
 endtask
 task automatic prof_report();
 	int tot;

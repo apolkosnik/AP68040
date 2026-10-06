@@ -481,6 +481,8 @@ always_comb begin
 		         (nrec.ea0.m == EM_ABSW || nrec.ea0.m == EM_ABSL || nrec.ea0.m == EM_PC16)) begin
 			ntarget = nrec.ea0.bd;
 			nredir  = 1'b1;
+			// the target is known: JSR is a single push (as BSR)
+			if (a0.rt == UA_JSR && nrec.exc == 8'd0) nrec.rt = UA_JSR_K;
 		end
 		else if (a0.rt == UA_RTS && ras_n != 4'd0) begin
 			ntarget = ras[ras_tp];
@@ -546,7 +548,7 @@ always_comb begin
 	nrec_q.ras.tp = ras_tp;
 	nrec_q.ras.n  = ras_n;
 	nrec_q.ras.k  = (nrec.exc != 8'd0) ? 2'd0 :
-	                (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
+	                (nrec.rt == UA_BSR || nrec.rt == UA_JSR || nrec.rt == UA_JSR_K) ? 2'd1 :
 	                (nrec.rt == UA_RTS && ras_n != 4'd0) ? 2'd2 : 2'd0;
 	if (go && (bt_restart || part_bt)) begin
 		nrec_q.exc  = EXC_SNR;
@@ -558,7 +560,7 @@ end
 wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
 wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.exc == 8'd0);
 // the entry's kind: a call pushes the fetch's return stack, a return pops it
-wire  [1:0] btb_kind = (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
+wire  [1:0] btb_kind = (nrec.rt == UA_BSR || nrec.rt == UA_JSR || nrec.rt == UA_JSR_K) ? 2'd1 :
                        (nrec.rt == UA_RTS) ? 2'd2 : 2'd0;
 always_comb begin
 	for (int i = 0; i < 8; i++) ras_o[i] = ras[i][31:1];
@@ -623,7 +625,7 @@ always_ff @(posedge clk) begin
 
 		// the return stack follows the records in program order
 		if (push && nrec_q.exc == 8'd0) begin
-			if (nrec.rt == UA_BSR || nrec.rt == UA_JSR) begin
+			if (nrec.rt == UA_BSR || nrec.rt == UA_JSR || nrec.rt == UA_JSR_K) begin
 				ras[ras_tp + 3'd1] <= nrec.npc;
 				ras_tp <= ras_tp + 3'd1;
 				if (ras_n != 4'd8) ras_n <= ras_n + 4'd1;

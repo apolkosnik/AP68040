@@ -280,6 +280,10 @@ R('DBCC',   U(op='DBCC', cond='CC', b='DY', d='DY', br='COND', last=1))
 R('JMP',    U(ag='LEA0', b='OPW', br='EA', last=1))   # OPW: the odd-target frame PC
 R('JSR',    U(ag='LEA0', agw='T0'),
             U(op='MOV', sz='L', a='NPC', b='T0', ag='PUSH', msz='L', mem='ST', br='B', last=1))
+# JSR to an absolute or PC-relative address: D1 computed the target (the
+# record's), so one uop as for BSR; OPW tells EX it is a JSR (the odd-target
+# frame PC is the target)
+R('JSR_K',  U(op='MOV', sz='L', a='NPC', b='OPW', ag='PUSH', msz='L', mem='ST', br='IMM', last=1))
 R('RTS',    U(op='MOV', sz='L', a='LD', ag='POP', msz='L', mem='LD', br='A', last=1))
 R('RTD',    U(op='MOV', sz='L', a='LD', ag='BASED', agb='SP', msz='L', mem='LD', d='T0'),
             U(ag='ADDC', agb='SP', agw='SP', dsel='IMMC', const=4, a='T0', br='A', last=1))
@@ -844,7 +848,7 @@ def emit():
         for n in ['EXC_FMT0', 'EXC_FMT2', 'EXC_FMT7', 'EXC_RESET', 'EXC_IRQ', 'EXC_IRQM',
                   'DEC_EXC', 'BCC', 'BSR', 'DBCC', 'FBCC', 'FDBCC', 'FPU_GEN',
                   'TRAP', 'BKPT', 'ILLEGAL', 'MOVEM_RM', 'MOVEM_MR',
-                  'MOVEC_RD', 'MOVEC_WR', 'JSR', 'JMP', 'RTS']:
+                  'MOVEC_RD', 'MOVEC_WR', 'JSR', 'JSR_K', 'JMP', 'RTS']:
             f.write('localparam logic [9:0] UA_%s = 10\'d%d;\n' % (n, ENTRY[n]))
         f.write('endpackage\n')
 
