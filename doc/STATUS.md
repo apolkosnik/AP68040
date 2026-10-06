@@ -12,7 +12,7 @@
 | M5 | MMU: ATCs, table walk, TTRs, PTEST/PFLUSH (t_mmu, t_atcprobe) | done |
 | M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
 | M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
-| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), seeds 1, 2 and 3 all meet setup and hold in all four corners (worst setup slack +0.136, +0.300, +0.137 ns at 16.667 ns); 26,364 ALMs, 16,526 registers (seed 1) |
+| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths).  e8e333b: seeds 1, 4 and 5 meet setup and hold in all four corners (worst setup slack +0.370, +0.421, +0.323 ns at 16.667 ns; 27,142 ALMs with seed 1); seeds 2 and 3 miss by 0.47 and 0.15 ns on the FPU rounding path and EX's slow-op result.  938bccc (before the CLR change): seeds 1-3 all closed |
 | M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.50, about 35.0 DMIPS at 60 MHz |
 | M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
 
@@ -67,7 +67,10 @@ record enters the FIFO (off the return stack path), and the ALU's taken
 kept off EX's operand forwarding.  Then, for the fast split accesses: the
 split lookup only registers its translation (the decision and the data a
 cycle later), and the BHT is written from registers of its own (a hold
-violation on the training copy's address).
+violation on the training copy's address).  The seeds that miss now fail on
+paths no recent change touched (the FPU's rounding increment and range
+check into a_m; EX's operand select into the slow-op result register):
+those are the next to shorten if a build's seed does not close.
 
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
