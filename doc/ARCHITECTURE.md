@@ -167,10 +167,20 @@ over three cycles before the routine starts.
   copyback, write-through, cache-inhibited serialized and nonserialized.
 * The fast path: a load that hits, within one line, answers from DC2's copy;
   a copyback store that hits writes the RAM in its WB cycle.
+* An operand across a line whose first part hits: one stolen lookup of the
+  next set gives the second part's translation, tags and data (E_SP_W,
+  E_SP_2, E_SP_3); a load takes its first part from DC2's copy, a copyback
+  store needs no data, and at WB writes its two parts in consecutive
+  cycles without the engine (if a snoop took the second line in between,
+  the engine writes the second part).  A miss, a walk, a fault, a pending
+  store to either line or a write to either set while the lookup is in
+  flight sends it to the general path.  Cycles a copyback access (user
+  mode, tb/asm/bench_mis.s): aligned 1.2, misaligned within a line 1.4,
+  across a line 8.3 (load) and 8.5 (store).
 * The engine runs everything else, one job at a time: misses (line fill,
   critical word first; a dirty victim goes to the push buffer and is pushed
   after the fill), copyback write-allocate, cache-inhibited accesses (a
-  matching line is pushed and invalidated first), operands crossing a line,
+  matching line is pushed and invalidated first), the other operands crossing a line,
   write-through and locked stores, MOVE16, CINV/CPUSH (line, page, all),
   PFLUSH/PTEST, and table walks for both ATCs.
 * Table walks (MC68040UM 3.2): root, pointer and page descriptors,
