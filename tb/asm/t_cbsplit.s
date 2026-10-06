@@ -18,6 +18,15 @@
 ;        included
 ;   11-13 write-through: after a read pass allocates the lines, long, word
 ;        and byte reads at every offset hit (no bus read in the window)
+;   18-19 a store into a line, then at once a load across into it from the
+;        line before (and a store into the first line, then a load across
+;        out of it), for every store offset in the second line's first long
+;        word and every load size: the load must see the store
+;   20-27 the same races in user mode with plain MOVE (MOVES serializes,
+;        so above the store has completed before the load starts): a store
+;        then, after 0..3 other instructions, a load across a line, for
+;        stores into either line, of every size, and across the line
+;        itself; failures and the end come back through TRAP #0 / #1
 ;   14-17 the MMU on: two logical pages mapped copyback by their page
 ;        descriptors to $B000 and $C000; 32 bytes around the page boundary
 ;        written, then read as longs and words at every offset (across the
@@ -41,6 +50,26 @@ LA	equ	$01050FF0	; root 0, pointer $41, pages $10 and $11
 PB	equ	$BFF0		; its physical address (page $10 -> $B000,
 				; page $11 -> $C000)
 
+; ucase <fillers>,<store op>,<value>,<store offset>,<load op>,<load
+; offset>,<expected>,<test>: bytes 12..19 set to $4C..$53, the store, the
+; fillers, the load (user mode)
+ucase	macro
+	move.l	#$4C4D4E4F,12(a0)
+	move.l	#$50515253,16(a0)
+	move.l	#\3,d3
+	\2	d3,\4(a0)
+	rept	\1
+	moveq	#0,d6
+	endr
+	moveq	#0,d1
+	\5	\6(a0),d1
+	cmp.l	#\7,d1
+	beq.s	.ok\@
+	move.w	#\8,d7
+	trap	#0
+.ok\@:
+	endm
+
 failt	macro
 	move.w	#\1,d7
 	bra	fail_all
@@ -56,7 +85,12 @@ chkl	macro
 	org	0
 	dc.l	$3400
 	dc.l	start
-	rept	254
+	rept	30
+	dc.l	unexp
+	endr
+	dc.l	h_trap0			; 32: TRAP #0, a user-mode failure (d7)
+	dc.l	h_trap1			; 33: TRAP #1, back to supervisor
+	rept	222
 	dc.l	unexp
 	endr
 
@@ -224,6 +258,101 @@ start:
 	move.l	(WWR).l,d1
 	chkl	d1,0,13
 
+;------------------------------- 18-19 a store, then a load across it
+; copyback again; d4 counts passes, d5 the stored value
+	cinva	dc
+	move.l	#$00008020,d0		; DTT0: user data copyback
+	movec	d0,dtt0
+	moveq	#0,d0
+.h0:	bsr	exp_l
+	moves.l	d2,(a0,d0.w)
+	addq.w	#4,d0
+	cmp.w	#64,d0
+	bne.s	.h0
+	move.l	#$11223344,d5
+	moveq	#3,d4
+.h1:	; long at 16 (line 1), long load at 13..15 (lines 0 and 1)
+	move.l	#$4C4D4E4F,d1		; bytes 12..15 as the pattern
+	moves.l	d1,12(a0)
+	moves.l	d5,16(a0)
+	moves.l	14(a0),d1
+	move.l	d5,d2
+	swap	d2
+	and.l	#$FFFF,d2
+	or.l	#$4E4F0000,d2		; bytes 14, 15 never stored
+	cmp.l	d2,d1
+	beq.s	.h2
+	failt	18
+.h2:	addq.l	#1,d5
+	moves.l	d5,16(a0)
+	moves.l	13(a0),d1
+	move.l	d5,d2
+	rol.l	#8,d2
+	and.l	#$FF,d2
+	or.l	#$4D4E4F00,d2
+	cmp.l	d2,d1
+	beq.s	.h3
+	failt	18
+.h3:	addq.l	#1,d5
+	moves.l	d5,16(a0)
+	moveq	#0,d1
+	moves.w	15(a0),d1
+	move.l	d5,d2
+	rol.l	#8,d2
+	and.l	#$FF,d2
+	or.l	#$4F00,d2
+	cmp.l	d2,d1
+	beq.s	.h4
+	failt	18
+.h4:	; long at 12 (line 0), long load at 14 (lines 0 and 1)
+	addq.l	#1,d5
+	moves.l	d5,12(a0)
+	moves.l	14(a0),d1
+	move.l	d5,d2
+	swap	d2
+	clr.w	d2			; bytes 14, 15 from the store
+	moves.l	16(a0),d3
+	swap	d3
+	move.w	d3,d2			; bytes 16, 17 as they are
+	cmp.l	d2,d1
+	beq.s	.h5
+	failt	19
+.h5:	add.l	#$01010101,d5
+	dbra	d4,.h1
+
+;------------------------------- 20-27 user mode, plain MOVE
+	lea	(ucont).l,a1
+	move.l	a1,(ucont_v).l
+	lea	($3000).l,a1
+	move	a1,usp
+	move.w	#$0000,sr		; user mode, interrupts open (none come)
+	moveq	#0,d6
+	moveq	#1,d4			; twice: the second pass from the I-cache
+uloop:
+	ucase	0,move.l,$A1A2A3A4,16,move.l,14,$4E4FA1A2,20
+	ucase	1,move.l,$A1A2A3A4,16,move.l,14,$4E4FA1A2,20
+	ucase	2,move.l,$A1A2A3A4,16,move.l,14,$4E4FA1A2,20
+	ucase	3,move.l,$A1A2A3A4,16,move.l,14,$4E4FA1A2,20
+	ucase	0,move.l,$A1A2A3A4,16,move.l,13,$4D4E4FA1,21
+	ucase	1,move.l,$A1A2A3A4,16,move.l,13,$4D4E4FA1,21
+	ucase	0,move.l,$A1A2A3A4,16,move.w,15,$4FA1,22
+	ucase	1,move.l,$A1A2A3A4,16,move.w,15,$4FA1,22
+	ucase	0,move.l,$A1A2A3A4,12,move.l,14,$A3A45051,23
+	ucase	1,move.l,$A1A2A3A4,12,move.l,14,$A3A45051,23
+	ucase	2,move.l,$A1A2A3A4,12,move.l,14,$A3A45051,23
+	ucase	0,move.w,$B1B2,16,move.l,14,$4E4FB1B2,24
+	ucase	1,move.w,$B1B2,16,move.l,14,$4E4FB1B2,24
+	ucase	0,move.b,$C1,17,move.l,15,$4F50C152,25
+	ucase	1,move.b,$C1,17,move.l,15,$4F50C152,25
+	ucase	0,move.l,$A1A2A3A4,14,move.l,15,$A2A3A452,26
+	ucase	1,move.l,$A1A2A3A4,14,move.l,15,$A2A3A452,26
+	ucase	2,move.l,$A1A2A3A4,14,move.l,15,$A2A3A452,26
+	ucase	0,move.l,$A1A2A3A4,18,move.l,15,$4F5051A1,27
+	ucase	1,move.l,$A1A2A3A4,18,move.l,15,$4F5051A1,27
+	dbra	d4,uloop
+	trap	#1
+ucont:
+
 ;------------------------------------- 14-17 page-crossing, the MMU on
 	cinva	dc
 	moveq	#0,d0
@@ -355,3 +484,11 @@ fail_all:
 
 unexp:
 	failt	99
+
+h_trap0:
+	bra	fail_all		; d7: the failing test
+h_trap1:
+	addq.l	#8,sp			; drop the frame (format $0), supervisor
+	move.l	(ucont_v).l,-(sp)
+	rts
+ucont_v	equ	$3610
