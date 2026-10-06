@@ -321,11 +321,20 @@ reg signed [17:0] e_w;        // working exponent (wrap safe)
 // normalization so source, restored destination and add/subtract result
 // share one leading-zero encoder and one 67-bit left shifter. Operand
 // normalization supplies zero GRS; result normalization preserves it.
-wire [63:0] norm_m = (fst == F_RESTORE_N) ? b_m :
-                     (fst == F_NORM2) ? acc_hi[63:0] : a_m;
+// The select is registered with the state (nsel[0]: F_RESTORE_N, nsel[1]:
+// F_NORM2, each entered from one place), so the encoder and shifter start
+// from flip-flops rather than from a decode of fst.
+reg  [1:0] nsel;
+wire [63:0] norm_m = nsel[0] ? b_m :
+                     nsel[1] ? acc_hi[63:0] : a_m;
 wire [6:0] norm_lz = clz64(norm_m);
 wire [66:0] norm_shifted =
-    {norm_m, ((fst == F_NORM2) ? grs : 3'd0)} << norm_lz;
+    {norm_m, (nsel[1] ? grs : 3'd0)} << norm_lz;
+// synthesis translate_off
+always @(posedge clk)
+	if (nsel != {fst == F_NORM2, fst == F_RESTORE_N})
+		$display("FPU: nsel %b disagrees with state %0d", nsel, fst);
+// synthesis translate_on
 
 // integer store bookkeeping
 reg        pk_neg;
@@ -656,6 +665,7 @@ always @(posedge clk) begin
 		grs <= 0; eff_sub <= 0; acc_hi <= 0; acc_lo <= 0;
 		qv <= 0; srem <= 0; srad <= 0; loop_n <= 0; op_kind <= 0;
 		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0;
+		nsel <= 2'd0;
 		// Invalid entries read as the default positive nonsignaling NaN.
 		fr_valid <= 0;
 	end
@@ -801,6 +811,7 @@ always @(posedge clk) begin
 			             op_in_hw(fr_cmd_op);
 		end
 
+		nsel <= 2'd0;
 		case (fst)
 			F_IDLE: if (frestore_unimp && frestore_resume) begin
 				// The frame, not the current register bank, supplies BOTH operands.
@@ -1317,6 +1328,7 @@ always @(posedge clk) begin
 				sh_dst <= {b_s, b_e[14:0], 16'd0, sh_v[66:3]};
 				sh_dtag <= frame_tag_x(b_e[14:0], sh_v[66:3]);
 				fst <= F_RESTORE_N;
+				nsel <= 2'b01;
 			end
 
 			F_RESTORE_N: begin
@@ -1721,6 +1733,7 @@ always @(posedge clk) begin
 						acc_hi <= {1'b0, diff[66:3]};
 						grs <= diff[2:0];
 						fst <= F_NORM2;
+						nsel <= 2'b10;
 					end
 				end
 			end
