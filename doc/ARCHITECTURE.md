@@ -232,6 +232,16 @@ take two bits per clock.  Unimplemented instructions and data types trap
 with the frames an FPSP expects; `FPU_REVISION` selects the FSAVE frame
 revision ($41 or $40).
 
+An FPm-to-FPn operation is one uop (FPU_RRF: CHK and DISP fused); others
+are CHK then DISP, DISP allowed to act behind its own CHK at WB.  The next
+FPU instruction is released in the cycle the previous one writes back
+without an enabled exception.  Inside the FPU a binary operation on a
+non-NaN source goes from dispatch straight to F_BIN; the alignment shift
+takes one cycle.  An FADD or FMUL takes 6 cycles back to back
+(tb/asm/bench_fpu.s): dispatch, F_BIN, F_SHR, F_ADDX (or the multiply),
+F_ROUND, F_WB -- each of the last four is near the clock period, so going
+further needs a pipelined adder and multiplier.
+
 ## Pins beyond the bus
 
 * IPEND: a request exceeds the mask (on bus clock edges).
