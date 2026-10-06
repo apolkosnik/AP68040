@@ -19,7 +19,7 @@
 ## Regression
 
 ```
-tb/run_tests.sh                 # the nineteen programs, five bus configurations each
+tb/run_tests.sh                 # the twenty programs, five bus configurations each
 tb/build_cputest.sh             # the corpus replay bench
 tb/run_cputest.py ~/Downloads/data040.zip                    # smoke slices
 tb/run_cputest.py ~/Downloads/data040.zip --full --group AE  # a group, every slice
@@ -31,7 +31,12 @@ retries, BCLK at half PCLK, and all of those together.
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
 t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress,
-t_eredir.
+t_eredir, t_cbsplit.
+
+The bench counts the CPU's bus transfers in a window ($F2D0-$F2DC);
+t_cbsplit uses it to show that misaligned and line- or page-crossing
+reads in copyback and write-through mode are served by the data cache
+(no bus read), and that copyback stores reach the bus only when pushed.
 
 Performance: `tb/build_c.sh dhry` (vbcc; `ASFLAGS=-DCOPYBACK=1` runs it in
 user mode with copyback caches), then `obj/obj_prog/tb_ap68040

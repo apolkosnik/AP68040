@@ -36,6 +36,9 @@
 //               line, shows whether the write reached the bus first)      //
 //   $F2B0 long  (read) counts its own bus reads into $F2B4              //
 //   $F2C0 word  bit 0 asserts CDIS, bit 1 MDIS                            //
+//   $F2D0 long  watch window start, $F2D4 its end (exclusive): the CPU's   //
+//               data reads in it are counted into $F2D8, its writes      //
+//               (pushes included) into $F2DC (bus beats; write 0 clears)  //
 //   $F2C4 word  random snoop traffic from the alternate master: bit 15    //
 //               on, bits 7:0 bus clocks between transfers (see t_snstress)//
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
@@ -636,6 +639,11 @@ always_ff @(posedge clk) begin
 		if (ev && ev_rd && !ev_err && ev_tt == 2'd0 && !am_drive &&
 		    ev_addr[15:0] == 16'hF2B0)
 			mem.mem[16'hF2B4 >> 2] <= mem.mem[16'hF2B4 >> 2] + 32'd1;
+		if (ev && !ev_err && ev_tt == 2'd0 && !am_drive && (ev_tm == 3'd0 || ev_tm == 3'd1 || ev_tm == 3'd5) &&
+		    ev_addr >= mem.mem[16'hF2D0 >> 2] && ev_addr < mem.mem[16'hF2D4 >> 2]) begin
+			if (ev_rd) mem.mem[16'hF2D8 >> 2] <= mem.mem[16'hF2D8 >> 2] + 32'd1;
+			else       mem.mem[16'hF2DC >> 2] <= mem.mem[16'hF2DC >> 2] + 32'd1;
+		end
 		if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && !am_drive &&
 		    ev_addr[15:0] == 16'hF294 && ev_be == 4'b1111)
 			mem.mem[16'hF2A8 >> 2] <= ev_data;
