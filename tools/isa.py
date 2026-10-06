@@ -131,7 +131,7 @@ add('0010 ...0 01.. ....', 'MOVEA', 'MOVEA', 'L', ea0=ALL)
 # ---------------------------------------------------------------- line 4
 for z in ('00', '01', '10'):
     add('0100 0000 %s.. ....' % z, 'NEGX', 'UNARY', 'z', ea0=DALT)
-    add('0100 0010 %s.. ....' % z, 'CLR',  'UNARY', 'z', ea0=DALT)
+    add('0100 0010 %s.. ....' % z, 'CLR',  'CLR_W', 'z', ea0=DALT)
     add('0100 0100 %s.. ....' % z, 'NEG',  'UNARY', 'z', ea0=DALT)
     add('0100 0110 %s.. ....' % z, 'NOT',  'UNARY', 'z', ea0=DALT)
     add('0100 1010 %s.. ....' % z, 'TST',  'TST',   'z', ea0=ALL - ({'An'} if z == '00' else set()))

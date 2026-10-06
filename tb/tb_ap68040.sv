@@ -755,6 +755,16 @@ always_ff @(posedge clk)
 		         dut.be.ag_hold, dut.dm_hold1, dut.be.dc2_hold, dut.be.ex_hold, dut.be.wb_hold,
 		         dut.redir_v ? "REDIR " : "", dut.d_redir_v ? "DREDIR" : "");
 
+// +fptrace=<from>: the FPU state each cycle for 300 cycles
+int fpt_from;
+initial if (!$value$plusargs("fptrace=%d", fpt_from)) fpt_from = -1;
+always_ff @(posedge clk)
+	if (fpt_from >= 0 && cycles >= fpt_from && cycles < fpt_from + 300)
+		$display("%8d FPU fst=%0d sh_cnt=%0d | EX %s op=%0d hold=%b",
+		         cycles, dut.be.fpif.fpu.fst, dut.be.fpif.fpu.sh_cnt,
+		         dut.be.ex_v ? $sformatf("%04x", dut.be.ex_u.pc[15:0]) : "----",
+		         dut.be.ex_u.op, dut.be.ex_hold);
+
 // exception entries
 always_ff @(posedge clk)
 	if (trace && dut.be.x_go)

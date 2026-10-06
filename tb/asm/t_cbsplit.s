@@ -34,6 +34,8 @@
 ;        line is invalidated) 0..7 bus clocks apart, 250 stores each;
 ;        every value reads back, and with BCLK at half PCLK the bench saw
 ;        the DMU's fallback (the second part by the engine)
+;   30   CLR (long, word, byte), ST and MOVE from SR to noncachable memory
+;        write without reading it (68020 and later): five writes, no read
 ;   14-17 the MMU on: two logical pages mapped copyback by their page
 ;        descriptors to $B000 and $C000; 32 bytes around the page boundary
 ;        written, then read as longs and words at every offset (across the
@@ -398,6 +400,21 @@ ucont:
 	bne.s	.s5			; after the fill, too late)
 	failt	29
 .s5:
+
+;----------------------------- 30 write-only operations do not read
+	bsr	arm			; supervisor data: noncachable (DTT1)
+	clr.l	(BUF).l
+	clr.w	(BUF+4).l
+	clr.b	(BUF+6).l
+	st	(BUF+7).l
+	move.w	sr,(BUF+8).l
+	nop
+	move.l	(WRD).l,d1
+	chkl	d1,0,30
+	move.l	(WWR).l,d1
+	chkl	d1,5,30
+	clr.l	(WLO).l
+	clr.l	(WHI).l
 
 ;------------------------------------- 14-17 page-crossing, the MMU on
 	cinva	dc

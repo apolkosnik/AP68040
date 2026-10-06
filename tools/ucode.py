@@ -161,6 +161,9 @@ R('MOVEQ',     U(op='MOV', sz='L', a='MOVEQ', d='DX', ccr='NZVC', last=1))
 R('UNARY',     U(op='EOP', b='EA0', d='EA0', ccr='CCR', last=1))
 R('TST',       U(op='MOV', a='EA0', ccr='NZVC', last=1))
 R('SCC',       U(op='SCC', cond='CC', b='EA0R', d='EA0', last=1))
+# CLR writes without reading (68020 and later; only the 68000 read first):
+# a register destination keeps its upper bytes, memory gets a store
+R('CLR_W',     U(op='EOP', b='EA0R', d='EA0', ccr='CCR', last=1))
 R('SWAP',      U(op='SWAP', b='DY', d='DY', ccr='NZVC', last=1))
 R('EXT',       U(op='EXT', b='DY', d='DY', ccr='NZVC', last=1))
 R('EXTB',      U(op='EXTB', b='DY', d='DY', ccr='NZVC', last=1))
