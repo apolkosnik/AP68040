@@ -50,6 +50,7 @@ module ap040_fpu
 	// The core uses this to run register-destination arithmetic in the
 	// background while integer execution continues.
 	output            accepted,
+	output            wb_ok,       // F_WB this cycle, no enabled exception
 	output reg        unimp,       // unimplemented instruction -> vector 11
 	output reg        unsupp,      // unsupported data type -> vector 55
 	output reg        exc_req,       // enabled arithmetic exception
@@ -180,6 +181,21 @@ localparam T_INF  = 2'd2;
 localparam T_NAN  = 2'd3;
 
 // {s, e[16:0], m[63:0], t[1:0]} = 84 bits
+// the opmodes F_EXEC sends to F_BIN (its ex_bin), and their op_kind
+function bin_op;
+	input [6:0] op;
+	case (op)
+		7'h22, 7'h62, 7'h66, 7'h28, 7'h68, 7'h6C, 7'h23, 7'h63, 7'h67, 7'h27,
+		7'h20, 7'h60, 7'h64, 7'h24: bin_op = 1'b1;
+		default: bin_op = 1'b0;
+	endcase
+endfunction
+function [3:0] bin_kind;
+	input [6:0] op;
+	bin_kind = (op == 7'h23 || op == 7'h27 || op == 7'h63 || op == 7'h67) ? 4'd2 :
+	           (op == 7'h20 || op == 7'h24 || op == 7'h60 || op == 7'h64) ? 4'd3 : 4'd1;
+endfunction
+
 function [83:0] unpack_x;
 	input        s;
 	input [14:0] e;
@@ -278,6 +294,7 @@ reg  [4:0] fst;
 // on nothing but done or an enabled-exception exc_req can follow.
 // (the alignment shift of an add runs after every datatype check: the
 // operation is accepted as it starts)
+assign wb_ok = (fst == F_WB) && !(|(fpsr[15:8] & fpcr[15:8]));
 assign accepted = (fst == F_ADDX) || (fst == F_MULT) ||
                   (fst == F_SHR && sh_ret == F_ADDX) ||
                   (fst == F_DIVL) || (fst == F_SQRTL) ||
@@ -963,10 +980,20 @@ always @(posedge clk) begin
 						    frame_tag_x(fr_dst_e, fr_dst_m),
 						    1'b0, 1'b0);
 					end
-					else begin
-					{a_s, a_e, a_m, a_t} <=
-						unpack_x(fr_src_s, fr_src_e, fr_src_m);
-					fst <= F_EXEC;
+					else begin : disp_rr
+					reg [83:0] ua;
+					ua = unpack_x(fr_src_s, fr_src_e, fr_src_m);
+					{a_s, a_e, a_m, a_t} <= ua;
+					// a binary operation on a non-NaN source needs nothing
+					// from F_EXEC but its bookkeeping (no SNaN to quiet, no
+					// sign to change): straight to F_BIN
+					if (bin_op(opmode) && ua[1:0] != T_NAN) begin
+						op_kind <= bin_kind(opmode);
+						grs <= 3'd0;
+						e_w <= $signed({ua[82], ua[82:66]});
+						fst <= F_BIN;
+					end
+					else fst <= F_EXEC;
 					end
 				end
 				else begin

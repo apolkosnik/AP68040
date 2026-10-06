@@ -188,7 +188,11 @@ logic  [6:0] f_opm;
 logic [95:0] f_din, f_fmwd;
 logic  [1:0] f_crsel;
 logic [31:0] f_crwd, f_iapc;
-logic        f_done, f_accepted, f_unimp, f_unsupp, f_excreq, f_used;
+logic        f_done, f_accepted, f_unimp, f_unsupp, f_excreq, f_used, f_wbok;
+// the released operation ends cleanly: done, or its F_WB without an
+// enabled exception (a cycle sooner)
+wire         f_end = (f_done || f_wbok) && !f_excreq;
+logic        fresh;            // a fused CHK's request went out last cycle
 logic  [7:0] f_excvec, f_curvec;
 logic [95:0] f_dout, f_fmrd;
 logic  [3:0] f_cc;
@@ -208,7 +212,7 @@ logic        r_et15, r_fpt15, r_wbte15, r_busy;
 
 ap040_fpu fpu (
 	.clk(clk), .nreset(nreset), .ce(1'b1),
-	.req(f_req), .op_class(f_class), .opmode(f_opm),
+	.req(f_req), .op_class(f_class), .opmode(f_opm), .wb_ok(f_wbok),
 	.src_fmt(f_fmt), .src_r(f_srcr), .dst_r(f_dstr),
 	.din(f_din), .done(f_done), .accepted(f_accepted),
 	.unimp(f_unimp), .unsupp(f_unsupp),
@@ -440,7 +444,8 @@ always_comb begin
 				// the released operation completing this cycle without an
 				// exception lets CHK go (one that raises one makes it pending
 				// at this edge: CHK waits and delivers it)
-				if (fuse && go) begin
+				if (fuse && go && fresh) hold = 1'b1;   // the FPU sees it now
+				else if (fuse && go) begin
 					// dispatched (below): DISP's outcome
 					if (f_unimp) begin
 						xvec = VEC_FLINE; xfmt = 4'd2; xnext = 1'b1;
@@ -453,7 +458,7 @@ always_comb begin
 					else if (f_excreq) begin xvec = f_excvec; xnext = 1'b1; end
 					else if (!(f_accepted || f_done)) hold = 1'b1;
 				end
-				else if (bg && !(f_done && !f_excreq)) hold = 1'b1;
+				else if (bg && !f_end) hold = 1'b1;
 				else if (chk_pend) begin
 					xvec = pend_vec;
 				end
@@ -561,7 +566,7 @@ wire act = ex_v && safe;
 always_ff @(posedge clk) begin
 	if (!nreset) begin
 		opw_q <= '0; ext_q <= '0;
-		bg <= 1'b0; pend <= 1'b0; pend_vec <= '0;
+		bg <= 1'b0; pend <= 1'b0; pend_vec <= '0; fresh <= 1'b0;
 		go <= 1'b0; done_q <= 1'b0; eaa <= '0; eav <= 1'b0;
 		sx_v <= 1'b0; sx_vec <= '0; sx_fmt <= '0; sx_addr <= '0; sx_kill <= 1'b0;
 		list <= '0; mv_lsb <= 1'b0; mv_rev <= 1'b0; mv_st <= 1'b0; mv_m1 <= 1'b0;
@@ -579,6 +584,7 @@ always_ff @(posedge clk) begin
 		f_req <= 1'b0; f_crwe <= 1'b0; f_iawe <= 1'b0; f_bsun <= 1'b0; f_fmwe <= 1'b0;
 		f_rst <= 1'b0; f_fsave_ack <= 1'b0; f_rest_idle <= 1'b0; f_rest_unimp <= 1'b0;
 		f_pendcap <= 1'b0;
+		fresh     <= 1'b0;
 
 		// a released operation: completion, or its enabled exception
 		// pending for the next FPU instruction (the FPU prepares the frame)
@@ -591,7 +597,7 @@ always_ff @(posedge clk) begin
 		end
 
 		if (act) case (sub)
-			FC_CHK: if (fuse && !go && !(bg && !(f_done && !f_excreq)) && !chk_pend && !chk_x) begin
+			FC_CHK: if (fuse && !go && !(bg && !f_end) && !chk_pend && !chk_x) begin
 				// FPm to FPn: CHK's latching and DISP's request at once
 				opw_q   <= opw;
 				ext_q   <= ext;
@@ -609,6 +615,7 @@ always_ff @(posedge clk) begin
 				f_srcr  <= ext[12:10];
 				f_dstr  <= ext[9:7];
 				f_din   <= din_of(fmt, av, bv, latch);
+				fresh   <= 1'b1;
 			end
 			else if (fuse && go) begin
 				if (adv) begin

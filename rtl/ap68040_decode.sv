@@ -274,6 +274,12 @@ logic [31:0] ntarget;
 // ends in btb_we and d_redir_v)
 logic        teq;
 logic        jsr_k;       // a JSR to a known target (see nrec_q)
+// a call (BSR, JSR) or a return (RTS), for the return stacks: from the
+// decoder's entry (the record's routine is past a first jump D1 resolved,
+// which is a longer path), kept from the first part of a multi-part decode
+logic        part_call, part_ret;
+wire         rcall = (ph == PH_IDLE) ? (a0.rt == UA_BSR || a0.rt == UA_JSR) : part_call;
+wire         rret  = (ph == PH_IDLE) ? (a0.rt == UA_RTS) : part_ret;
 wire  [31:0] bt_d2 = bt_tgt - qpc - 32'd2;
 // synthesis translate_off
 always @(posedge clk)
@@ -588,8 +594,8 @@ always_comb begin
 	nrec_q.ras.tp = ras_tp;
 	nrec_q.ras.n  = ras_n;
 	nrec_q.ras.k  = (nrec.exc != 8'd0) ? 2'd0 :
-	                (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
-	                (nrec.rt == UA_RTS && ras_n != 4'd0) ? 2'd2 : 2'd0;
+	                rcall ? 2'd1 :
+	                (rret && ras_n != 4'd0) ? 2'd2 : 2'd0;
 	if (go && (bt_restart || part_bt)) begin
 		nrec_q.exc  = EXC_SNR;
 		nrec_q.rt   = UA_DEC_EXC;
@@ -600,8 +606,7 @@ end
 wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
 wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.exc == 8'd0);
 // the entry's kind: a call pushes the fetch's return stack, a return pops it
-wire  [1:0] btb_kind = (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
-                       (nrec.rt == UA_RTS) ? 2'd2 : 2'd0;
+wire  [1:0] btb_kind = rcall ? 2'd1 : rret ? 2'd2 : 2'd0;
 always_comb begin
 	for (int i = 0; i < 8; i++) ras_o[i] = ras[i][31:1];
 	// a back-end redirect resynchronizes the fetch's stack from the
@@ -640,6 +645,8 @@ always_ff @(posedge clk) begin
 		btb_wkind  <= '0;
 		btb_wtgt   <= '0;
 		part_bt    <= 1'b0;
+		part_call  <= 1'b0;
+		part_ret   <= 1'b0;
 		ras_tp     <= '0;
 		ras_n      <= '0;
 		for (int i = 0; i < 8; i++) ras[i] <= '0;
@@ -665,12 +672,12 @@ always_ff @(posedge clk) begin
 
 		// the return stack follows the records in program order
 		if (push && nrec_q.exc == 8'd0) begin
-			if (nrec.rt == UA_BSR || nrec.rt == UA_JSR) begin
+			if (rcall) begin
 				ras[ras_tp + 3'd1] <= nrec.npc;
 				ras_tp <= ras_tp + 3'd1;
 				if (ras_n != 4'd8) ras_n <= ras_n + 4'd1;
 			end
-			else if (nrec.rt == UA_RTS && ras_n != 4'd0) begin
+			else if (rret && ras_n != 4'd0) begin
 				ras_tp <= ras_tp - 3'd1;
 				ras_n  <= ras_n - 4'd1;
 			end
@@ -704,6 +711,8 @@ always_ff @(posedge clk) begin
 			if (go_part) begin
 				part <= nrec;
 				if (ph == PH_IDLE) begin
+					part_call <= rcall;
+					part_ret  <= rret;
 					part_pd   <= pd0;
 					part_len  <= use_n;
 					part_imml <= (a0.rt == UA_FPU_GEN) ? fp_immlen(win[1]) :
