@@ -450,7 +450,8 @@ always_comb begin
 end
 wire  [4:0] m1_end   = {1'b0, m1.a[3:0]} + {2'b00, nbytes(m1.msz)};
 wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
-wire        m1_sfast = (m1.mem == M_LD) && m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
+wire        m1_sfast = ((m1.mem == M_LD) || (m1.mem == M_ST && x_dc1.cm == 2'b01)) &&
+                       m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
                        !x_dc1.cm[1] && dc_en && !m1.iack && !m1.lock;
 wire        m1_fast  = ((m1.mem == M_LD) || (m1.mem == M_RMW && !m1.lock)) &&
                        x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
@@ -645,17 +646,25 @@ wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
                (e_st == E_IDLE) && !e_wst_done;
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
+// a copyback store across a line, both parts hits: the first part this
+// cycle, the second the next (wfs_p1), without the engine
+logic        wfs_p1;
+wire wb_fs = wb_st && m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && m4.x.cm == 2'b01 &&
+             m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_en &&
+             !m4.r.lock && (m4.r.msz != SZ_Q) && (e_st == E_IDLE) && !e_wst_done && !wfs_p1;
+wire   [2:0] wfs_n0  = 3'(5'd16 - {1'b0, m4.r.a[3:0]});
+wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
 
 // a fast load behind an older store to its line waits for it (merged into
 // its copy) instead of taking the engine
 wire fast_wait = m2.r.v && m2.fast && (hz || (dw && dw_set == m2.r.a[9:4]));
 wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job;
-wire wb_slow  = wb_st && !wb_fast && !e_wst_done;
+wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
 
 // store ready: the fast store answers in its own WB cycle (the engine's
 // stores through the registered pulse)
 logic st_rdy_r, st_fault_r;
-assign st_rdy   = st_rdy_r || (wb_fast && !sn_frz);
+assign st_rdy   = st_rdy_r || (wb_fast && !sn_frz) || (wfs_p1 && m4.x1.hit && !sn_frz);
 assign st_fault = st_rdy_r && st_fault_r;
 
 //--------------------------------------------------------------------------
@@ -728,6 +737,7 @@ always_ff @(posedge clk) begin
 		e_kill <= 1'b0;
 		sp_dw  <= 1'b0;
 		sp_job <= 1'b0;
+		wfs_p1 <= 1'b0;
 		e_job <= 1'b0;
 		m1_stale <= 1'b0;
 		sn_ph <= SN_IDLE; sn_src <= '0; sn_way <= '0; bo_cancel <= 1'b0;
@@ -777,14 +787,17 @@ always_ff @(posedge clk) begin
 			m2.x1    <= '0;
 			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
 			            (e_st == E_IDLE);
-			m2.sfast <= m1_sfast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
-			            (e_st == E_IDLE);
+			// (a store reads nothing: the copy's state does not matter; its
+			// first part's lookup is trusted as the general path does)
+			m2.sfast <= m1_sfast && (m1.mem == M_ST ||
+			            (!m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
+			             (e_st == E_IDLE)));
 		end
 		else begin
 			if (adv_dc2) m2.r.v <= 1'b0;
 			if ((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || (e_st != E_IDLE)) m2.fast <= 1'b0;
 			// its own split lookup (a read) leaves the copy as it was
-			if ((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || !e_quiet)
+			if (((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || !e_quiet) && m2.r.mem != M_ST)
 				m2.sfast <= 1'b0;
 		end
 
@@ -815,6 +828,42 @@ always_ff @(posedge clk) begin
 			st_fault_r <= 1'b0;
 			e_wst_done <= !adv_wb;
 		end
+		if (wb_fs && !sn_frz) begin
+			dw      <= 1'b1;
+			dw_set  <= m4.x.pa[9:4];
+			dw_way  <= m4.x.way;
+			dw_be   <= bmask(m4.r.a[3:0], wfs_n0);
+			dw_src  <= 2'd0;
+			dw_word <= lanes32(wfs_acc, m4.r.a[1:0]);
+			vp_set = m4.x.pa[9:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+			wfs_p1  <= 1'b1;
+		end
+		if (wfs_p1 && !sn_frz) begin
+			wfs_p1 <= 1'b0;
+			if (m4.x1.hit) begin
+				dw      <= 1'b1;
+				dw_set  <= m4.x1.pa[9:4];
+				dw_way  <= m4.x1.way;
+				dw_be   <= bmask(4'd0, nbytes(m4.r.msz) - wfs_n0);
+				dw_src  <= 2'd0;
+				dw_word <= lanes32(wfs_acc << (8 * wfs_n0), 2'd0);
+				vp_set = m4.x1.pa[9:4]; vp_wm[m4.x1.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+				st_rdy_r   <= !adv_wb;
+				st_fault_r <= 1'b0;
+				e_wst_done <= !adv_wb;
+			end
+			else begin
+				// a snoop took the second line in between: the engine
+				// writes the second part (as its own access would)
+				e_part <= 1'b1;
+				e_va   <= {m4.r.a[31:4] + 28'd1, 4'd0};
+				e_x    <= m4.x1;
+				e_n    <= nbytes(m4.r.msz) - wfs_n0;
+				e_acc  <= wfs_acc << (8 * wfs_n0);
+				bo_err <= 1'b0;
+				e_st   <= E_W_PART;
+			end
+		end
 
 		//--------------------------------------------------------------
 		// engine (frozen while the snooper has the cache)
@@ -823,7 +872,9 @@ always_ff @(posedge clk) begin
 		case (e_st)
 		E_IDLE: begin
 			steal <= 1'b0;
-			if (mt_v && !mt_done)
+			if (wfs_p1)
+				;                       // a split WB store's second part next
+			else if (mt_v && !mt_done)
 				e_st <= E_M_START;
 			else if (wb_slow)
 				e_st <= E_W_START;
@@ -869,11 +920,19 @@ always_ff @(posedge clk) begin
 			xres_t x;
 			logic [27:0] l1;
 			logic [2:0]  n0;
-			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, 1'b0, atc_hit, atc_e,
+			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
 			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m2.r.a[9:4] + 6'd1]);
 			l1 = x.pa[31:4];
 			n0 = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
-			if (!e_kill && m2.sfast && x.ok && !x.flt && !x.walk && x.hit && !x.cm[1] &&
+			if (!e_kill && m2.sfast && m2.r.mem == M_ST && x.ok && !x.flt && !x.walk &&
+			    x.hit && x.cm == 2'b01) begin
+				// a copyback store across a line: both parts hit, nothing
+				// to read; WB writes them
+				m2.x1  <= x;
+				e_st   <= E_S_DONE;
+			end
+			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && x.ok && !x.flt && !x.walk &&
+			    x.hit && !x.cm[1] &&
 			    !hz && !st_line(m3, l1) && !st_line(m4, l1) && !sp_dw &&
 			    !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
 				// both parts from the cache: the first from the copy, the

@@ -21,7 +21,8 @@
 //   $F150 word  IPL = bits 2:0, falls to bits 6:4 after bits 15:8 clocks  //
 //   $F154 word  arm a one-shot bus error on an instruction fetch at the   //
 //               written address (0 disarms)                               //
-//   $F160 word  (read) bench capability word, +cap=<n> (default 7)        //
+//   $F160 word  (read) bench capability word, +cap=<n> (default 7); bit   //
+//               5 is set when BCLK runs at half PCLK (+bclk2)             //
 //   $F200 + 32k (k = 0..3): alternate-master transfer k: +0 address,     //
 //               +4 word: bit 0 read, 2:1 SIZ, 4:3 SC1/SC0; +8..+$17 data //
 //               (write data in, read data back: a line's four long words,//
@@ -41,6 +42,9 @@
 //               (pushes included) into $F2DC (bus beats; write 0 clears)  //
 //   $F2C4 word  random snoop traffic from the alternate master: bit 15    //
 //               on, bits 7:0 bus clocks between transfers (see t_snstress)//
+//               bit 14: instead, SC 01 long writes to $D014 only          //
+//   $F2E0 long  (read) split copyback stores whose second line a snoop    //
+//               took between the two parts (the DMU's fallback)          //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -82,7 +86,8 @@ logic        dbg_retire, dbg_halted;
 // random snoop traffic ($F2C4, t_snstress): reads of the CPU's counters
 // at $A000 (SC 01: they must never go backwards) and reads/writes of the
 // shared words at $B000 (each value names its writer and address)
-logic        rs_en;
+logic        rs_en, rs_split;
+int          fb_cnt;
 logic  [7:0] rs_gap, rs_cnt;
 logic  [2:0] rs_op;
 logic  [5:0] rs_k;
@@ -476,6 +481,9 @@ always_ff @(posedge clk) begin
 				mem.mem[(16'hF208 + 32 * k + 4 * i) >> 2] <= am_x_rd[k][127 - 32 * i -: 32];
 	end
 	if (am_go) mem.mem[16'hF28C >> 2] <= 32'd0;
+	// the DMU's fallback for a split WB store whose second line went
+	if (rsti_n && dut.dmu.wfs_p1 && !dut.dmu.sn_frz && !dut.dmu.m4.x1.hit)
+		mem.mem[16'hF2E0 >> 2] <= mem.mem[16'hF2E0 >> 2] + 32'd1;
 end
 int          cap;
 
@@ -509,7 +517,7 @@ always_ff @(posedge clk) begin
 		fetch_stall <= '0;
 		am_go       <= 1'b0;
 		pins_r      <= 2'b00;
-		rs_en <= 1'b0; rs_gap <= '0; rs_cnt <= '0; rs_op <= '0; rs_k <= '0; rs_seq <= '0;
+		rs_en <= 1'b0; rs_split <= 1'b0; rs_gap <= '0; rs_cnt <= '0; rs_op <= '0; rs_k <= '0; rs_seq <= '0;
 		rs_busy <= 1'b0; rs_ops <= 0;
 		for (int i = 0; i < 64; i++) rs_last[i] <= 0;
 		am_n        <= '0;
@@ -533,7 +541,13 @@ always_ff @(posedge clk) begin
 				am_n   <= 3'd1;
 				am_trig_en <= 1'b0;
 				am_delay <= '0;
-				if (r < 30) begin       // read a counter, SC 01
+				if (rs_split) begin     // write $D014, SC 01 (t_cbsplit)
+					rs_op <= 3'd1;
+					am_x_addr[0] <= 32'h0000_D014;
+					am_x_ctl[0]  <= 5'b01_00_0;
+					am_x_wd[0]   <= {16'h5A5A, rs_seq, 96'd0};
+				end
+				else if (r < 30) begin  // read a counter, SC 01
 					rs_op <= 3'd0;
 					am_x_addr[0] <= 32'h0000_A000 + {24'd0, k, 2'b00};
 					am_x_ctl[0]  <= 5'b01_00_1;
@@ -682,8 +696,9 @@ always_ff @(posedge clk) begin
 				16'hF154: begin fberr_armed <= (w != 16'd0); fberr_addr <= w; end
 				16'hF2C0: pins_r <= w[1:0];
 				16'hF2C4: begin
-					rs_en  <= w[15];
-					rs_gap <= w[7:0];
+					rs_en    <= w[15];
+					rs_split <= w[14];
+					rs_gap   <= w[7:0];
 					if (!w[15]) $display("snoop traffic: %0d transfers", rs_ops);
 				end
 				16'hF280: begin
@@ -855,7 +870,7 @@ initial begin
 	insn_prev = 0;
 	load_prog();
 	if (!$value$plusargs("cap=%d", cap)) cap = 7;
-	mem.mem[16'hF160 >> 2] = {cap[15:0], 16'h0000};
+	mem.mem[16'hF160 >> 2] = {cap[15:0] | (bclk2 ? 16'h0020 : 16'h0000), 16'h0000};
 	mem.mem[16'hF164 >> 2] = 32'd0;
 	repeat (8) @(posedge clk);
 	rsti_n = 1'b1;

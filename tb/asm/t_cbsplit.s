@@ -27,6 +27,13 @@
 ;        then, after 0..3 other instructions, a load across a line, for
 ;        stores into either line, of every size, and across the line
 ;        itself; failures and the end come back through TRAP #0 / #1
+;   28-29 a snoop between the two halves of a store across a line: the
+;        second line pushed (CPUSHL), a long stored across $D00E (its
+;        second line allocated, then written at WB the cycle after the
+;        first), while the alternate master writes $D014 (SC 01: a clean
+;        line is invalidated) 0..7 bus clocks apart, 250 stores each;
+;        every value reads back, and with BCLK at half PCLK the bench saw
+;        the DMU's fallback (the second part by the engine)
 ;   14-17 the MMU on: two logical pages mapped copyback by their page
 ;        descriptors to $B000 and $C000; 32 bytes around the page boundary
 ;        written, then read as longs and words at every offset (across the
@@ -43,6 +50,9 @@ WHI	equ	$F2D4
 WRD	equ	$F2D8
 WWR	equ	$F2DC
 BUF	equ	$9800
+TRAFFIC	equ	$F2C4
+FBCNT	equ	$F2E0
+CAPW	equ	$F160
 ROOT	equ	$10000		; root table (128 x 4)
 PTR	equ	$10200		; pointer table (128 x 4)
 PAGE	equ	$10400		; page table (64 x 4, 4 KB pages)
@@ -352,6 +362,42 @@ uloop:
 	dbra	d4,uloop
 	trap	#1
 ucont:
+
+;------------------------- 28-29 a snoop between the halves of a store
+	lea	($D00E).l,a3
+	lea	($D010).l,a4
+	moves.l	(a3),d1			; both lines present
+	clr.l	(FBCNT).l
+	move.l	#$10000,d5
+	move.w	#$C000,d6		; SC 01 writes to $D014, 0..7 clocks apart
+.s0:	move.w	d6,(TRAFFIC).l
+	move.w	#249,d4
+.s1:	cpushl	dc,(a4)			; the second line: pushed, invalidated
+	addq.l	#1,d5
+	moves.l	d5,(a3)			; across the line
+	moves.l	(a3),d1
+	cmp.l	d5,d1
+	beq.s	.s2
+	clr.w	(TRAFFIC).l
+	failt	28
+.s2:	dbra	d4,.s1
+	addq.w	#1,d6
+	cmp.w	#$C008,d6
+	bne.s	.s0
+	clr.w	(TRAFFIC).l
+	move.w	#200,d1
+.s3:	nop
+	dbra	d1,.s3
+	moves.l	(a3),d1
+	cmp.l	d5,d1
+	beq.s	.s4
+	failt	28
+.s4:	btst	#5,(CAPW+1).l		; BCLK at half PCLK: the other master's
+	beq.s	.s5			; snoop can fall between the halves (at
+	move.l	(FBCNT).l,d1		; full speed it arbitrates for the bus
+	bne.s	.s5			; after the fill, too late)
+	failt	29
+.s5:
 
 ;------------------------------------- 14-17 page-crossing, the MMU on
 	cinva	dc
