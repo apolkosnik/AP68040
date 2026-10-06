@@ -39,6 +39,7 @@ module ap68040_backend
 	output logic        redir_v,
 	output logic [31:0] redir_pc,
 	output logic        flush,          // kill everything younger than WB
+	output logic        fe_flush,       // the front end's flush (D1, D2)
 	output logic        ras_rv,         // D1's return stack to restore with it
 	output logic  [2:0] ras_rtp,
 	output logic  [3:0] ras_rn,
@@ -252,7 +253,7 @@ assign adv_dc2 = dc2_v && !stall_dc2;
 assign adv_dc1 = dc1_v && !stall_dc1;
 assign adv_ag  = ag_v  && !stall_ag;
 
-assign in_rdy  = !stall_ag && !flush && !stopped;
+assign in_rdy  = !stall_ag && !flush && !stopped && !eredir_pend;
 
 //--------------------------------------------------------------------------
 // AG
@@ -265,11 +266,29 @@ function automatic logic pend_w(input logic [4:0] r);
 	         (ex_v  && ex_u.d_v  && ex_u.d_reg  == r);
 endfunction
 
+// a plain load leaving DC2 hands its data to a base or index waiting in
+// AG (cap_b/cap_x: the EX-stage writer is then no longer waited for)
+logic cap_b, cap_x;
+function automatic logic pend_dc(input logic [4:0] r);
+	pend_dc = (dc1_v && dc1_u.d_v && dc1_u.d_reg == r) ||
+	          (dc2_v && dc2_u.d_v && dc2_u.d_reg == r);
+endfunction
+wire ex_wr_b = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.base;
+wire ex_wr_x = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.idx;
 wire ag_interlock = ag_v && (
-	(ag_u.base_v && pend_w(ag_u.base)) ||
-	(ag_u.idx_v  && pend_w(ag_u.idx))  ||
+	(ag_u.base_v && (pend_dc(ag_u.base) || (ex_wr_b && !cap_b))) ||
+	(ag_u.idx_v  && (pend_dc(ag_u.idx)  || (ex_wr_x && !cap_x))) ||
+	// a register AG writes waits for every older writer (else the EX write
+	// of the captured load could land after this one)
 	(ag_u.upd_v  && pend_w(ag_u.upd_reg)) ||
 	(ag_u.upd2_v && pend_w(ag_u.upd2_reg)));
+
+// the load whose data can be handed over: its result is the data itself
+// (a long MOVE, MOVEA.W sign-extended, a memory-indirect pointer)
+wire        dc2_cap  = adv_dc2 && dc2_u.d_v && dc2_u.op == OP_MOV && dc2_u.cond == 4'd0 &&
+                       dc2_u.mem == M_LD && dc2_u.a_src == OS_MEM && dc2_u.sz == SZ_L &&
+                       dc2_u.exc == 8'd0;
+wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata[15]}}, dm_ldata[15:0]} : dm_ldata;
 
 assign ag_hold = ag_interlock;
 
@@ -948,6 +967,14 @@ wire        ex_br      = (ex_u.br != BR_NONE) || (ex_u.op == OP_RTE);
 wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
 wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
                                    (ex_taken && ex_u.pred && ex_target != ex_u.target));
+// a mispredicted branch that WB will redirect for no other reason turns
+// the front end round as it leaves EX, a cycle early; the stages behind it
+// still go at WB (the front end is not flushed again), and AG takes
+// nothing in between
+logic       eredir_pend, wb_eredir;
+wire        ex_early = ex_mispred && !ex_u.ser && !ex_sr_we &&
+                       !(ex_u.last && (smc_pend || ex_smc)) && (ex_u.exc == 8'd0) &&
+                       !ex_fault && (ex_xvec == 8'd0) && !ex_odd && !kill_now && !flush;
 
 // a change of flow to an odd address is an address error at the
 // instruction (format $2, the address with A0 cleared), before any of its
@@ -1191,11 +1218,14 @@ always_ff @(posedge clk) begin
 	ras_rv  <= 1'b0;
 	exc_go  <= 1'b0;
 	flush   <= 1'b0;
+	fe_flush <= 1'b0;
 	ucond_v <= 1'b0;
 	dbg_retire <= 1'b0;
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		eredir_pend <= 1'b0;
+		wb_eredir   <= 1'b0;
 		fv <= 32'd0;
 		xw_ph <= 2'd0;
 		ccr_f   <= 5'd0;
@@ -1375,6 +1405,15 @@ always_ff @(posedge clk) begin
 			// redirecting there would drop the instruction's remaining uops)
 			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we ||
 			               (ex_u.last && (smc_pend || ex_smc));
+			wb_eredir   <= ex_early;
+			if (ex_early) begin
+				fe_flush    <= 1'b1;
+				redir_v     <= 1'b1;
+				redir_pc    <= ex_next;
+				ras_rv      <= ex_u.ras.v;
+				{ras_rtp, ras_rn} <= ras_after(ex_u.ras);
+				eredir_pend <= 1'b1;
+			end
 			if (ex_u.last) smc_pend <= 1'b0;
 			else if (ex_smc) smc_pend <= 1'b1;
 			// where execution continues, predicted correctly or not
@@ -1520,10 +1559,13 @@ always_ff @(posedge clk) begin
 			end
 			if (wb_redir) begin
 				flush    <= 1'b1;
-				redir_v  <= 1'b1;
-				redir_pc <= wb_redir_pc;
-				ras_rv   <= wb_u.ras.v;
-				{ras_rtp, ras_rn} <= ras_after(wb_u.ras);
+				if (!wb_eredir) begin
+					fe_flush <= 1'b1;
+					redir_v  <= 1'b1;
+					redir_pc <= wb_redir_pc;
+					ras_rv   <= wb_u.ras.v;
+					{ras_rtp, ras_rn} <= ras_after(wb_u.ras);
+				end
 				// the front file restarts from the back one (fv cleared below)
 				ccr_f <= wb_sr_we ? wb_sr_new[4:0] : wb_ccr;
 			end
@@ -1540,6 +1582,7 @@ always_ff @(posedge clk) begin
 		end
 		if (wb_refetch) begin
 			flush    <= 1'b1;
+			fe_flush <= 1'b1;
 			redir_v  <= 1'b1;
 			redir_pc <= wb_u.pc;
 			ras_rv   <= wb_u.ras.v;
@@ -1563,6 +1606,7 @@ always_ff @(posedge clk) begin
 			smc_pend <= 1'b0;
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
+			fe_flush <= 1'b1;
 			redir_v  <= 1'b0;
 			ras_rv   <= 1'b0;
 			xw_ph    <= 2'd1;          // T5-T13 first, then exc_go
@@ -1635,6 +1679,7 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (flush) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+			eredir_pend <= 1'b0;
 		end
 		else begin
 			// D2 -> AG (exactly when in_rdy says the uop is taken)
@@ -1678,21 +1723,41 @@ assign pst_st   = halted ? 4'h5 : stopped ? 4'hD : xstk ? 4'hF :
 // front-file writes of that cycle bypassed in), then following EX's
 // writes while AG holds (an interlocked base or index is written there)
 always_ff @(posedge clk) begin
+	// a captured EX writer stays captured while it is in EX
+	if (adv_ex) begin cap_b <= 1'b0; cap_x <= 1'b0; end
 	if (!flush && !stall_ag && in_v && !stopped) begin
 		logic [31:0] b, x;
+		logic        cb, cx;
 		b = rrd[0];
 		x = rrd[1];
+		cb = 1'b0;
+		cx = 1'b0;
 		for (int i = 0; i < 3; i++) begin
 			if (fwe[i] && fwa[i] == in_u.base) b = fwd[i];
 			if (fwe[i] && fwa[i] == in_u.idx)  x = fwd[i];
 		end
+		// the load entering EX, unless a younger writer is in AG or DC1
+		// (it will be waited for in any case)
+		if (dc2_cap && dc2_u.d_reg == in_u.base) begin b = dc2_capv; cb = 1'b1; end
+		if (dc2_cap && dc2_u.d_reg == in_u.idx)  begin x = dc2_capv; cx = 1'b1; end
 		agb_q <= in_u.base_v ? b : 32'd0;
 		agx_q <= ixf(x, in_u);
+		cap_b <= cb;
+		cap_x <= cx;
 	end
 	else if (ag_v) begin
 		if (exw_v && ag_u.base_v && exw_reg == ag_u.base) agb_q <= exw_val;
 		if (exw_v && exw_reg == ag_u.idx) agx_q <= ixf(exw_val, ag_u);
+		if (dc2_cap && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
+			agb_q <= dc2_capv;
+			cap_b <= 1'b1;
+		end
+		if (dc2_cap && dc2_u.d_reg == ag_u.idx) begin
+			agx_q <= ixf(dc2_capv, ag_u);
+			cap_x <= 1'b1;
+		end
 	end
+	if (flush || !nreset) begin cap_b <= 1'b0; cap_x <= 1'b0; end
 end
 
 endmodule

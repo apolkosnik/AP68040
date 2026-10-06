@@ -324,7 +324,30 @@ end
 int   pc_mp  [int unsigned];
 always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_ex && dut.be.ex_mispred)
 	pc_mp[dut.be.ex_u.pc] += 1;
+// AG interlock cycles by the youngest producer: stage (1 DC1, 2 DC2, 3 EX),
+// a load or not, and its op
+int   il_k [int unsigned];
+always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.ag_v && dut.be.ag_interlock) begin
+	logic [4:0] r [4];
+	logic       rv [4];
+	int         k;
+	r[0] = dut.be.ag_u.base;     rv[0] = dut.be.ag_u.base_v;
+	r[1] = dut.be.ag_u.idx;      rv[1] = dut.be.ag_u.idx_v;
+	r[2] = dut.be.ag_u.upd_reg;  rv[2] = dut.be.ag_u.upd_v;
+	r[3] = dut.be.ag_u.upd2_reg; rv[3] = dut.be.ag_u.upd2_v;
+	k = 0;
+	for (int i = 0; i < 4; i++) if (rv[i]) begin
+		if (dut.be.dc1_v && dut.be.dc1_u.d_v && dut.be.dc1_u.d_reg == r[i])
+			k = 1000 + (dut.be.dc1_u.mem != 0) * 100 + dut.be.dc1_u.op;
+		else if (k == 0 && dut.be.dc2_v && dut.be.dc2_u.d_v && dut.be.dc2_u.d_reg == r[i])
+			k = 2000 + (dut.be.dc2_u.mem != 0) * 100 + dut.be.dc2_u.op;
+		else if (k == 0 && dut.be.ex_v && dut.be.ex_u.d_v && dut.be.ex_u.d_reg == r[i])
+			k = 3000 + (dut.be.ex_u.mem != 0) * 100 + dut.be.ex_u.op;
+	end
+	il_k[k] += 1;
+end
 task automatic pcprof_dump();
+	foreach (il_k[a]) $display("ILK %0d %0d", a, il_k[a]);
 	foreach (pc_cyc[a]) $display("PCPROF %08x %0d %0d", a, pc_n[a], pc_cyc[a]);
 	foreach (pc_mp[a]) $display("PCMISP %08x %0d", a, pc_mp[a]);
 endtask

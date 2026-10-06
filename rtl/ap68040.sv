@@ -182,7 +182,7 @@ assign d_oe = sn_d_oe || b_d_oe;
 //--------------------------------------------------------------------------
 // back end and front end
 //--------------------------------------------------------------------------
-logic        redir_v, flush;
+logic        redir_v, flush, fe_flush;
 logic [31:0] redir_pc;
 logic        exc_go;
 logic  [3:0] exc_kind;
@@ -221,7 +221,7 @@ logic        uo_rdy;
 ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
-	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush),
+	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.ucond_v(ucond_v), .ucond(ucond),
@@ -347,7 +347,7 @@ ap68040_fetch fetch (
 assign b_wdata[1] = '0;
 
 ap68040_decode dec (
-	.clk(clk), .nreset(nreset), .flush(flush),
+	.clk(clk), .nreset(nreset), .flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
@@ -362,7 +362,7 @@ ap68040_decode dec (
 );
 
 ap68040_useq useq (
-	.clk(clk), .nreset(nreset), .flush(flush),
+	.clk(clk), .nreset(nreset), .flush(fe_flush),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
 	.smode(sr[13]), .master(sr[12]),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
