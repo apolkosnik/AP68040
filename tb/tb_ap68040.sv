@@ -309,6 +309,25 @@ always_ff @(posedge clk) if (rsti_n && prof) begin
 		end
 	end
 end
+// +pcprof: the cycles since the previous instruction completed, charged
+// to each completing instruction's address (dumped at the end)
+logic pcprof;
+int   pc_cyc [int unsigned];
+int   pc_n   [int unsigned];
+int   pc_last;
+initial pcprof = $test$plusargs("pcprof");
+always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_wb && dut.be.wb_u.last) begin
+	pc_cyc[dut.be.wb_u.pc] += cycles - pc_last;
+	pc_n[dut.be.wb_u.pc]   += 1;
+	pc_last <= cycles;
+end
+int   pc_mp  [int unsigned];
+always_ff @(posedge clk) if (rsti_n && pcprof && dut.be.adv_ex && dut.be.ex_mispred)
+	pc_mp[dut.be.ex_u.pc] += 1;
+task automatic pcprof_dump();
+	foreach (pc_cyc[a]) $display("PCPROF %08x %0d %0d", a, pc_n[a], pc_cyc[a]);
+	foreach (pc_mp[a]) $display("PCMISP %08x %0d", a, pc_mp[a]);
+endtask
 task automatic prof_report();
 	int tot;
 	tot = pf[PF_RET] + pf[PF_WB] + pf[PF_EX] + pf[PF_DC2] + pf[PF_DC1] + pf[PF_AG] + pf[PF_FE] + pf[PF_FQE];
@@ -667,6 +686,25 @@ always_ff @(posedge clk)
 		         dut.dmu.m2.fast, dut.dmu.hz, dut.dmu.m2.x.hit, dut.dmu.m2.x.way, dut.dmu.m2.x.pa,
 		         dut.dmu.dw, dut.dmu.dw_set, dut.dmu.m1_stale);
 
+// +ftrace=<from>,+ftto=<to>: the whole pipeline by instruction address,
+// one line a cycle (Q words in the fetch queue, records, uops; holds)
+int ft_from, ft_to;
+initial begin
+	if (!$value$plusargs("ftrace=%d", ft_from)) ft_from = -1;
+	if (!$value$plusargs("ftto=%d", ft_to)) ft_to = ft_from + 200;
+end
+always_ff @(posedge clk)
+	if (ft_from >= 0 && cycles >= ft_from && cycles < ft_to)
+		$display("%8d Q%0d R%0d:%04x U%0d:%04x | AG %s DC1 %s DC2 %s EX %s WB %s | h ag=%b d1=%b d2=%b ex=%b wb=%b | %s%s",
+		         cycles, dut.fetch.cnt, dut.rq_n, dut.rq0.pc[15:0], dut.uq_n, dut.uq0.pc[15:0],
+		         dut.be.ag_v ? $sformatf("%04x", dut.be.ag_u.pc[15:0]) : "----",
+		         dut.be.dc1_v ? $sformatf("%04x", dut.be.dc1_u.pc[15:0]) : "----",
+		         dut.be.dc2_v ? $sformatf("%04x", dut.be.dc2_u.pc[15:0]) : "----",
+		         dut.be.ex_v ? $sformatf("%04x", dut.be.ex_u.pc[15:0]) : "----",
+		         dut.be.wb_v ? $sformatf("%04x", dut.be.wb_u.pc[15:0]) : "----",
+		         dut.be.ag_hold, dut.dm_hold1, dut.be.dc2_hold, dut.be.ex_hold, dut.be.wb_hold,
+		         dut.redir_v ? "REDIR " : "", dut.d_redir_v ? "DREDIR" : "");
+
 // exception entries
 always_ff @(posedge clk)
 	if (trace && dut.be.x_go)
@@ -788,6 +826,7 @@ initial begin
 	rsti_n = 1'b1;
 	while (result == 0 && cycles < timeout && !dbg_halted) @(posedge clk);
 	if (prof) prof_report();
+	if (pcprof) pcprof_dump();
 	if (result == 1 && errors == 0)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)

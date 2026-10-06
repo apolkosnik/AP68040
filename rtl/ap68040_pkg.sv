@@ -189,9 +189,21 @@ localparam logic [6:0]
 	OP_RTE   = 7'd61,  // RTE: SR = A, jump to B (throwaway frame: this RTE)
 	OP_IACKV = 7'd62;  // interrupt vector from the IACK data
 
+// D1's return stack pointer as an instruction found it, and what the
+// instruction did to it: a WB redirect puts it back (after the
+// instruction, or before it for a refetch), so wrong-path calls and
+// returns that D1 decoded leave no trace
+typedef struct packed {
+	logic        v;
+	logic  [1:0] k;         // 1 pushed (BSR/JSR), 2 popped (RTS)
+	logic  [2:0] tp;
+	logic  [3:0] n;
+} ras_snap_t;
+
 typedef struct packed {
 	logic [31:0] pc;        // address of the 68040 instruction
 	logic [31:0] npc;       // address of the next sequential instruction
+	ras_snap_t   ras;       // see ras_snap_t
 	logic        first;     // first uop of the instruction
 	logic        last;      // last uop: the instruction completes with it
 	// execution
@@ -311,6 +323,7 @@ typedef struct packed {
 	logic        t0;      // on the 68040 T0 trace list
 	logic        bst;     // Bcc: the static prediction (backward taken)
 	logic  [1:0] bhc;     // Bcc: its history counter as D1 read it
+	ras_snap_t   ras;     // D1's return stack before this instruction
 } dinst_t;
 
 endpackage

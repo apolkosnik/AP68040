@@ -39,6 +39,9 @@ module ap68040_backend
 	output logic        redir_v,
 	output logic [31:0] redir_pc,
 	output logic        flush,          // kill everything younger than WB
+	output logic        ras_rv,         // D1's return stack to restore with it
+	output logic  [2:0] ras_rtp,
+	output logic  [3:0] ras_rn,
 
 	// exception entry for the sequencer
 	output logic        exc_go,         // pulse: run the exception routine
@@ -74,7 +77,7 @@ module ap68040_backend
 	output logic        irq_pending,    // IPEND: a request beats the mask
 	output logic        bht_we,         // Bcc history training (decode's table)
 	output logic  [7:0] bht_wa,
-	output logic  [1:0] bht_wd,
+	output logic        bht_dis,        // ... the branch went against the static rule
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        dm_iack,        // interrupt acknowledge cycle
 	input  logic        dm_hold1,       // the DMU holds DC1
@@ -367,12 +370,17 @@ assign dm_older   = ex_v || wb_v;
 
 
 // Bcc history: the counter counts disagreement with the static rule
-// (saturating 0..3); trained as the branch leaves EX
+// (saturating 0..3); trained as the branch leaves EX, written a cycle
+// later unless that cycle flushes (the branch was on a wrong path: an
+// older uop at WB redirected or trapped as it left EX)
 wire        bht_agree = (ex_taken == ex_u.bst);
-assign bht_we = adv_ex && ex_u.op == OP_BCC && ex_u.br == BR_COND;
-assign bht_wa = ex_u.pc[8:1];
-assign bht_wd = bht_agree ? ((ex_u.bhc == 2'd0) ? 2'd0 : ex_u.bhc - 2'd1)
-                          : ((ex_u.bhc == 2'd3) ? 2'd3 : ex_u.bhc + 2'd1);
+logic       bht_we_q;
+always_ff @(posedge clk) begin
+	bht_we_q <= nreset && adv_ex && ex_u.op == OP_BCC && ex_u.br == BR_COND;
+	bht_wa   <= ex_u.pc[8:1];
+	bht_dis  <= !bht_agree;
+end
+assign bht_we = bht_we_q && !flush;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 assign dm_iack    = (ag_u.mfc == MFC_IACK);
 always_comb begin
@@ -1169,8 +1177,18 @@ always_comb begin
 	x_cm_ea = (cm_pend && wb_u.pc == cm_pc) ? cm_ea : wb_mv_ea;
 end
 
+// the return stack after the instruction at WB
+function automatic logic [6:0] ras_after(input ras_snap_t r);
+	case (r.k)
+		2'd1:    ras_after = {r.tp + 3'd1, (r.n == 4'd8) ? 4'd8 : r.n + 4'd1};
+		2'd2:    ras_after = {r.tp - 3'd1, r.n - 4'd1};
+		default: ras_after = {r.tp, r.n};
+	endcase
+endfunction
+
 always_ff @(posedge clk) begin
 	redir_v <= 1'b0;
+	ras_rv  <= 1'b0;
 	exc_go  <= 1'b0;
 	flush   <= 1'b0;
 	ucond_v <= 1'b0;
@@ -1231,6 +1249,8 @@ always_ff @(posedge clk) begin
 		exc_kind <= EK_RESET;
 		exc_ssp <= R_ISP;
 		redir_pc <= 32'd0;
+		ras_rtp <= '0;
+		ras_rn <= '0;
 	end
 	else begin
 		//------------------------------------------------------------------
@@ -1502,6 +1522,8 @@ always_ff @(posedge clk) begin
 				flush    <= 1'b1;
 				redir_v  <= 1'b1;
 				redir_pc <= wb_redir_pc;
+				ras_rv   <= wb_u.ras.v;
+				{ras_rtp, ras_rn} <= ras_after(wb_u.ras);
 				// the front file restarts from the back one (fv cleared below)
 				ccr_f <= wb_sr_we ? wb_sr_new[4:0] : wb_ccr;
 			end
@@ -1520,6 +1542,8 @@ always_ff @(posedge clk) begin
 			flush    <= 1'b1;
 			redir_v  <= 1'b1;
 			redir_pc <= wb_u.pc;
+			ras_rv   <= wb_u.ras.v;
+			{ras_rtp, ras_rn} <= {wb_u.ras.tp, wb_u.ras.n};
 			ccr_f    <= ccr_b;
 			rt_armed <= 1'b1;
 			rt_pc    <= wb_u.pc;
@@ -1540,6 +1564,7 @@ always_ff @(posedge clk) begin
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			redir_v  <= 1'b0;
+			ras_rv   <= 1'b0;
 			xw_ph    <= 2'd1;          // T5-T13 first, then exc_go
 			exc_kind <= x_kind;
 			exc_ssp  <= x_ssp;

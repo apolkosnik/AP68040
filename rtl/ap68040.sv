@@ -208,7 +208,7 @@ logic  [2:0] dm_fc;
 logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
-logic  [1:0] bht_wd;
+logic        bht_dis;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
 logic [31:0] dm_ldata, dm_faddr, dm_st_data;
 logic  [7:0] dm_fvec;
@@ -222,12 +222,13 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush),
+	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
 	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
-	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd), .sn_ihit(sn_ihit),
+	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
 	.irq_pending(irq_pending),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
@@ -301,6 +302,9 @@ logic [BTB_TW-1:0] btb_wtag;
 logic [30:0] btb_wtgt;
 logic  [1:0] btb_wkind;
 logic [30:0] d_ras [8];
+logic        ras_rv;
+logic  [2:0] ras_rtp;
+logic  [3:0] ras_rn;
 logic  [2:0] d_ras_tp;
 logic  [3:0] d_ras_n;
 pd_t         pd0;
@@ -344,13 +348,14 @@ assign b_wdata[1] = '0;
 
 ap68040_decode dec (
 	.clk(clk), .nreset(nreset), .flush(flush),
+	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
 	.pd0(pd0), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
-	.bht_we(bht_we), .bht_wa(bht_wa), .bht_wd(bht_wd),
+	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
 	.btb_wslot(btb_wslot), .btb_wkind(btb_wkind), .btb_wtgt(btb_wtgt),
 	.ras_o(d_ras), .ras_tp_o(d_ras_tp), .ras_n_o(d_ras_n)

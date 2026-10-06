@@ -28,6 +28,9 @@ module ap68040_decode
 	input  logic        clk,
 	input  logic        nreset,
 	input  logic        flush,          // back end redirect: drop everything
+	input  logic        ras_rv,         // ... with the return stack to restore
+	input  logic  [2:0] ras_rtp,
+	input  logic  [3:0] ras_rn,
 
 	input  logic [15:0] win [8],
 	input  logic  [7:0] win_flt,
@@ -54,7 +57,7 @@ module ap68040_decode
 	// Bcc history training (from EX)
 	input  logic        bht_we,
 	input  logic  [7:0] bht_wa,
-	input  logic  [1:0] bht_wd,
+	input  logic        bht_dis,        // ... the branch went against the static rule
 
 	// BTB maintenance (the fetch unit's table)
 	output logic        btb_we,
@@ -225,6 +228,7 @@ ph_t         ph;
 dinst_t      part;          // record under construction (slow path)
 pd_t         part_pd;
 logic  [3:0] part_len;      // words consumed so far
+dinst_t      rq2;           // third record (internal)
 logic  [2:0] part_imml;     // EA0 immediate length (slow path)
 logic        hold_redir;    // a predicted branch is redirecting fetch
 
@@ -278,6 +282,16 @@ logic  [1:0] bht_q;
 ap68040_lutram #(.AW(8), .DW(2)) bht (
 	.clk(clk), .we(bht_we), .waddr(bht_wa), .wdata(bht_wd), .raddr(qpc[8:1]), .q(bht_q)
 );
+// training counts from the table's current value (a copy read at the
+// training address), not from the value D1 read when it decoded the
+// branch: two passes of a short loop are often decoded before the first
+// one is trained
+logic  [1:0] bht_t, bht_wd;
+ap68040_lutram #(.AW(8), .DW(2)) bht_tr (
+	.clk(clk), .we(bht_we), .waddr(bht_wa), .wdata(bht_wd), .raddr(bht_wa), .q(bht_t)
+);
+assign bht_wd = bht_dis ? ((bht_t == 2'd3) ? 2'd3 : bht_t + 2'd1)
+                        : ((bht_t == 2'd0) ? 2'd0 : bht_t - 2'd1);
 logic [31:0] ras [8];
 logic  [2:0] ras_tp;           // the top entry
 logic  [3:0] ras_n;            // entries held (0..8)
@@ -528,10 +542,17 @@ end
 dinst_t nrec_q;
 always_comb begin
 	nrec_q = nrec;
+	nrec_q.ras.v  = 1'b1;
+	nrec_q.ras.tp = ras_tp;
+	nrec_q.ras.n  = ras_n;
+	nrec_q.ras.k  = (nrec.exc != 8'd0) ? 2'd0 :
+	                (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
+	                (nrec.rt == UA_RTS && ras_n != 4'd0) ? 2'd2 : 2'd0;
 	if (go && (bt_restart || part_bt)) begin
 		nrec_q.exc  = EXC_SNR;
 		nrec_q.rt   = UA_DEC_EXC;
 		nrec_q.pred = 1'b0;
+		nrec_q.ras.k = 2'd0;
 	end
 end
 wire [31:0] lastpc = qpc + {27'd0, use_n - 4'd1, 1'b0};    // the decode's last word
@@ -541,11 +562,13 @@ wire  [1:0] btb_kind = (nrec.rt == UA_BSR || nrec.rt == UA_JSR) ? 2'd1 :
                        (nrec.rt == UA_RTS) ? 2'd2 : 2'd0;
 always_comb begin
 	for (int i = 0; i < 8; i++) ras_o[i] = ras[i][31:1];
-	ras_tp_o = ras_tp;
-	ras_n_o  = ras_n;
+	// a back-end redirect resynchronizes the fetch's stack from the
+	// restored pointer
+	ras_tp_o = ras_rv ? ras_rtp : ras_tp;
+	ras_n_o  = ras_rv ? ras_rn  : ras_n;
 end
 
-wire room  = (rq_n != 2'd2);
+wire room  = (rq_n != 2'd3);
 wire stall = flush || hold_redir || d_redir_v || !room;
 wire fire  = (go || go_part) && !stall;
 wire push  = fire && go;
@@ -558,6 +581,7 @@ always_ff @(posedge clk) begin
 		rq_n       <= 2'd0;
 		rq0        <= '0;
 		rq1        <= '0;
+		rq2        <= '0;
 		ph         <= PH_IDLE;
 		part       <= '0;
 		part_pd    <= '0;
@@ -610,15 +634,25 @@ always_ff @(posedge clk) begin
 			end
 		end
 
+		// three records, so that D1 (which sees only the registered count)
+		// and D2 can both move one a cycle: D2 chains into rq1 while D1
+		// fills behind it
 		case ({push, pop})
-			2'b01: begin rq0 <= rq1; rq_n <= rq_n - 2'd1; end
+			2'b01: begin rq0 <= rq1; rq1 <= rq2; rq_n <= rq_n - 2'd1; end
 			2'b10: begin
-				if (rq_n == 2'd0) rq0 <= nrec_q; else rq1 <= nrec_q;
+				case (rq_n)
+					2'd0:    rq0 <= nrec_q;
+					2'd1:    rq1 <= nrec_q;
+					default: rq2 <= nrec_q;
+				endcase
 				rq_n <= rq_n + 2'd1;
 			end
 			2'b11: begin
-				if (rq_n == 2'd1) rq0 <= nrec_q;
-				else begin rq0 <= rq1; rq1 <= nrec_q; end
+				case (rq_n)
+					2'd1:    rq0 <= nrec_q;
+					2'd2:    begin rq0 <= rq1; rq1 <= nrec_q; end
+					default: begin rq0 <= rq1; rq1 <= rq2; rq2 <= nrec_q; end
+				endcase
 			end
 			default: ;
 		endcase
@@ -665,6 +699,10 @@ always_ff @(posedge clk) begin
 		end
 		if (flush) begin
 			rq_n       <= 2'd0;
+			if (ras_rv) begin
+				ras_tp <= ras_rtp;
+				ras_n  <= ras_rn;
+			end
 			ph         <= PH_IDLE;
 			d_redir_v  <= 1'b0;
 			hold_redir <= 1'b0;

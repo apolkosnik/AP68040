@@ -326,6 +326,7 @@ always_comb begin
 	                       (src.ext1[15:13] == 3'b101 || src.ext1[15:13] == 3'b111));
 	nu.pc     = src.pc;
 	nu.npc    = src.npc;
+	nu.ras    = src.ras;
 	nu.first  = src_first;
 	nu.last   = uw.last;
 	nu.exc    = (src.exc != 8'd0) ? src.exc : 8'd0;
@@ -766,7 +767,7 @@ always_comb begin
 		if (n_jump)      na = jc_now ? uw.jt : upc + 10'd1;
 		else if (stay)   na = upc;
 		else if (!uw.last) na = upc + 10'd1;
-		else if (!exc_mode && rq_n == 2'd2) na = rq1.rt;   // next instruction
+		else if (!exc_mode && rq_n[1]) na = rq1.rt;        // next instruction
 		else nv = 1'b0;
 	end
 	else if (!uw_v && !exc_mode && rq_n != 2'd0) begin
