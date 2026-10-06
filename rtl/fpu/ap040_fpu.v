@@ -276,7 +276,10 @@ reg  [4:0] fst;
 // destination-operand checks in F_EXEC and F_BIN.  Only the arithmetic
 // and rounding states are strictly past every such decision: from here
 // on nothing but done or an enabled-exception exc_req can follow.
+// (the alignment shift of an add runs after every datatype check: the
+// operation is accepted as it starts)
 assign accepted = (fst == F_ADDX) || (fst == F_MULT) ||
+                  (fst == F_SHR && sh_ret == F_ADDX) ||
                   (fst == F_DIVL) || (fst == F_SQRTL) ||
                   (fst == F_NORM2) || (fst == F_ROUND);
 
@@ -328,6 +331,17 @@ reg  [1:0] nsel;
 wire [63:0] norm_m = nsel[0] ? b_m :
                      nsel[1] ? acc_hi[63:0] : a_m;
 wire [6:0] norm_lz = clz64(norm_m);
+
+// v >> n with every bit shifted out ORed into bit 0 (n up to 67: all out)
+function [66:0] shr_sticky;
+	input [66:0] v;
+	input [6:0]  n;
+	reg   [66:0] m;
+	begin
+		m = (n >= 7'd67) ? {67{1'b1}} : ((67'd1 << n) - 67'd1);
+		shr_sticky = ((n >= 7'd67) ? 67'd0 : (v >> n)) | {66'd0, |(v & m)};
+	end
+endfunction
 wire [66:0] norm_shifted =
     {norm_m, (nsel[1] ? grs : 3'd0)} << norm_lz;
 // synthesis translate_off
@@ -2123,33 +2137,13 @@ always @(posedge clk) begin
 			end
 
 			F_SHR: begin : f_shr
-				// staged right shift with sticky collection
-				reg [6:0] step;
-				if (sh_cnt == 0) fst <= sh_ret;
-				else begin
-					step = (sh_cnt >= 7'd32) ? 7'd32 :
-					       (sh_cnt >= 7'd16) ? 7'd16 :
-					       (sh_cnt >= 7'd8)  ? 7'd8  :
-					       (sh_cnt >= 7'd4)  ? 7'd4  :
-					       (sh_cnt >= 7'd2)  ? 7'd2  : 7'd1;
-					// new {int[66:3], G, R, S}: value shifted by the step,
-					// G/R from the top shifted-out bits, S ORs the rest
-					case (step)
-						7'd32: sh_v <= {32'd0, sh_v[66:35], sh_v[34], sh_v[33],
-						                (sh_v[32:0] != 0)};
-						7'd16: sh_v <= {16'd0, sh_v[66:19], sh_v[18], sh_v[17],
-						                (sh_v[16:0] != 0)};
-						7'd8:  sh_v <= {8'd0, sh_v[66:11], sh_v[10], sh_v[9],
-						                (sh_v[8:0] != 0)};
-						7'd4:  sh_v <= {4'd0, sh_v[66:7], sh_v[6], sh_v[5],
-						                (sh_v[4:0] != 0)};
-						7'd2:  sh_v <= {2'd0, sh_v[66:5], sh_v[4], sh_v[3],
-						                (sh_v[2:0] != 0)};
-						default: sh_v <= {1'd0, sh_v[66:4], sh_v[3], sh_v[2],
-						                  (sh_v[1:0] != 0)};
-					endcase
-					sh_cnt <= sh_cnt - step;
-				end
+				// right shift with sticky collection, in one cycle: the
+				// value shifted by sh_cnt, every bit shifted out ORed into
+				// bit 0 ({int[66:3], G, R, S}; the former 32/16/8/4/2/1
+				// steps composed to the same)
+				if (sh_cnt != 0) sh_v <= shr_sticky(sh_v, sh_cnt);
+				sh_cnt <= 7'd0;
+				fst    <= sh_ret;
 			end
 
 			F_PACKI: begin : f_packi

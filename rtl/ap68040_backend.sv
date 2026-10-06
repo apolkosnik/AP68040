@@ -190,6 +190,11 @@ logic [31:0] dc1_upd, dc1_upd2, dc2_upd, dc2_upd2, ex_upd, ex_upd2;
 // exception clears fv, so every register reads the back file again -- no
 // copy.  Five read ports at AG: base, index, upd2 register, A, B.
 logic [31:0] fv;
+// an FPU uop may act once it is the oldest in flight -- or when the one at
+// WB is its own instruction's CHK, which left EX without an exception and
+// commits (no instruction boundary is between them)
+wire wb_fpchk = wb_v && wb_u.op == OP_FPU && wb_u.cond == 4'd0 && !wb_u.last &&
+                ex_v && ex_u.op == OP_FPU && ex_u.pc == wb_u.pc && (wb_exc == 8'd0);
 // FPU interface outputs (ap68040_fpif)
 logic        fp_hold, fp_dkill, fp_taken, fp_xnext, fp_xcommit, fp_stkill;
 logic [31:0] fp_res, fp_xaddr;
@@ -469,7 +474,7 @@ ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
 	.ex_v(ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0), .sub(ex_u.cond),
 	.imm(ex_u.imm[7:0]), .immb(ex_u.imm_b[7:0]),
 	.av(ex_av), .bv(ex_bv), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
-	.safe(!wb_v), .adv(adv_ex), .kill(kill_now),
+	.safe(!wb_v || wb_fpchk), .adv(adv_ex), .kill(kill_now),
 	.hold(fp_hold), .res(fp_res), .dkill(fp_dkill), .taken(fp_taken),
 	.xvec(fp_xvec), .xfmt(fp_xfmt), .xnext(fp_xnext), .xaddr(fp_xaddr),
 	.xcommit(fp_xcommit), .st_kill(fp_stkill),

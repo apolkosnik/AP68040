@@ -436,7 +436,10 @@ always_comb begin
 		if (!safe) hold = 1'b1;
 		else case (sub)
 			FC_CHK: begin
-				if (bg) hold = 1'b1;
+				// the released operation completing this cycle without an
+				// exception lets CHK go (one that raises one makes it pending
+				// at this edge: CHK waits and delivers it)
+				if (bg && !(f_done && !f_excreq)) hold = 1'b1;
 				else if (chk_pend) begin
 					xvec = pend_vec;
 				end
