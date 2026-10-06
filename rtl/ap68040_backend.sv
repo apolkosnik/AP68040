@@ -1006,7 +1006,12 @@ end
 
 // front-file write by EX, and its broadcast to younger operands
 wire ex_d_eff = ex_u.d_v && !ex_dkill && !(ex_u.op == OP_CAS && cas_eq);
-assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd &&
+// (the odd-target check as it concerns a register write: only DBcc and
+// FDBcc are branches that write one, so the ALU's taken stays off the
+// operand forwarding)
+wire ex_odd_w = ex_br && (ex_bdb ? ex_u.target[0] :
+                          (ex_u.op == OP_FPU) && ex_taken && ex_target[0]);
+assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd_w &&
                  (ex_u.exc == 8'd0);
 assign exw_reg = ex_u.d_reg;
 assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
