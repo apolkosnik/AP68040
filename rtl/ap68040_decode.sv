@@ -267,6 +267,17 @@ always_comb begin
 	                      : (win_fatc[fi] ? EXC_IFSA : EXC_IFS);
 end
 logic [31:0] ntarget;
+// ntarget == bt_tgt without the target adder: a PC-relative target
+// qpc + 2 + disp equals bt_tgt exactly when disp == bt_tgt - qpc - 2,
+// which is formed from registers alongside the decode (the BTB check
+// ends in btb_we and d_redir_v)
+logic        teq;
+wire  [31:0] bt_d2 = bt_tgt - qpc - 32'd2;
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && push && ph == PH_IDLE && bt_end && nrec.pred && teq != (ntarget == bt_tgt))
+		$display("DECODE: teq %b disagrees with the target compare at %h", teq, qpc);
+// synthesis translate_on
 ph_t         nph;
 
 // Branch prediction at D1 (the back end verifies every prediction in EX):
@@ -306,6 +317,7 @@ always_comb begin
 	flt     = 1'b0;
 	nredir  = 1'b0;
 	ntarget = '0;
+	teq     = 1'b0;
 	disp    = '0;
 	nph     = ph;
 
@@ -473,6 +485,7 @@ always_comb begin
 			       (opw[7:0] == 8'hFF) ? {win[1], win[2]} :
 			       {{24{opw[7]}}, opw[7:0]};
 			ntarget = qpc + 32'd2 + disp;
+			teq     = (disp == bt_d2);
 			nrec.bst = disp[31];
 			nrec.bhc = bht_q;
 			nredir  = (a0.rt == UA_BSR) || (opw[11:8] == 4'h0) || (disp[31] ^ bht_q[1]);
@@ -480,27 +493,34 @@ always_comb begin
 		else if ((a0.rt == UA_JSR || a0.rt == UA_JMP) && go && !go_part &&
 		         (nrec.ea0.m == EM_ABSW || nrec.ea0.m == EM_ABSL || nrec.ea0.m == EM_PC16)) begin
 			ntarget = nrec.ea0.bd;
+			teq     = (nrec.ea0.m == EM_ABSL) ? ({win[1], win[2]} == bt_tgt) :
+			          (nrec.ea0.m == EM_ABSW) ? (sx16(win[1]) == bt_tgt) :
+			                                    (sx16(win[1]) == bt_d2);
 			nredir  = 1'b1;
 			// the target is known: JSR is a single push (as BSR)
 			if (a0.rt == UA_JSR && nrec.exc == 8'd0) nrec.rt = UA_JSR_K;
 		end
 		else if (a0.rt == UA_RTS && ras_n != 4'd0) begin
 			ntarget = ras[ras_tp];
+			teq     = (ras[ras_tp] == bt_tgt);
 			nredir  = 1'b1;
 		end
 		else if (a0.rt == UA_DBCC) begin
 			disp    = sx16(win[1]);
 			ntarget = qpc + 32'd2 + disp;
+			teq     = (disp == bt_d2);
 			nredir  = disp[31];
 		end
 		else if (a0.rt == UA_FBCC) begin
 			disp    = opw[6] ? {win[1], win[2]} : sx16(win[1]);
 			ntarget = qpc + 32'd2 + disp;
+			teq     = (disp == bt_d2);
 			nredir  = (opw[5:0] == 6'h0F) || disp[31];
 		end
 		else if (a0.rt == UA_FDBCC) begin
 			disp    = sx16(win[2]);
 			ntarget = qpc + 32'd4 + disp;
+			teq     = (disp == bt_d2 - 32'd2);
 			nredir  = disp[31];
 		end
 		if (a0.rt == UA_FPU_GEN && nrec.ea0.m == EM_IMM)
@@ -674,7 +694,7 @@ always_ff @(posedge clk) begin
 			end
 			if (push && ph == PH_IDLE && bt_end) begin
 				// the fetch already took this branch: fine if D1 agrees
-				if (!(nrec.pred && ntarget == bt_tgt)) begin
+				if (!(nrec.pred && teq)) begin
 					d_redir_v  <= 1'b1;
 					d_redir_pc <= nrec.pred ? ntarget : nrec.npc;
 					btb_we     <= 1'b1;
