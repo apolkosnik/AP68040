@@ -50,6 +50,7 @@ module ap68040_fpif
 	// the uop in EX
 	input  logic        ex_v,           // an OP_FPU uop is in EX
 	input  logic  [3:0] sub,
+	input  logic        fuse,           // CHK: dispatch in the same uop (FPm to FPn)
 	input  logic  [7:0] imm,            // operand A constant
 	input  logic  [7:0] immb,           // operand B constant
 	input  logic [31:0] av,
@@ -439,7 +440,20 @@ always_comb begin
 				// the released operation completing this cycle without an
 				// exception lets CHK go (one that raises one makes it pending
 				// at this edge: CHK waits and delivers it)
-				if (bg && !(f_done && !f_excreq)) hold = 1'b1;
+				if (fuse && go) begin
+					// dispatched (below): DISP's outcome
+					if (f_unimp) begin
+						xvec = VEC_FLINE; xfmt = 4'd2; xnext = 1'b1;
+						xaddr = pc; xcommit = 1'b1;
+					end
+					else if (f_unsupp) begin
+						xvec = VEC_UNSUP; xfmt = 4'd3; xnext = 1'b1;
+						xaddr = 32'd0; xcommit = 1'b1;
+					end
+					else if (f_excreq) begin xvec = f_excvec; xnext = 1'b1; end
+					else if (!(f_accepted || f_done)) hold = 1'b1;
+				end
+				else if (bg && !(f_done && !f_excreq)) hold = 1'b1;
 				else if (chk_pend) begin
 					xvec = pend_vec;
 				end
@@ -447,6 +461,7 @@ always_comb begin
 					xvec = chk_ill ? VEC_ILL : VEC_FLINE;
 					if (chk_un) begin xfmt = 4'd2; xnext = 1'b1; end
 				end
+				else if (fuse) hold = 1'b1;    // dispatching this cycle
 			end
 			FC_DISP: begin
 				if (ocl == 3'b011) begin
@@ -576,7 +591,32 @@ always_ff @(posedge clk) begin
 		end
 
 		if (act) case (sub)
-			FC_CHK: if (adv) begin
+			FC_CHK: if (fuse && !go && !(bg && !(f_done && !f_excreq)) && !chk_pend && !chk_x) begin
+				// FPm to FPn: CHK's latching and DISP's request at once
+				opw_q   <= opw;
+				ext_q   <= ext;
+				eav     <= 1'b0;
+				sx_v    <= 1'b0;
+				sx_kill <= 1'b0;
+				done_q  <= 1'b0;
+				go      <= 1'b1;
+				f_req   <= 1'b1;
+				f_iawe  <= 1'b1;
+				f_iapc  <= pc;
+				f_class <= ocl;
+				f_opm   <= opm;
+				f_fmt   <= fmt;
+				f_srcr  <= ext[12:10];
+				f_dstr  <= ext[9:7];
+				f_din   <= din_of(fmt, av, bv, latch);
+			end
+			else if (fuse && go) begin
+				if (adv) begin
+					go <= 1'b0;
+					if (f_accepted && !f_done && !f_excreq) bg <= 1'b1;
+				end
+			end
+			else if (adv) begin
 				opw_q <= opw;
 				ext_q <= ext;
 				eav   <= 1'b0;
@@ -756,6 +796,8 @@ always_ff @(posedge clk) begin
 			default: ;
 		endcase
 		if (!(ex_v && sub == FC_CRR)) crr_wait <= 1'b0;
+		// a request is done with when its uop leaves (a fused CHK may follow)
+		if (act && adv && sub == FC_DISP) go <= 1'b0;
 		if (kill) begin
 			go <= 1'b0; mvr_wait <= 1'b0; crr_wait <= 1'b0;
 		end

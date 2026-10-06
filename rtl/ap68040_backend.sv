@@ -472,6 +472,7 @@ wire         ex_is_fp = (ex_u.op == OP_FPU);
 ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
 	.clk(clk), .nreset(nreset),
 	.ex_v(ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0), .sub(ex_u.cond),
+	.fuse(ex_u.sz == SZ_W),
 	.imm(ex_u.imm[7:0]), .immb(ex_u.imm_b[7:0]),
 	.av(ex_av), .bv(ex_bv), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
 	.safe(!wb_v || wb_fpchk), .adv(adv_ex), .kill(kill_now),

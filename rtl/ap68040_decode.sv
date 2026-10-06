@@ -187,6 +187,7 @@ function automatic logic jcond(input logic [4:0] jc, input logic [3:0] e0,
 		JC_X1A:      jcond = ext1[15];
 		JC_CREG_RF:  jcond = (ext1[11:0] == 12'h800) || (ext1[11:0] == 12'h803) ||
 		                     (ext1[11:0] == 12'h804);
+		JC_FP_OC0:   jcond = (ext1[15:13] == 3'b000);
 		default:     jcond = 1'b0;
 	endcase
 endfunction
@@ -355,8 +356,10 @@ always_comb begin
 				                 part.pc + {27'd0, part_len, 1'b0},
 				                 win[0], win[1], win[2], win[3], win[4]);
 			// an FPU immediate is read from the instruction stream by the
-			// microcode: its address follows the extension word
-			if (ph == PH_EA0 && nrec.ea0.m == EM_IMM && part.rt == UA_FPU_GEN)
+			// microcode: its address follows the extension word (the
+			// operation word says FPU: the record's routine is past the
+			// first word D1 resolves)
+			if (ph == PH_EA0 && nrec.ea0.m == EM_IMM && part.opw[15:6] == 10'b1111_0010_00)
 				nrec.ea0.bd = part.pc + 32'd4;
 			if (ph == PH_EA0 && has_ext(part_pd.i1) && !flt) begin
 				go_part = 1'b1;

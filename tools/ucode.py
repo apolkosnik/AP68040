@@ -528,6 +528,7 @@ def _fst(src, off, msz='L', **kw):
 
 
 R('FPU_GEN',
+  U(jc='FP_OC0', jt='FPU_RRF.0'),
   FCHK(),
   U(jc='FP_OC0', jt='FPU_RR.0'),
   U(jc='FP_OC2', jt='FPU_IN.0'),
@@ -536,6 +537,9 @@ R('FPU_GEN',
   U(jc='FP_OC67', jt='FPU_MVM.0'),
   F('DISP', last=1))                       # opclass 001 never gets here (CHK)
 R('FPU_RR', F('DISP', last=1))
+# FPm to FPn: CHK and DISP in one uop (sz W marks it: the FPU interface
+# checks, then dispatches in the same EX visit)
+R('FPU_RRF', F('CHK', a='EXT1', b='OPW', sz='W', last=1))
 # <ea> to FPn
 R('FPU_IN',
   U(jc='FMT_7', jt='FPU_RR.0'),            # FMOVECR: no operand

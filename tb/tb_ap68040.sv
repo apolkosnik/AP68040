@@ -760,10 +760,10 @@ int fpt_from;
 initial if (!$value$plusargs("fptrace=%d", fpt_from)) fpt_from = -1;
 always_ff @(posedge clk)
 	if (fpt_from >= 0 && cycles >= fpt_from && cycles < fpt_from + 300)
-		$display("%8d FPU fst=%0d sh_cnt=%0d | EX %s op=%0d hold=%b",
+		$display("%8d FPU fst=%0d sh_cnt=%0d | EX %s op=%0d cond=%0d sz=%0d hold=%b",
 		         cycles, dut.be.fpif.fpu.fst, dut.be.fpif.fpu.sh_cnt,
 		         dut.be.ex_v ? $sformatf("%04x", dut.be.ex_u.pc[15:0]) : "----",
-		         dut.be.ex_u.op, dut.be.ex_hold);
+		         dut.be.ex_u.op, dut.be.ex_u.cond, dut.be.ex_u.sz, dut.be.ex_hold);
 
 // exception entries
 always_ff @(posedge clk)
