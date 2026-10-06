@@ -308,13 +308,16 @@ logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
 logic [31:0] x_chunk;
+// the ITT matches are formed in F0 (the TTRs change only by MOVEC, which
+// serializes and refetches), so F1 starts from them
+logic        f1_tt0, f1_tt1;
 always_comb begin
 	logic tt0, tt1;
 	logic [21:0] tg;
 	x_ok = 1'b0; x_flt = 1'b0; x_walk = 1'b0;
 	x_pa = f1_pc; x_cm = 2'b00; x_upa = 2'b00;
-	tt0 = ttr_hit(itt0, f1_pc, f1_s);
-	tt1 = ttr_hit(itt1, f1_pc, f1_s);
+	tt0 = f1_tt0;
+	tt1 = f1_tt1;
 	if (tt0 || tt1) begin
 		x_ok  = 1'b1;
 		x_cm  = tt0 ? itt0[6:5] : itt1[6:5];
@@ -397,6 +400,7 @@ always_ff @(posedge clk) begin
 		fnew  <= 1'b1;
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
+		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0;
 		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0; f1_bkind <= '0;
 		fras_tp <= '0; fras_n <= '0;
 		for (int i = 0; i < 8; i++) fras[i] <= '0;
@@ -503,6 +507,8 @@ always_ff @(posedge clk) begin
 			f1_btgt  <= btb_q[30:0];
 			f1_pc  <= fpc;
 			f1_s   <= smode;
+			f1_tt0 <= ttr_hit(itt0, fpc, smode);
+			f1_tt1 <= ttr_hit(itt1, fpc, smode);
 			f1_dem <= fnew;
 			f1_hit <= atc_hit;
 			f1_e   <= atc_e;
