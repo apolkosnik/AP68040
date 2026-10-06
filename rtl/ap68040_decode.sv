@@ -292,18 +292,30 @@ ph_t         nph;
 //    the redirect EX would have made anyway).
 logic  [1:0] bht_q;
 ap68040_lutram #(.AW(8), .DW(2)) bht (
-	.clk(clk), .we(bht_we), .waddr(bht_wa), .wdata(bht_wd), .raddr(qpc[8:1]), .q(bht_q)
+	.clk(clk), .we(bw_we), .waddr(bw_wa), .wdata(bw_wd), .raddr(qpc[8:1]), .q(bht_q)
 );
 // training counts from the table's current value (a copy read at the
 // training address), not from the value D1 read when it decoded the
 // branch: two passes of a short loop are often decoded before the first
 // one is trained
-logic  [1:0] bht_t, bht_wd;
+// The update is written a cycle later from registers of its own (the read
+// address is not also the write address); a training of the same counter
+// in that cycle takes the value being written.
+logic  [1:0] bht_t, bht_c, bht_nd;
+logic        bw_we;
+logic  [7:0] bw_wa;
+logic  [1:0] bw_wd;
 ap68040_lutram #(.AW(8), .DW(2)) bht_tr (
-	.clk(clk), .we(bht_we), .waddr(bht_wa), .wdata(bht_wd), .raddr(bht_wa), .q(bht_t)
+	.clk(clk), .we(bw_we), .waddr(bw_wa), .wdata(bw_wd), .raddr(bht_wa), .q(bht_t)
 );
-assign bht_wd = bht_dis ? ((bht_t == 2'd3) ? 2'd3 : bht_t + 2'd1)
-                        : ((bht_t == 2'd0) ? 2'd0 : bht_t - 2'd1);
+assign bht_c  = (bw_we && bw_wa == bht_wa) ? bw_wd : bht_t;
+assign bht_nd = bht_dis ? ((bht_c == 2'd3) ? 2'd3 : bht_c + 2'd1)
+                        : ((bht_c == 2'd0) ? 2'd0 : bht_c - 2'd1);
+always_ff @(posedge clk) begin
+	bw_we <= nreset && bht_we;
+	bw_wa <= bht_wa;
+	bw_wd <= bht_nd;
+end
 logic [31:0] ras [8];
 logic  [2:0] ras_tp;           // the top entry
 logic  [3:0] ras_n;            // entries held (0..8)
