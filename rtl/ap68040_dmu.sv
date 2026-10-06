@@ -334,6 +334,15 @@ function automatic logic [127:0] mrg(input logic [127:0] l, input logic [15:0] b
 	mrg = l;
 endfunction
 
+// the WB fast store of this cycle (its RAM write is dw next cycle): merged
+// into DC2's copy now, so a load behind it does not wait for that write
+logic         wfm;
+logic  [5:0]  wfm_set;
+logic  [1:0]  wfm_way;
+logic [15:0]  wfm_be;
+logic [31:0]  wfm_word;
+logic         dwp;            // this cycle's dw was merged a cycle ago (wfm)
+
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
@@ -359,10 +368,18 @@ generate
 					l = mrg(l, dwq_be, dwq_word);
 				if (dw && dw_src == 2'd0 && dw_set == m1.a[9:4] && dw_way == 2'(gw))
 					l = mrg(l, dw_be, dw_word);
+				if (wfm && wfm_set == m1.a[9:4] && wfm_way == 2'(gw))
+					l = mrg(l, wfm_be, wfm_word);
 				dq_r[gw] <= l;
 			end
-			else if (dw && dw_src == 2'd0 && dw_set == m2.r.a[9:4] && dw_way == 2'(gw))
-				dq_r[gw] <= mrg(dq_r[gw], dw_be, dw_word);
+			else begin
+				l = dq_r[gw];
+				if (dw && dw_src == 2'd0 && dw_set == m2.r.a[9:4] && dw_way == 2'(gw))
+					l = mrg(l, dw_be, dw_word);
+				if (wfm && wfm_set == m2.r.a[9:4] && wfm_way == 2'(gw))
+					l = mrg(l, wfm_be, wfm_word);
+				dq_r[gw] <= l;
+			end
 		end
 	end
 endgenerate
@@ -477,7 +494,7 @@ wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
 logic m1_stale;
 
 // (a store that left WB is still being written this cycle: dw)
-wire fast_now = m2.r.v && m2.fast && !hz && !(dw && dw_set == m2.r.a[9:4]);
+wire fast_now = m2.r.v && m2.fast && !hz && !(dw && !dwp && dw_set == m2.r.a[9:4]);
 wire [31:0] fast_data = take(dq_r[m2.x.way], m2.r.a[3:0], nbytes(m2.r.msz));
 
 // a store with its translation known needs nothing from DC2 unless it must
@@ -646,6 +663,12 @@ wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
                (e_st == E_IDLE) && !e_wst_done;
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
+assign wfm      = wb_fast && !sn_frz;
+assign wfm_set  = m4.x.pa[9:4];
+assign wfm_way  = m4.x.way;
+assign wfm_be   = wbf_be;
+assign wfm_word = wbf_word;
+always_ff @(posedge clk) dwp <= nreset && wfm;
 // a copyback store across a line, both parts hits: the first part this
 // cycle, the second the next (wfs_p1), without the engine
 logic        wfs_p1;
@@ -657,7 +680,7 @@ wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
 
 // a fast load behind an older store to its line waits for it (merged into
 // its copy) instead of taking the engine
-wire fast_wait = m2.r.v && m2.fast && (hz || (dw && dw_set == m2.r.a[9:4]));
+wire fast_wait = m2.r.v && m2.fast && (hz || (dw && !dwp && dw_set == m2.r.a[9:4]));
 wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job;
 wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
 
