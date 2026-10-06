@@ -74,7 +74,7 @@ JTAG.
 The tools are Verilator 5 and vasm/vbcc (`vasmm68k_mot`, `vbccm68k`).
 
 ```
-tb/run_tests.sh                 # 20 programs x 5 bus configurations
+tb/run_tests.sh                 # 21 programs x 5 bus configurations
 tb/build_cputest.sh             # the cputest replay bench
 tb/run_cputest.py data040.zip --full --jobs 24   # the whole corpus
 tb/build_c.sh dhry              # Dhrystone (vbcc)
