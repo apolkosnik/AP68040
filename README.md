@@ -13,9 +13,9 @@ its benches in `tb_old/`, as a reference.
 
 | | |
 |---|---|
-| clock | 60 MHz (16.667 ns): worst setup slack +0.009 ns; hold and minimum pulse width met in all four corners (Quartus 17.0, out of context) |
-| area | 26,451 ALMs (63 % of the 5CSEBA6), 18,652 registers |
-| Dhrystone 2.1 | CPI 1.90, about 27.6 DMIPS at 60 MHz (user mode, copyback caches, in simulation) |
+| clock | 60 MHz (16.667 ns): worst setup slack +0.547 ns with the default seed, hold and minimum pulse width met in all four corners (Quartus 17.0, out of context; two of three seeds close) |
+| area | 26,399 ALMs (63 % of the 5CSEBA6), 18,195 registers |
+| Dhrystone 2.1 | CPI 1.50, about 35.0 DMIPS at 60 MHz (user mode, copyback caches, in simulation) |
 | cputest 68040 corpus | 3776 of 3801 slices; the other 25 are known WinUAE generator defects (see doc/STATUS.md) |
 
 ## Design
@@ -74,7 +74,7 @@ JTAG.
 The tools are Verilator 5 and vasm/vbcc (`vasmm68k_mot`, `vbccm68k`).
 
 ```
-tb/run_tests.sh                 # 18 programs x 5 bus configurations
+tb/run_tests.sh                 # 19 programs x 5 bus configurations
 tb/build_cputest.sh             # the cputest replay bench
 tb/run_cputest.py data040.zip --full --jobs 24   # the whole corpus
 tb/build_c.sh dhry              # Dhrystone (vbcc)

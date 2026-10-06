@@ -12,7 +12,7 @@
 | M5 | MMU: ATCs, table walk, TTRs, PTEST/PFLUSH (t_mmu, t_atcprobe) | done |
 | M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
 | M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
-| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: worst setup slack +0.009 ns at 16.667 ns, hold and pulse width met in all four corners; 26,451 ALMs, 18,652 registers (out of context, Quartus 17.0) |
+| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE), the default seed gives worst setup slack +0.547 ns at 16.667 ns, hold and pulse width met in all four corners; 26,399 ALMs, 18,195 registers.  Seed 2 also closes (+0.093 ns); seed 3 misses the slow -40C corner by 0.062 ns |
 | M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.50, about 35.0 DMIPS at 60 MHz |
 | M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
 
@@ -52,6 +52,14 @@ redirecting from EX; 1,951,441 with one-uop JSR.  What is left: about
 two-uop memory-to-memory MOVE, MOVEM one register a cycle.  A 512-entry
 BTB removes 8,000 D1 redirects (2 %), but failed timing by 0.44 ns
 (placement of the D1 consume path); not adopted.
+
+Timing: seeds move the worst path by about +-0.5 ns, so a change is judged
+on three seeds.  The paths that limited the seeds in this round, and what
+cut them: the FPU normalizer's input select (registered with the state),
+the fetch F1 ITT match (formed in F0), the D1 BTB target check (compares
+the displacement with bt_tgt - qpc - 2, no adder), JSR_K chosen as the
+record enters the FIFO (off the return stack path), and the ALU's taken
+kept off EX's operand forwarding.
 
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
