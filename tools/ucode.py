@@ -557,6 +557,20 @@ R('FPU_IN8', _fld('T0', 0), _fld('T1', 4), F('DISP', a='T0', b='T1', ag='FUPD', 
 R('FPU_IN12', _fld('T0', 0), _fld('T1', 4), _fld('LATCH', 8),
   F('DISP', a='T0', b='T1', ag='FUPD', last=1))
 R('FPU_IND', F('DISP', a='EA0', last=1))
+# The common forms straight through, chosen by D1 from the extension word
+# and the EA (no jump words: each costs the sequencer a cycle): the same
+# uops as the FPU_GEN / FPU_IN / FPU_OUT paths they replace
+R('FPU_K_IND',  FCHK(), F('DISP', a='EA0', last=1))
+R('FPU_K_IN4',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0),
+  F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_K_IN1',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0, msz='B'),
+  F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_K_IN2',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0, msz='W'),
+  F('DISP', a='T0', ag='FUPD', last=1))
+R('FPU_K_IN8',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0), _fld('T1', 4),
+  F('DISP', a='T0', b='T1', ag='FUPD', last=1))
+R('FPU_K_IN12', FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0), _fld('T1', 4),
+  _fld('LATCH', 8), F('DISP', a='T0', b='T1', ag='FUPD', last=1))
 # FPn to <ea>
 R('FPU_OUT',
   U(jc='EA0_DN', jt='FPU_OUTD.0'),
@@ -575,6 +589,19 @@ R('FPU_OUT8', F('GET', a='CONST', const=1, d='T1'), _fst('T0', 0), _fst('T1', 4)
 R('FPU_OUT12', F('GET', a='CONST', const=1, d='T1'), F('GET', a='CONST', const=2, d='T2'),
   _fst('T0', 0), _fst('T1', 4), _fst('T2', 8), F('END', ag='FUPD', last=1))
 R('FPU_OUTD', F('DISP', b='EA0', d='EA0'), F('END', last=1))
+R('FPU_K_OUTD', FCHK(), F('DISP', b='EA0', d='EA0'), F('END', last=1))
+R('FPU_K_OUT4', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+  _fst('T0', 0), F('END', ag='FUPD', last=1))
+R('FPU_K_OUT1', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+  _fst('T0', 0, msz='B'), F('END', ag='FUPD', last=1))
+R('FPU_K_OUT2', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+  _fst('T0', 0, msz='W'), F('END', ag='FUPD', last=1))
+R('FPU_K_OUT8', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+  F('GET', a='CONST', const=1, d='T1'), _fst('T0', 0), _fst('T1', 4),
+  F('END', ag='FUPD', last=1))
+R('FPU_K_OUT12', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+  F('GET', a='CONST', const=1, d='T1'), F('GET', a='CONST', const=2, d='T2'),
+  _fst('T0', 0), _fst('T1', 4), _fst('T2', 8), F('END', ag='FUPD', last=1))
 # FMOVE(M) control registers: one slot each for FPCR, FPSR, FPIAR, the
 # absent ones cancelled; Dn / An hold the single register
 R('FPU_CR',
@@ -855,7 +882,10 @@ def emit():
         for n in ['EXC_FMT0', 'EXC_FMT2', 'EXC_FMT7', 'EXC_RESET', 'EXC_IRQ', 'EXC_IRQM',
                   'DEC_EXC', 'BCC', 'BSR', 'DBCC', 'FBCC', 'FDBCC', 'FPU_GEN',
                   'TRAP', 'BKPT', 'ILLEGAL', 'MOVEM_RM', 'MOVEM_MR',
-                  'MOVEC_RD', 'MOVEC_WR', 'JSR', 'JSR_K', 'JMP', 'RTS']:
+                  'MOVEC_RD', 'MOVEC_WR', 'JSR', 'JSR_K', 'JMP', 'RTS',
+                  'FPU_K_IND', 'FPU_K_IN1', 'FPU_K_IN2', 'FPU_K_IN4', 'FPU_K_IN8',
+                  'FPU_K_IN12', 'FPU_K_OUTD', 'FPU_K_OUT1', 'FPU_K_OUT2',
+                  'FPU_K_OUT4', 'FPU_K_OUT8', 'FPU_K_OUT12']:
             f.write('localparam logic [9:0] UA_%s = 10\'d%d;\n' % (n, ENTRY[n]))
         f.write('endpackage\n')
 

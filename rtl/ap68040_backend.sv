@@ -191,10 +191,13 @@ logic [31:0] dc1_upd, dc1_upd2, dc2_upd, dc2_upd2, ex_upd, ex_upd2;
 // copy.  Five read ports at AG: base, index, upd2 register, A, B.
 logic [31:0] fv;
 // an FPU uop may act once it is the oldest in flight -- or when the one at
-// WB is its own instruction's CHK, which left EX without an exception and
-// commits (no instruction boundary is between them)
-wire wb_fpchk = wb_v && wb_u.op == OP_FPU && wb_u.cond == 4'd0 && !wb_u.last &&
-                ex_v && ex_u.op == OP_FPU && ex_u.pc == wb_u.pc && (wb_exc == 8'd0);
+// WB is an earlier uop of its own instruction that commits: no exception
+// (a load's fault is known by now), not the last uop (no instruction
+// boundary between them: no interrupt or trace), and not a store (a bus
+// error on a store comes after WB)
+wire wb_fpchk = wb_v && !wb_u.last && (wb_exc == 8'd0) &&
+                (wb_u.mem == M_NONE || wb_u.mem == M_LD) &&
+                ex_v && ex_u.op == OP_FPU && ex_u.pc == wb_u.pc;
 // FPU interface outputs (ap68040_fpif)
 logic        fp_hold, fp_dkill, fp_taken, fp_xnext, fp_xcommit, fp_stkill;
 logic [31:0] fp_res, fp_xaddr;

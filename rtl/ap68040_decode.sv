@@ -277,9 +277,39 @@ logic        jsr_k;       // a JSR to a known target (see nrec_q)
 // a call (BSR, JSR) or a return (RTS), for the return stacks: from the
 // decoder's entry (the record's routine is past a first jump D1 resolved,
 // which is a longer path), kept from the first part of a multi-part decode
-logic        part_call, part_ret;
+logic        part_call, part_ret, part_fpg;
 wire         rcall = (ph == PH_IDLE) ? (a0.rt == UA_BSR || a0.rt == UA_JSR) : part_call;
 wire         rret  = (ph == PH_IDLE) ? (a0.rt == UA_RTS) : part_ret;
+// an FPU general instruction (the decoder's entry FPU_GEN)
+wire         fpg   = (ph == PH_IDLE) ? (a0.rt == UA_FPU_GEN) : part_fpg;
+// its straight-line routine for the common forms (FPU_GEN's paths without
+// their jump words), else the record's own
+function automatic logic [9:0] fpu_k(input logic [15:0] x, input logic [3:0] m,
+                                    input logic [9:0] dflt);
+	fpu_k = dflt;
+	if (x[15:13] == 3'b010 && x[12:10] != 3'd7 && m != EM_AN) begin
+		if (m == EM_DN) fpu_k = UA_FPU_K_IND;
+		else case (x[12:10])
+			3'd0, 3'd1: fpu_k = UA_FPU_K_IN4;
+			3'd6:       fpu_k = UA_FPU_K_IN1;
+			3'd4:       fpu_k = UA_FPU_K_IN2;
+			3'd5:       fpu_k = UA_FPU_K_IN8;
+			3'd2, 3'd3: fpu_k = UA_FPU_K_IN12;
+			default: ;
+		endcase
+	end
+	else if (x[15:13] == 3'b011 && m != EM_AN) begin
+		if (m == EM_DN) fpu_k = UA_FPU_K_OUTD;
+		else case (x[12:10])
+			3'd0, 3'd1: fpu_k = UA_FPU_K_OUT4;
+			3'd6:       fpu_k = UA_FPU_K_OUT1;
+			3'd4:       fpu_k = UA_FPU_K_OUT2;
+			3'd5:       fpu_k = UA_FPU_K_OUT8;
+			3'd2:       fpu_k = UA_FPU_K_OUT12;
+			default: ;
+		endcase
+	end
+endfunction
 wire  [31:0] bt_d2 = bt_tgt - qpc - 32'd2;
 // synthesis translate_off
 always @(posedge clk)
@@ -590,6 +620,7 @@ dinst_t nrec_q;
 always_comb begin
 	nrec_q = nrec;
 	if (jsr_k && nrec.exc == 8'd0) nrec_q.rt = UA_JSR_K;
+	if (fpg && nrec.exc == 8'd0) nrec_q.rt = fpu_k(nrec.ext1, nrec.ea0.m, nrec.rt);
 	nrec_q.ras.v  = 1'b1;
 	nrec_q.ras.tp = ras_tp;
 	nrec_q.ras.n  = ras_n;
@@ -647,6 +678,7 @@ always_ff @(posedge clk) begin
 		part_bt    <= 1'b0;
 		part_call  <= 1'b0;
 		part_ret   <= 1'b0;
+		part_fpg   <= 1'b0;
 		ras_tp     <= '0;
 		ras_n      <= '0;
 		for (int i = 0; i < 8; i++) ras[i] <= '0;
@@ -713,6 +745,7 @@ always_ff @(posedge clk) begin
 				if (ph == PH_IDLE) begin
 					part_call <= rcall;
 					part_ret  <= rret;
+					part_fpg  <= fpg;
 					part_pd   <= pd0;
 					part_len  <= use_n;
 					part_imml <= (a0.rt == UA_FPU_GEN) ? fp_immlen(win[1]) :

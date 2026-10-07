@@ -4,3 +4,4 @@ tb/build/
 *.bin
 obj/
 tb/build/
+tb/tools/__pycache__/
