@@ -79,6 +79,10 @@ module ap68040_backend
 	output logic        bht_we,         // Bcc history training (decode's table)
 	output logic  [7:0] bht_wa,
 	output logic        bht_dis,        // ... the branch went against the static rule
+	output logic        lp_we,          // loop exit training (decode's table)
+	output logic [11:0] lp_wa,
+	output logic        lp_tk,
+	output logic        lp_mp,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
 	output logic        dm_iack,        // interrupt acknowledge cycle
 	input  logic        dm_hold1,       // the DMU holds DC1
@@ -408,6 +412,16 @@ always_ff @(posedge clk) begin
 	bht_dis  <= !bht_agree;
 end
 assign bht_we = bht_we_q && !flush;
+// loop exits: every backward Bcc/DBcc, the same way
+logic       lp_we_q;
+always_ff @(posedge clk) begin
+	lp_we_q <= nreset && adv_ex && ex_u.bst &&
+	           ((ex_u.op == OP_BCC && ex_u.br == BR_COND) || ex_u.op == OP_DBCC);
+	lp_wa   <= ex_u.pc[12:1];
+	lp_tk   <= ex_taken;
+	lp_mp   <= ex_mispred;
+end
+assign lp_we = lp_we_q && !flush;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
 assign dm_iack    = (ag_u.mfc == MFC_IACK);
 always_comb begin

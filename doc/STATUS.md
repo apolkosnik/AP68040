@@ -13,7 +13,7 @@
 | M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
 | M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
 | M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths).  69028f0: seeds 1, 2 and 3 meet setup and hold in all four corners (worst setup slack +0.063, +0.181, +0.222 ns at 16.667 ns); 26,976 ALMs (seed 1) |
-| M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.48, about 35.4 DMIPS at 60 MHz |
+| M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.40, about 37.5 DMIPS at 60 MHz |
 | M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
 
 ## Regression
@@ -40,7 +40,7 @@ retries, BCLK at half PCLK, and all of those together.
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
 t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress,
-t_eredir, t_cbsplit, t_cmodes.
+t_eredir, t_cbsplit, t_cmodes, t_loops.
 
 The bench counts the CPU's bus transfers in a window ($F2D0-$F2DC);
 t_cbsplit uses it to show that misaligned and line- or page-crossing
@@ -49,7 +49,10 @@ reads in copyback and write-through mode are served by the data cache
 t_cmodes checks every caching mode by its bus transfers (fills, write-
 through, write-allocate, victim pushes, CPUSHL, CINVL, noncachable
 accesses, and a noncachable read that hits a dirty line: push, invalidate,
-then memory, as WinUAE does).
+then memory, as WinUAE does).  The bench also counts Bcc/DBcc
+mispredictions ($F2E4): t_loops checks that the loop exit predictor
+predicts the exits of fixed-trip loops (Bcc, DBRA, nested, with a TRAP
+flushing every pass, after a trip change) besides the loops' results.
 
 Performance: `tb/build_c.sh dhry` (vbcc; `ASFLAGS=-DCOPYBACK=1` runs it in
 user mode with copyback caches), then `obj/obj_prog/tb_ap68040
@@ -66,12 +69,17 @@ Dhrystone history (cycles for the 2000 runs between the stamps):
 2,015,434 with three entries and the return stack and BHT repaired;
 1,997,442 with load data handed to AG at DC2; 1,985,428 with mispredicts
 redirecting from EX; 1,951,441 with one-uop JSR; 1,927,452 with a WB
-store merged into DC2's copy in its own cycle.  tb/tools/gen_bench_insn.py
-measures 58 instruction forms (bench_insn.s); outliers left: two taken
-branches in one fetch long word thrash the one-slot BTB entry (6 cycles
-each), MOVE16 (about 38), CAS/TAS (locked bus transfers, about 25).  What is left: about
-12,000 mispredictions (loop exits), load- and ALU-to-address interlocks,
-two-uop memory-to-memory MOVE, MOVEM one register a cycle.  A 512-entry
+store merged into DC2's copy in its own cycle; 1,903,474 with the split
+access and FPU work; 1,819,584 with the loop exit predictor (Bcc/DBcc
+mispredictions 12,000 -> 2,032; the exits it predicts cost a D1 redirect
+where the fetch BTB had taken the branch).  tb/tools/gen_bench_insn.py
+measures 67 instruction forms (bench_insn.s); outliers left: MOVE16
+(about 38), CAS/TAS (locked bus transfers, about 25), split accesses
+(about 8), FP arithmetic (about 6).  What is left in Dhrystone: 2,000
+mispredictions of a forward BLE whose history counter it shares with a
+never-taken branch 512 bytes away (a hashed index moved the aliasing
+elsewhere and was slower), load- and ALU-to-address interlocks (about
+6 %), DIVS.L, two-uop memory-to-memory MOVE, MOVEM one register a cycle.  A 512-entry
 BTB removes 8,000 D1 redirects (2 %), but failed timing by 0.44 ns
 (placement of the D1 consume path); not adopted.
 

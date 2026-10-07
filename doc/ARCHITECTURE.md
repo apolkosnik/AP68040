@@ -121,11 +121,22 @@ over three cycles before the routine starts.
   at the training address), one cycle after the branch leaves EX, and not
   if that cycle flushes: D1 runs ahead of EX, so two passes of a short loop
   are often decoded before the first is trained.
+* **Loop exits.**  An 8-entry table (registers, tagged with PC[12:1])
+  learns the trip of a backward Bcc/DBcc: how many times it is taken
+  before it falls through.  When the same trip comes round twice running,
+  D1 predicts the fall-through at that count, overruling the history table
+  and the fetch BTB (whose entry it keeps: the next pass takes it).  EX
+  trains the count (as the history table, a cycle after the branch leaves
+  EX); D1 keeps its own count, ahead of EX by the instances in flight, and
+  goes back to EX's after every flush.  A mispredicted exit of a branch
+  without an entry takes one (round robin).  Counts saturate at 255: longer
+  loops are left to the history table.
 * Each record carries the return-stack pointer D1 found and what the
   instruction did to it; a back-end redirect restores it (after the
   instruction, or before it for a refetch), so calls and returns D1
   decoded on a wrong path leave no trace.
-* **The fetch BTB** (256 entries, MLAB, indexed by fetch address) remembers
+* **The fetch BTB** (256 entries, a slot for each word of a long word,
+  MLAB, indexed by fetch address) remembers
   D1's taken predictions: branches, calls (BSR/JSR) and returns (RTS).  A
   hit at F0 ends the chunk at the branch's last word, flags that word, and
   sends F0 to the target from F1 (one bubble): the entry's target, or for a

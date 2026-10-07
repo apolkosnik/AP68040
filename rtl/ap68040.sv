@@ -209,6 +209,8 @@ logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic        bht_dis;
+logic        lp_we, lp_tk, lp_mp;
+logic [11:0] lp_wa;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
 logic [31:0] dm_ldata, dm_faddr, dm_st_data;
 logic  [7:0] dm_fvec;
@@ -228,7 +230,8 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
 	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
-	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis), .sn_ihit(sn_ihit),
+	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
+	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
 	.irq_pending(irq_pending),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
@@ -356,6 +359,7 @@ ap68040_decode dec (
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
+	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
 	.btb_wslot(btb_wslot), .btb_wkind(btb_wkind), .btb_wtgt(btb_wtgt),
 	.ras_o(d_ras), .ras_tp_o(d_ras_tp), .ras_n_o(d_ras_n)

@@ -45,6 +45,7 @@
 //               bit 14: instead, SC 01 long writes to $D014 only          //
 //   $F2E0 long  (read) split copyback stores whose second line a snoop    //
 //               took between the two parts (the DMU's fallback)          //
+//   $F2E4 long  (read) Bcc/DBcc mispredicted in EX (write 0 clears)      //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -484,6 +485,9 @@ always_ff @(posedge clk) begin
 	// the DMU's fallback for a split WB store whose second line went
 	if (rsti_n && dut.dmu.wfs_p1 && !dut.dmu.sn_frz && !dut.dmu.m4.x1.hit)
 		mem.mem[16'hF2E0 >> 2] <= mem.mem[16'hF2E0 >> 2] + 32'd1;
+	// Bcc/DBcc mispredictions (t_loops)
+	if (rsti_n && dut.be.adv_ex && dut.be.ex_mispred && dut.be.ex_bdb && !dut.be.flush)
+		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
 end
 int          cap;
 

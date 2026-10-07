@@ -58,6 +58,11 @@ module ap68040_decode
 	input  logic        bht_we,
 	input  logic  [7:0] bht_wa,
 	input  logic        bht_dis,        // ... the branch went against the static rule
+	// loop exit training (from EX): a backward Bcc/DBcc, taken or not
+	input  logic        lp_we,
+	input  logic [11:0] lp_wa,
+	input  logic        lp_tk,
+	input  logic        lp_mp,          // ... and it was mispredicted
 
 	// BTB maintenance (the fetch unit's table)
 	output logic        btb_we,
@@ -357,6 +362,35 @@ logic [31:0] ras [8];
 logic  [2:0] ras_tp;           // the top entry
 logic  [3:0] ras_n;            // entries held (0..8)
 
+// Loop exits: a backward Bcc/DBcc that has been taken the same number of
+// times (the trip) before falling through, twice running, is predicted to
+// fall through when its count comes round again.  EX trains the count of
+// each entry (lp_cnt: taken since the last exit); D1 counts the same
+// branch as it predicts it (lp_sp), ahead of EX by the instances in
+// flight, and goes back to EX's count after every flush (lp_sync: until
+// the first record after it).  lp_x is registered: confident and lp_sp
+// at the trip.  8 entries, tagged with pc[12:1]; a mispredicted exit of a
+// branch without an entry takes one (round robin).
+localparam int LPN = 8;
+logic [11:0] lp_tag  [LPN];
+logic        lp_v    [LPN];
+logic        lp_cf   [LPN];
+logic  [7:0] lp_trip [LPN];
+logic  [7:0] lp_cnt  [LPN];
+logic  [7:0] lp_sp   [LPN];
+logic        lp_x    [LPN];
+logic  [2:0] lp_rr;
+logic        lp_sync;
+logic [LPN-1:0] lp_hit;
+logic        lp_exit, lp_br, lp_ovr;
+always_comb begin
+	for (int i = 0; i < LPN; i++)
+		lp_hit[i] = lp_v[i] && (lp_tag[i] == qpc[12:1]);
+	lp_exit = 1'b0;
+	for (int i = 0; i < LPN; i++)
+		if (lp_hit[i] && lp_x[i]) lp_exit = 1'b1;
+end
+
 always_comb begin
 	logic [31:0] disp;
 	logic        nredir;
@@ -368,6 +402,8 @@ always_comb begin
 	nredir  = 1'b0;
 	ntarget = '0;
 	teq     = 1'b0;
+	lp_br   = 1'b0;
+	lp_ovr  = 1'b0;
 	jsr_k   = 1'b0;
 	disp    = '0;
 	nph     = ph;
@@ -542,6 +578,9 @@ always_comb begin
 			nrec.bst = disp[31];
 			nrec.bhc = bht_q;
 			nredir  = (a0.rt == UA_BSR) || (opw[11:8] == 4'h0) || (disp[31] ^ bht_q[1]);
+			lp_br   = (a0.rt == UA_BCC) && (opw[11:9] != 3'd0) && disp[31];
+			lp_ovr  = lp_br && lp_exit;
+			if (lp_ovr) nredir = 1'b0;
 		end
 		else if ((a0.rt == UA_JSR || a0.rt == UA_JMP) && go && !go_part &&
 		         (nrec.ea0.m == EM_ABSW || nrec.ea0.m == EM_ABSL || nrec.ea0.m == EM_PC16)) begin
@@ -564,7 +603,10 @@ always_comb begin
 			disp    = sx16(win[1]);
 			ntarget = qpc + 32'd2 + disp;
 			teq     = (disp == bt_d2);
-			nredir  = disp[31];
+			nrec.bst = disp[31];
+			lp_br   = disp[31];
+			lp_ovr  = lp_br && lp_exit;
+			nredir  = disp[31] && !lp_exit;
 		end
 		else if (a0.rt == UA_FBCC) begin
 			disp    = opw[6] ? {win[1], win[2]} : sx16(win[1]);
@@ -651,6 +693,76 @@ wire stall = flush || hold_redir || d_redir_v || !room;
 wire fire  = (go || go_part) && !stall;
 wire push  = fire && go;
 wire pop   = rq_pop && (rq_n != 2'd0);
+
+// loop exit table updates
+wire lp_push = push && (ph == PH_IDLE) && lp_br && (nrec.exc == 8'd0);
+logic lp_whit;
+always_comb begin
+	lp_whit = 1'b0;
+	for (int i = 0; i < LPN; i++)
+		if (lp_v[i] && lp_tag[i] == lp_wa) lp_whit = 1'b1;
+end
+always_ff @(posedge clk) begin
+	if (!nreset) begin
+		lp_rr   <= '0;
+		lp_sync <= 1'b0;
+		for (int i = 0; i < LPN; i++) begin
+			lp_tag[i]  <= '0;
+			lp_v[i]    <= 1'b0;
+			lp_cf[i]   <= 1'b0;
+			lp_trip[i] <= '0;
+			lp_cnt[i]  <= '0;
+			lp_sp[i]   <= '0;
+			lp_x[i]    <= 1'b0;
+		end
+	end
+	else begin
+		if (flush) lp_sync <= 1'b1;
+		else if (push) lp_sync <= 1'b0;
+		if (lp_we && !lp_tk && lp_mp && !lp_whit) lp_rr <= lp_rr + 3'd1;
+		for (int i = 0; i < LPN; i++) begin
+			logic        v_n, cf_n;
+			logic  [7:0] trip_n, cnt_n, base, inc;
+			logic [11:0] tag_n;
+			v_n    = lp_v[i];
+			cf_n   = lp_cf[i];
+			trip_n = lp_trip[i];
+			cnt_n  = lp_cnt[i];
+			tag_n  = lp_tag[i];
+			if (lp_we && lp_v[i] && lp_tag[i] == lp_wa) begin
+				if (lp_tk)
+					cnt_n = (lp_cnt[i] == 8'hFF) ? 8'hFF : lp_cnt[i] + 8'd1;
+				else begin
+					cf_n   = (lp_cnt[i] == lp_trip[i]) && (lp_cnt[i] != 8'hFF);
+					trip_n = lp_cnt[i];
+					cnt_n  = 8'd0;
+				end
+			end
+			else if (lp_we && !lp_tk && lp_mp && !lp_whit && lp_rr == 3'(i)) begin
+				v_n    = 1'b1;
+				tag_n  = lp_wa;
+				cf_n   = 1'b0;
+				trip_n = 8'hFF;
+				cnt_n  = 8'd0;
+			end
+			base = (flush || lp_sync) ? cnt_n : lp_sp[i];
+			inc  = (base == 8'hFF) ? 8'hFF : base + 8'd1;
+			lp_v[i]    <= v_n;
+			lp_tag[i]  <= tag_n;
+			lp_cf[i]   <= cf_n;
+			lp_trip[i] <= trip_n;
+			lp_cnt[i]  <= cnt_n;
+			if (lp_push && lp_hit[i]) begin
+				lp_sp[i] <= nrec.pred ? inc : 8'd0;
+				lp_x[i]  <= v_n && cf_n && (nrec.pred ? (inc == trip_n) : (trip_n == 8'd0));
+			end
+			else begin
+				lp_sp[i] <= base;
+				lp_x[i]  <= v_n && cf_n && (base == trip_n);
+			end
+		end
+	end
+end
 
 assign consume = fire ? use_n[2:0] : 3'd0;
 
@@ -760,7 +872,8 @@ always_ff @(posedge clk) begin
 				if (!(nrec.pred && teq)) begin
 					d_redir_v  <= 1'b1;
 					d_redir_pc <= nrec.pred ? ntarget : nrec.npc;
-					btb_we     <= 1'b1;
+					// (a loop exit keeps the entry: the next pass takes it)
+					btb_we     <= !lp_ovr;
 					btb_wv     <= nrec.pred && btb_ok;
 					btb_wi     <= lastpc[BTB_AW+1:2];
 					btb_wtag   <= lastpc[31:BTB_AW+2];
