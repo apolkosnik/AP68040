@@ -1048,7 +1048,7 @@ always @(posedge clk) begin
 									fpsr[14] <= 1;
 									fpsr[7]  <= 1;
 								end
-								fpu_used <= 1; fst <= F_STDONE;
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 							end
 							else begin
 								sE = $signed({a_e[16], a_e}) - 18'sd16383;
@@ -1083,7 +1083,7 @@ always @(posedge clk) begin
 									dout <= {a_s, enc[7:0], mr[22:0], 64'd0};
 									if (inx) begin fpsr[9] <= 1; fpsr[3] <= 1; end
 								end
-								fpu_used <= 1; fst <= F_STDONE;
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 								end
 							end
 						end
@@ -1102,7 +1102,7 @@ always @(posedge clk) begin
 									fpsr[14] <= 1;
 									fpsr[7]  <= 1;
 								end
-								fpu_used <= 1; fst <= F_STDONE;
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 							end
 							else begin
 								sE = $signed({a_e[16], a_e}) - 18'sd16383;
@@ -1135,7 +1135,7 @@ always @(posedge clk) begin
 									dout <= {a_s, enc[10:0], mr[51:0], 32'd0};
 									if (inx) begin fpsr[9] <= 1; fpsr[3] <= 1; end
 								end
-								fpu_used <= 1; fst <= F_STDONE;
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 								end
 							end
 						end
@@ -1169,7 +1169,7 @@ always @(posedge clk) begin
 									fpsr[13] <= 1;
 									fpsr[7]  <= 1;
 								end
-								fpu_used <= 1; fst <= F_STDONE;
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 							end
 							else if (a_t == T_INF || sE > 18'sd62) begin
 								// infinity or far out of range: OPERR with
@@ -2231,7 +2231,7 @@ always @(posedge clk) begin
 					end
 				end
 				fpu_used <= 1;
-				fst <= F_STDONE;
+				if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 			end
 
 			F_UNFL: begin : f_unfl
@@ -2333,7 +2333,7 @@ always @(posedge clk) begin
 					fpsr[5] <= 1;                 // accrued UNFL
 				end
 				fpu_used <= 1;
-				fst <= F_STDONE;
+				if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
 			end
 
 			F_STDONE: begin
