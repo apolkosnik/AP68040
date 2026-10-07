@@ -993,6 +993,17 @@ always @(posedge clk) begin
 						e_w <= $signed({ua[82], ua[82:66]});
 						fst <= F_BIN;
 					end
+					else if ((opmode == 7'h00 || opmode == 7'h40 || opmode == 7'h44) &&
+					         ua[1:0] != T_NAN) begin
+						// a move: F_EXEC's work for it, here (its exception
+						// shadow, GRS, the working exponent), then F_ROUND
+						sh_cmd  <= {3'b010, src_fmt, dst_r, opmode};
+						sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
+						sh_stag <= r_stag;
+						grs <= 3'd0;
+						e_w <= $signed({ua[82], ua[82:66]});
+						fst <= F_ROUND;
+					end
 					else fst <= F_EXEC;
 					end
 				end

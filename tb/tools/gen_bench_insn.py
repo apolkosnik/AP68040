@@ -67,6 +67,7 @@ FORMS = [
     ("move.w (An),Dn split", "move.w 15(a0),d2", ""),
     ("move.l Dn,(An) split", "move.l d2,14(a0)", ""),
     ("move16", "move16 (a0)+,(a1)+", "lea (BUF).l,a0\n\tlea (BUF+$400).l,a1"),
+    ("fmove.x FPm,FPn", "fmove.x fp0,fp6", ""),
     ("fadd.x FPm,FPn", "fadd.x fp0,fp1", ""),
     ("fmul.x FPm,FPn", "fmul.x fp0,fp2", ""),
     ("fmove.d (An),FPn", "fmove.d (a0),fp3", ""),

@@ -927,118 +927,132 @@ start:
 	move16 (a0)+,(a1)+
 	dbra	d0,.l57
 	stamp	116
-; 59: fadd.x FPm,FPn
+; 59: fmove.x FPm,FPn
 	stamp	117
 	move.w	#99,d0
 .l58:
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
-	fadd.x fp0,fp1
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
+	fmove.x fp0,fp6
 	dbra	d0,.l58
 	stamp	118
-; 60: fmul.x FPm,FPn
+; 60: fadd.x FPm,FPn
 	stamp	119
 	move.w	#99,d0
 .l59:
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
-	fmul.x fp0,fp2
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
+	fadd.x fp0,fp1
 	dbra	d0,.l59
 	stamp	120
-; 61: fmove.d (An),FPn
+; 61: fmul.x FPm,FPn
 	stamp	121
 	move.w	#99,d0
 .l60:
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
-	fmove.d (a0),fp3
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
+	fmul.x fp0,fp2
 	dbra	d0,.l60
 	stamp	122
-; 62: fadd.d (An),FPn
+; 62: fmove.d (An),FPn
 	stamp	123
 	move.w	#99,d0
 .l61:
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
-	fadd.d (a0),fp4
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
+	fmove.d (a0),fp3
 	dbra	d0,.l61
 	stamp	124
-; 63: fmove.d FPn,(An)
+; 63: fadd.d (An),FPn
 	stamp	125
 	move.w	#99,d0
 .l62:
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
-	fmove.d fp1,(a2)
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
+	fadd.d (a0),fp4
 	dbra	d0,.l62
 	stamp	126
-; 64: fmove.s FPn,(An)
+; 64: fmove.d FPn,(An)
 	stamp	127
 	move.w	#99,d0
 .l63:
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
-	fmove.s fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
+	fmove.d fp1,(a2)
 	dbra	d0,.l63
 	stamp	128
-; 65: fmove.l FPn,Dn
+; 65: fmove.s FPn,(An)
 	stamp	129
 	move.w	#99,d0
 .l64:
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
-	fmove.l fp1,d5
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
+	fmove.s fp1,(a2)
 	dbra	d0,.l64
 	stamp	130
-; 66: fmove.l Dn,FPn
+; 66: fmove.l FPn,Dn
 	stamp	131
 	move.w	#99,d0
 .l65:
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
-	fmove.l d1,fp5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
+	fmove.l fp1,d5
 	dbra	d0,.l65
 	stamp	132
+; 67: fmove.l Dn,FPn
+	stamp	133
+	move.w	#99,d0
+.l66:
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	fmove.l d1,fp5
+	dbra	d0,.l66
+	stamp	134
 	trap	#3
 h_stamp:
 	move.w	d7,(STAMP).l
