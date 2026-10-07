@@ -1268,7 +1268,15 @@ always @(posedge clk) begin
 								a_t <= T_NUM;
 								a_e <= {9'd0, r_din[94:87]} + 17'd16256; // -127+16383
 								a_m <= {1'b1, r_din[86:64], 40'd0};
-								fst <= F_EXEC;
+								// a binary operation: straight to F_BIN (as
+								// for a register source)
+								if (bin_op(r_op) && !r_unimp) begin
+									op_kind <= bin_kind(r_op);
+									grs <= 3'd0;
+									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
+									fst <= F_BIN;
+								end
+								else fst <= F_EXEC;
 							end
 						end
 						3'd5: begin : cv_d
@@ -1316,7 +1324,13 @@ always @(posedge clk) begin
 								a_t <= T_NUM;
 								a_e <= {6'd0, r_din[94:84]} + 17'd15360; // -1023+16383
 								a_m <= {1'b1, r_din[83:32], 11'd0};
-								fst <= F_EXEC;
+								if (bin_op(r_op) && !r_unimp) begin
+									op_kind <= bin_kind(r_op);
+									grs <= 3'd0;
+									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
+									fst <= F_BIN;
+								end
+								else fst <= F_EXEC;
 							end
 						end
 						default: begin : cv_x
