@@ -128,7 +128,8 @@ def run(item, args):
     log.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
     try:
-        generate(str(item["header"]), str(item["data"]), str(job), args.round_limit)
+        generate(str(item["header"]), str(item["data"]), str(job), args.round_limit,
+                 sample=args.sample)
         cmd = [str(SIM), "+job=%s" % job, "+mon=%s" % MON,
                "+lmem=%s" % image(item["gdir"], "lmem.dat", args.work / "images"),
                "+tmem=%s" % image(item["gdir"], "tmem.dat", args.work / "images")]
@@ -162,6 +163,10 @@ def main():
     ap.add_argument("--instruction", action="append", default=[])
     ap.add_argument("--slice", action="append", default=[])
     ap.add_argument("--round-limit", type=int, default=None)
+    ap.add_argument("--sample", type=lambda s: tuple(int(x) for x in s.split(":")),
+                    default=None, metavar="FLOOR:STRIDE",
+                    help="every round up to FLOOR per slice, then every STRIDE-th "
+                         "(e.g. 300:24, about 6%% of the full corpus's rounds)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--keep-jobs", action="store_true")

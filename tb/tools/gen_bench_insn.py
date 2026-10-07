@@ -67,6 +67,14 @@ FORMS = [
     ("move.w (An),Dn split", "move.w 15(a0),d2", ""),
     ("move.l Dn,(An) split", "move.l d2,14(a0)", ""),
     ("move16", "move16 (a0)+,(a1)+", "lea (BUF).l,a0\n\tlea (BUF+$400).l,a1"),
+    ("fadd.x FPm,FPn", "fadd.x fp0,fp1", ""),
+    ("fmul.x FPm,FPn", "fmul.x fp0,fp2", ""),
+    ("fmove.d (An),FPn", "fmove.d (a0),fp3", ""),
+    ("fadd.d (An),FPn", "fadd.d (a0),fp4", ""),
+    ("fmove.d FPn,(An)", "fmove.d fp1,(a2)", ""),
+    ("fmove.s FPn,(An)", "fmove.s fp1,(a2)", ""),
+    ("fmove.l FPn,Dn", "fmove.l fp1,d5", ""),
+    ("fmove.l Dn,FPn", "fmove.l d1,fp5", ""),
 ]
 
 def main(path):

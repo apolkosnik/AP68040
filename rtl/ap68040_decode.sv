@@ -697,6 +697,7 @@ always_ff @(posedge clk) begin
 			btb_wv     <= 1'b0;
 			btb_wi     <= fa[BTB_AW+1:2];
 			btb_wtag   <= fa[31:BTB_AW+2];
+			btb_wslot  <= fa[1];
 		end
 		// the flag of an earlier part stays with the instruction
 		if (fire) part_bt <= go_part && (part_bt || bt_restart);

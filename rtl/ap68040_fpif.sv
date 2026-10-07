@@ -425,6 +425,11 @@ endfunction
 // the uop in EX
 //--------------------------------------------------------------------------
 wire chk_pend = pend && !is_fsave && !is_frest;   // FSAVE/FRESTORE: their own rules
+// uops with no FPU side effect need not wait to be the oldest: GET reads
+// the latched result; END of an instruction with no store exception
+// pending and not FSAVE/FRESTORE does nothing (a fault of an older uop
+// discards it with the rest)
+wire nosafe = (sub == FC_GET) || (sub == FC_END && !sx_v && !is_fsave && !is_frest);
 
 always_comb begin
 	hold    = 1'b0;
@@ -438,7 +443,7 @@ always_comb begin
 	xcommit = 1'b0;
 	st_kill = sx_kill;
 	if (ex_v) begin
-		if (!safe) hold = 1'b1;
+		if (!safe && !nosafe) hold = 1'b1;
 		else case (sub)
 			FC_CHK: begin
 				// the released operation completing this cycle without an
@@ -561,7 +566,7 @@ end
 //--------------------------------------------------------------------------
 // sequential
 //--------------------------------------------------------------------------
-wire act = ex_v && safe;
+wire act = ex_v && (safe || nosafe);
 
 always_ff @(posedge clk) begin
 	if (!nreset) begin

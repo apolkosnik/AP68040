@@ -23,7 +23,16 @@ tb/run_tests.sh                 # the twenty-one programs, five bus configuratio
 tb/build_cputest.sh             # the corpus replay bench
 tb/run_cputest.py ~/Downloads/data040.zip                    # smoke slices
 tb/run_cputest.py ~/Downloads/data040.zip --full --group AE  # a group, every slice
+tb/run_cputest.py ~/Downloads/data040.zip --full --sample 300:24 --jobs 30  # every slice, sampled
 ```
+
+Testing tiers: run_tests.sh for every change (about 10 minutes); the full
+corpus slices of the area touched (FPU: `--instruction 'F*'`); before a
+push, the sampled corpus -- every round of each slice up to 300, then
+every 24th, about 6 % of the rounds, 9 minutes at 30 jobs, and on 87ea11d
+plus the two-slot BTB it failed exactly the 25 known slices, as the full
+run does; the full corpus (2.5 hours or more) for milestones and before
+an RBF.
 
 Bus configurations: zero wait, random waits, waits with TBI and TA/TEA
 retries, BCLK at half PCLK, and all of those together.

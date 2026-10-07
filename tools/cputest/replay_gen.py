@@ -346,7 +346,13 @@ def write_round(f: BinaryIO, testno: int, roundno: int, flags: int,
 
 def generate(header_path: str, dat_path: str, out_path: str,
              max_rounds: Optional[int] = None,
-             audit_only: bool = False) -> dict:
+             audit_only: bool = False,
+             sample: Optional[tuple] = None) -> dict:
+    # sample = (floor, stride): emit every execution round up to `floor`,
+    # then every `stride`-th; a round left out is handled as a skipped
+    # (no-oracle) one: its branch-target toggles and a pending first-round
+    # setup carry over to the next emitted round
+    considered = 0
     hdr = Header(open(header_path, "rb").read())
     df = DataFile.load(dat_path, header=hdr)
     st = Stream(df.body, hdr)
@@ -594,11 +600,18 @@ def generate(header_path: str, dat_path: str, out_path: str,
                                    hdr.super_stack_memory, level, pre, toggles,
                                    expected, sr_mask, actual_exc, expected_pc,
                                    exspec, trace_sr_mask, memchecks, post, cleanup)
-                        if max_rounds is None or count < max_rounds:
+                        chosen = (sample is None or considered < sample[0] or
+                                  (considered - sample[0]) % sample[1] == 0)
+                        considered += 1
+                        if not chosen:
+                            deferred_toggles = toggles
+                        elif max_rounds is None or count < max_rounds:
                             write_round(None if audit_only else out, *pending)
                             count += 1
                             execution_rounds += 1
-                        first_round = False
+                            first_round = False
+                        else:
+                            first_round = False
                     roundno += 1
 
                 if st.peek() == CT_END:
@@ -620,7 +633,7 @@ def generate(header_path: str, dat_path: str, out_path: str,
                             FLAG_IGNORE_EXCEPTION, maintenance,
                             hdr.super_stack_memory - 0x80,
                             hdr.super_stack_memory, 0,
-                            (setup_mem + setup_op) if first_round else [],
+                            setup_patches if first_round else [],
                             deferred_toggles, maintenance,
                             0xFFFF, 0xFF, 0, ExceptionSpec(), 0xFFFF,
                             [], [], list(reversed(setup_cleanup)))

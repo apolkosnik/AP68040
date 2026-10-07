@@ -191,20 +191,28 @@ endgenerate
 //--------------------------------------------------------------------------
 logic [31:0] fpc;              // F0 fetch address (A0 clear)
 
-// BTB: valid, tag, slot, kind, target[31:1]
-localparam int BTB_DW = 1 + BTB_TW + 1 + 2 + 31;
-logic [BTB_DW-1:0] btb_q;
-ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb (
-	.clk(clk), .we(btb_we), .waddr(btb_wi),
-	.wdata({btb_wv, btb_wtag, btb_wslot, btb_wkind, btb_wtgt}),
-	.raddr(fpc[BTB_AW+1:2]), .q(btb_q)
+// BTB: one array per word of the long word (a branch ending at word 0,
+// one ending at word 1), each valid, tag, kind, target[31:1]: two taken
+// branches in one long word (BSR then RTS, a short branch then RTS) no
+// longer evict each other
+localparam int BTB_DW = 1 + BTB_TW + 2 + 31;
+logic [BTB_DW-1:0] btb_q0, btb_q1, btb_q;
+ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb0 (
+	.clk(clk), .we(btb_we && !btb_wslot), .waddr(btb_wi),
+	.wdata({btb_wv, btb_wtag, btb_wkind, btb_wtgt}),
+	.raddr(fpc[BTB_AW+1:2]), .q(btb_q0)
 );
-wire               btb_qv    = btb_q[BTB_DW-1];
-wire [BTB_TW-1:0]  btb_qtag  = btb_q[BTB_DW-2 -: BTB_TW];
-wire               btb_qslot = btb_q[33];
-// a hit needs the branch's last word in this fetch (a fetch that starts
-// at word 1 cannot end a branch at word 0)
-wire btb_hit = btb_qv && btb_qtag == fpc[31:BTB_AW+2] && (btb_qslot || !fpc[1]);
+ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb1 (
+	.clk(clk), .we(btb_we && btb_wslot), .waddr(btb_wi),
+	.wdata({btb_wv, btb_wtag, btb_wkind, btb_wtgt}),
+	.raddr(fpc[BTB_AW+1:2]), .q(btb_q1)
+);
+// the first branch of the fetch: word 0's when the fetch starts there
+wire btb_hit0 = btb_q0[BTB_DW-1] && btb_q0[BTB_DW-2 -: BTB_TW] == fpc[31:BTB_AW+2] && !fpc[1];
+wire btb_hit1 = btb_q1[BTB_DW-1] && btb_q1[BTB_DW-2 -: BTB_TW] == fpc[31:BTB_AW+2];
+wire btb_hit  = btb_hit0 || btb_hit1;
+wire btb_qslot = !btb_hit0;
+assign btb_q   = btb_hit0 ? btb_q0 : btb_q1;
 
 // the fetch's return stack: pushed by calls the BTB takes, popped by the
 // returns it takes (their target), resynchronized from D1's on redirects
@@ -502,7 +510,7 @@ always_ff @(posedge clk) begin
 		if (f0_go) begin
 			f1_v   <= 1'b1;
 			f1_bt  <= btb_hit && bt_room;
-			f1_bslot <= btb_q[33];
+			f1_bslot <= btb_qslot;
 			f1_bkind <= btb_q[32:31];
 			f1_btgt  <= btb_q[30:0];
 			f1_pc  <= fpc;
