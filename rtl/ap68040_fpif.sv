@@ -112,6 +112,21 @@ function automatic logic [3:0] fp_bytes(input logic [2:0] f);
 	endcase
 endfunction
 
+// a memory operand the FPU pipeline takes (ap040_fpu q_n): an integer, or
+// a zero or normalized single/double/extended with an unbiased exponent
+// within +-60 (formed here, as the operand is registered, so the FPU's
+// dispatch starts from a register)
+function automatic logic nice_mem(input logic [95:0] d, input logic [2:0] f);
+	case (f)
+		3'd0, 3'd4, 3'd6: nice_mem = 1'b1;
+		3'd1: nice_mem = (d[94:64] == 31'd0) || (d[94:87] >= 8'd67 && d[94:87] <= 8'd187);
+		3'd5: nice_mem = (d[94:32] == 63'd0) || (d[94:84] >= 11'd963 && d[94:84] <= 11'd1083);
+		3'd2: nice_mem = (d[63:0] == 64'd0) ? (d[94:80] != 15'h7FFF)
+		                 : (d[63] && d[94:80] >= 15'd16323 && d[94:80] <= 15'd16443);
+		default: nice_mem = 1'b0;
+	endcase
+endfunction
+
 // WinUAE fault_if_nonexisting_opmode: 1 = F-line (format $0, no side
 // effects), 2 = opmodes $78-$7F, which the 68040 reports as illegal
 function automatic logic [1:0] opmode_class(input logic [6:0] op);
@@ -190,6 +205,7 @@ logic        f_fsave_ack, f_rest_idle, f_rest_unimp, f_pendcap;
 logic  [2:0] f_class, f_fmt, f_srcr, f_dstr, f_fmsel;
 logic  [6:0] f_opm;
 logic [95:0] f_din, f_fmwd;
+logic        f_dnice;          // f_din is an ordinary operand (the FPU pipeline)
 logic  [1:0] f_crsel;
 logic [31:0] f_crwd, f_iapc;
 logic        f_done, f_accepted, f_unimp, f_unsupp, f_excreq, f_used, f_wbok;
@@ -220,7 +236,7 @@ ap040_fpu fpu (
 	.clk(clk), .nreset(nreset), .ce(1'b1),
 	.req(f_req), .op_class(f_class), .opmode(f_opm), .wb_ok(f_wbok),
 	.src_fmt(f_fmt), .src_r(f_srcr), .dst_r(f_dstr),
-	.din(f_din), .done(f_done), .accepted(f_accepted),
+	.din(f_din), .din_nice(f_dnice), .done(f_done), .accepted(f_accepted),
 	.unimp(f_unimp), .unsupp(f_unsupp),
 	.exc_req(f_excreq), .exc_vec(f_excvec), .dout(f_dout),
 	.fpcc(f_cc),
@@ -596,7 +612,7 @@ always_ff @(posedge clk) begin
 		f_req <= 1'b0; f_crwe <= 1'b0; f_iawe <= 1'b0; f_bsun <= 1'b0; f_fmwe <= 1'b0; f_rst <= 1'b0;
 		f_fsave_ack <= 1'b0; f_rest_idle <= 1'b0; f_rest_unimp <= 1'b0; f_pendcap <= 1'b0;
 		f_class <= '0; f_fmt <= '0; f_srcr <= '0; f_dstr <= '0; f_fmsel <= '0; f_opm <= '0;
-		f_din <= '0; f_fmwd <= '0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
+		f_din <= '0; f_dnice <= 1'b0; f_fmwd <= '0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
 		r_cmd1 <= '0; r_cmd3 <= '0; r_stag <= '0; r_dtag <= '0; r_flags <= '0; r_grs <= '0;
 		r_fpt <= '0; r_et <= '0; r_wbt <= '0; r_fpiar <= '0; r_cusavepc <= '0;
 		r_et15 <= 1'b0; r_fpt15 <= 1'b0; r_wbte15 <= 1'b0; r_busy <= 1'b0;
@@ -636,6 +652,7 @@ always_ff @(posedge clk) begin
 				f_srcr  <= ext[12:10];
 				f_dstr  <= ext[9:7];
 				f_din   <= din_of(fmt, av, bv, latch);
+				f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
 				fresh   <= 1'b1;
 			end
 			else if (fuse && go) begin
@@ -679,6 +696,8 @@ always_ff @(posedge clk) begin
 					f_srcr  <= (ocl == 3'b011) ? ext[9:7] : ext[12:10];
 					f_dstr  <= ext[9:7];
 					f_din   <= din_of(fmt, av, bv, latch);
+					f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
+				f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
 				end
 				else if (ocl == 3'b011) begin
 					if (f_unimp || f_unsupp || f_done) begin

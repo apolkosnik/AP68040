@@ -49,6 +49,9 @@ module ap040_fpu
 	input       [2:0] src_r,       // FPm
 	input       [2:0] dst_r,       // FPn
 	input      [95:0] din,         // memory operand, left aligned
+	input             din_nice,    // din is an ordinary operand for the
+	                               // pipeline (nice_mem: the interface forms
+	                               // it as it registers din)
 	output reg        done,
 	// the operation has passed operand classification: unimp/unsupp can no
 	// longer occur, only completion or an enabled arithmetic exception.
@@ -346,7 +349,8 @@ reg  [64:0] acc_hi;           // multiply accumulator high / divide remainder
 reg  [63:0] acc_lo;           // multiply accumulator low / dividend feed
 reg  [66:0] qv;               // divide quotient / sqrt root
 reg  [68:0] srem;             // sqrt remainder
-reg [131:0] srad;             // sqrt radicand feed
+reg  [65:0] srad;             // sqrt radicand feed (its nonzero top: the
+                              // 132-bit radicand's low 66 bits are zero)
 reg   [6:0] loop_n;
 reg [127:0] mul_pd;           // registered DSP full product (F_MULT)
 reg   [3:0] op_kind;          // 0 none, 1 add, 2 mul, 3 div, 4 sqrt
@@ -516,8 +520,9 @@ reg        fstate_e1;    // the prepared/restored frame is an arithmetic
 // (tb/tb_fpu_pipe.sv runs both side by side):
 //   P1  zero cases, operand order and exponent difference (FMUL: the
 //       exponent sum)                                          (F_BIN)
-//   P2  alignment shift with sticky (FMUL: the 64x64 product)  (F_SHR)
-//   P3  add or subtract (FMUL: the product's one-bit normalize) (F_ADDX)
+//   P2  alignment shift with sticky (FMUL: the 32x32 partial products)
+//                                                              (F_SHR)
+//   P3  add or subtract (FMUL: their sum, one-bit normalize)   (F_ADDX)
 //   P4  normalize after a subtraction, or an integer source    (F_NORM2)
 //   P5  round to the precision                                 (F_ROUND)
 //   P6  register, FPSR condition codes, INEX                   (F_WB)
@@ -581,7 +586,6 @@ reg  [63:0] p2_bm, p2_sm, p3_bm, p4_m, p5_m, p6_m, p7_m;
 reg   [6:0] p2_sh;
 reg         p2_es, p3_es, p4_n;
 reg  [66:0] p3_sv;
-reg [127:0] p3_pd;
 reg   [2:0] p4_g, p5_g;
 reg         p6_inx, p6_nice;
 reg         p1_ni, p2_ni, p3_ni;   // an integer source: normalize in P4
@@ -590,8 +594,46 @@ reg         p1_ni, p2_ni, p3_ni;   // an integer source: normalize in P4
 // F_MULT, which it reaches with the pipeline empty
 // (its operands are registers of its own, loaded by whichever goes to
 // multiply: F_BIN as it enters F_MULT, P1 for an FMUL)
+// The product takes two cycles: the four 32x32 partial products are
+// registered (in the DSP blocks), their sum is formed the next cycle --
+// a 64x64 product does not close in one 60 MHz cycle without register
+// retiming
 reg   [63:0] mul_x, mul_y;
-wire [127:0] mul_out = mul_x * mul_y;
+reg   [63:0] mul_hh, mul_hl, mul_lh, mul_ll;
+always @(posedge clk) if (ce) begin
+	mul_hh <= mul_x[63:32] * mul_y[63:32];
+	mul_hl <= mul_x[63:32] * mul_y[31:0];
+	mul_lh <= mul_x[31:0]  * mul_y[63:32];
+	mul_ll <= mul_x[31:0]  * mul_y[31:0];
+end
+wire [127:0] mul_out = {mul_hh, 64'd0} + {32'd0, mul_hl, 32'd0} +
+                       {32'd0, mul_lh, 32'd0} + {64'd0, mul_ll};
+
+// FDIV and FSQRT: one restoring datapath, two steps a cycle.  Divide:
+// the remainder shifts one bit (zeros enter; the first, integer step does
+// not shift) and the divisor is the trial; square root: the remainder
+// shifts two bits (the radicand's next two enter) and the trial is the
+// root so far with 01.  The borrow of each trial subtraction is the bit.
+wire        ds_sq = (fst == F_SQRTL);
+wire        ds_d0 = !ds_sq && (loop_n == 7'd0);
+reg  [68:0] ds_rem1, ds_rem;  // the remainder after one step, after two
+reg         ds_q1, ds_q2;
+always @* begin : dsq
+	reg [68:0] r2a, rem1, r2b, t1, t2;
+	reg [69:0] d1, d2;
+	r2a = ds_sq ? {srem[66:0], srad[65:64]} :
+	      ds_d0 ? {4'd0, acc_hi} : {3'd0, acc_hi[63:0], 1'b0};
+	t1  = ds_sq ? {1'b0, qv[65:0], 2'b01} : {5'd0, a_m};
+	d1  = {1'b0, r2a} - {1'b0, t1};
+	ds_q1 = !d1[69];
+	rem1 = ds_q1 ? d1[68:0] : r2a;
+	ds_rem1 = rem1;
+	r2b = ds_sq ? {rem1[66:0], srad[63:62]} : {3'd0, rem1[63:0], 1'b0};
+	t2  = ds_sq ? {1'b0, qv[64:0], ds_q1, 2'b01} : t1;
+	d2  = {1'b0, r2b} - {1'b0, t2};
+	ds_q2 = !d2[69];
+	ds_rem = ds_q2 ? d2[68:0] : r2b;
+end
 
 assign pbusy = p1_v || p2_v || p3_v || p4_v || p5_v || p6_v;
 assign pdone = pipe_issue;
@@ -673,7 +715,7 @@ wire       q_mem  = (op_class == 3'b010) &&
                       q_kind == 2'd0));
 wire [1:0] q_aw   = pw(src_r);
 wire [1:0] q_bw   = pw(dst_r);
-wire       q_aok  = q_mem ? q_n :
+wire       q_aok  = q_mem ? din_nice :
                     (q_aw == 2'd0) ? (fr_valid[src_r] && fr_nice[src_r]) :
                     (q_aw == 2'd2) ? p5_nice :
                     (q_aw == 2'd3) ? p6_nice : 1'b0;
@@ -686,6 +728,15 @@ wire pipe_issue = (PIPE != 0) && ce && rq && (fst == F_IDLE) &&
                   !fstate_unimp && !fstate_e1 && !fstate_busy && !fstate_resig &&
                   (fpcr[15:8] == 8'd0) && pipe_opm(opmode) &&
                   (q_reg || q_mem) && q_aok && q_bok;
+
+// synthesis translate_off
+always @(posedge clk)
+	if (ce && rq && q_mem && din_nice !== q_n) begin
+		$display("FAIL: din_nice %b, the operand classifies as %b (fmt %0d din %h)",
+		         din_nice, q_n, src_fmt, din);
+		$finish;
+	end
+// synthesis translate_on
 
 // P1: the operands (forwarded), the zero cases, order and exponents
 reg         s1_as, s1_bs, s1_az, s1_bz;
@@ -799,7 +850,6 @@ always @(posedge clk) begin
 		p3_es <= p2_es;
 		p3_bm <= p2_bm;
 		p3_sv <= shr_sticky({p2_sm, 3'd0}, p2_sh);
-		p3_pd <= mul_out;
 
 		//----------------------------------------------------------------- P3
 		p4_v  <= p3_v;
@@ -841,14 +891,15 @@ always @(posedge clk) begin
 				end
 			end
 			2'd2: begin
-				if (p3_pd[127]) begin
-					p4_m <= p3_pd[127:64];
-					p4_g <= {p3_pd[63], p3_pd[62], (p3_pd[61:0] != 0)};
+				// the partial products P2 registered, summed here
+				if (mul_out[127]) begin
+					p4_m <= mul_out[127:64];
+					p4_g <= {mul_out[63], mul_out[62], (mul_out[61:0] != 0)};
 					p4_e <= p3_e + 18'sd1;
 				end
 				else begin
-					p4_m <= p3_pd[126:63];
-					p4_g <= {p3_pd[62], p3_pd[61], (p3_pd[60:0] != 0)};
+					p4_m <= mul_out[126:63];
+					p4_g <= {mul_out[62], mul_out[61], (mul_out[60:0] != 0)};
 				end
 			end
 			default: ;
@@ -2115,8 +2166,7 @@ always @(posedge clk) begin
 								fst <= F_ROUND;
 							end
 							else begin
-								srad <= sE[0] ? {a_m, 1'b0, 67'd0}
-								              : {1'b0, a_m, 67'd0};
+								srad <= sE[0] ? {a_m, 2'b00} : {1'b0, a_m, 1'b0};
 								srem <= 0;
 								qv <= 0;
 								loop_n <= 0;
@@ -2383,7 +2433,7 @@ always @(posedge clk) begin
 			end
 
 			F_MULT: begin : f_mult
-				if (loop_n == 7'd1) begin : mul_fin
+				if (loop_n == 7'd2) begin : mul_fin
 					// mul_pd is the registered full 128-bit product, exactly
 					// the value the former 32-cycle radix-4 loop accumulated.
 					if (mul_pd[127]) begin
@@ -2399,18 +2449,15 @@ always @(posedge clk) begin
 					fst <= F_ROUND;
 				end
 				else begin
-					// One registered 64x64 DSP-tree multiply replaces the
-					// 32-cycle serial radix-4 loop.  At this clock (34.8 ns
-					// budget) the cascade closes in a single cycle.
-					mul_pd <= mul_out;
-					loop_n <= 7'd1;
+					// the 64x64 DSP product (it replaced a 32-cycle radix-4
+					// loop): the partial products are registered in the
+					// first cycle (loop_n 0), summed into mul_pd in the second
+					if (loop_n == 7'd1) mul_pd <= mul_out;
+					loop_n <= loop_n + 7'd1;
 				end
 			end
 
 			F_DIVL: begin : f_divl
-				reg [64:0] r2a, rem1, r2b, rem2;
-				reg [65:0] d0, d1, d2;     // trial subtractions: the borrow is the bit
-				reg        q1, q2;
 				if (loop_n == 7'd34) begin
 					if (qv[66]) begin
 						a_m <= qv[66:3];
@@ -2425,36 +2472,21 @@ always @(posedge clk) begin
 					fst <= F_ROUND;
 				end
 				else if (loop_n == 7'd0) begin
-					// integer quotient bit compares unshifted
-					d0 = {1'b0, acc_hi} - {2'b00, a_m};
-					if (!d0[65]) acc_hi <= d0[64:0];
-					qv <= {qv[65:0], !d0[65]};
+					// the integer quotient bit compares unshifted (the
+					// shared datapath's first step, ds_d0)
+					acc_hi <= ds_rem1[64:0];
+					qv <= {qv[65:0], ds_q1};
 					loop_n <= 7'd1;
 				end
 				else begin
-					// two restoring fraction bits per cycle (66 = 2 x 33):
-					// the remainder shifts left with zeros entering, two
-					// one-bit iterations cascaded combinationally (three
-					// do not close at 60 MHz)
-					r2a = {acc_hi[63:0], 1'b0};
-					d1 = {1'b0, r2a} - {2'b00, a_m};
-					q1 = !d1[65];
-					rem1 = q1 ? d1[64:0] : r2a;
-					r2b = {rem1[63:0], 1'b0};
-					d2 = {1'b0, r2b} - {2'b00, a_m};
-					q2 = !d2[65];
-					rem2 = q2 ? d2[64:0] : r2b;
-					acc_hi <= rem2;
-					qv <= {qv[64:0], q1, q2};
+					// two restoring fraction bits per cycle (66 = 2 x 33)
+					acc_hi <= ds_rem[64:0];
+					qv <= {qv[64:0], ds_q1, ds_q2};
 					loop_n <= loop_n + 7'd1;
 				end
 			end
 
 			F_SQRTL: begin : f_sqrtl
-				reg [68:0] r2a, rem1, r2b, rem2;
-				reg [68:0] trial1, trial2;
-				reg [69:0] d1, d2;         // trial subtractions: the borrow is the digit
-				reg        q1, q2;
 				if (loop_n == 7'd33) begin
 					a_m <= qv[65:2];
 					grs <= {qv[1], qv[0], (srem != 69'd0)};
@@ -2462,22 +2494,10 @@ always @(posedge clk) begin
 					fst <= F_ROUND;
 				end
 				else begin
-					// two result digits per cycle (66 = 2 x 33): each trial
-					// folds the earlier digits into the partial root, two
-					// one-digit steps cascaded combinationally
-					r2a = {srem[66:0], srad[131:130]};
-					trial1 = {1'b0, qv[65:0], 2'b01};
-					d1 = {1'b0, r2a} - {1'b0, trial1};
-					q1 = !d1[69];
-					rem1 = q1 ? d1[68:0] : r2a;
-					r2b = {rem1[66:0], srad[129:128]};
-					trial2 = {1'b0, qv[64:0], q1, 2'b01};
-					d2 = {1'b0, r2b} - {1'b0, trial2};
-					q2 = !d2[69];
-					rem2 = q2 ? d2[68:0] : r2b;
-					srad <= {srad[127:0], 4'b0000};
-					srem <= rem2;
-					qv <= {qv[64:0], q1, q2};
+					// two result digits per cycle (66 = 2 x 33)
+					srad <= {srad[61:0], 4'b0000};
+					srem <= ds_rem;
+					qv <= {qv[64:0], ds_q1, ds_q2};
 					loop_n <= loop_n + 7'd1;
 				end
 			end

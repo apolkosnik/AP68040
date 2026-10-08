@@ -17,6 +17,7 @@
 // segments, and some segments enable exceptions.                         //
 //                                                                          //
 //   +seed=<n>   random seed (default 1)   +cmds=<n>  commands (20000)     //
+//   (built with REF=old: the reference is the committed FPU instead)     //
 //   +pipeonly   only the pipeline's operations, on ordinary values, few  //
 //               sync points: back-to-back issue, hazards and forwarding  //
 //--------------------------------------------------------------------------//
@@ -64,12 +65,12 @@ cmd_t cmds [$];
 `FPU_PORTS(r)
 `FPU_PORTS(d)
 
-`define FPU_INST(P, PIPEV) \
-	ap040_fpu #(.PIPE(PIPEV)) P``_fpu ( \
+`define FPU_INST(P, PIPEV, MOD) \
+	MOD #(.PIPE(PIPEV)) P``_fpu ( \
 		.clk(clk), .nreset(nreset), .ce(1'b1), \
 		.req(P``_req), .op_class(P``_cls), .opmode(P``_opm), .wb_ok(P``_wbok), \
 		.src_fmt(P``_fmt), .src_r(P``_fmwe ? P``_fmsel : P``_sr), .dst_r(P``_dr), \
-		.din(P``_din), .done(P``_done), .accepted(P``_acc), \
+		.din(P``_din), .din_nice(nice_mem(P``_din, P``_fmt)), .done(P``_done), .accepted(P``_acc), \
 		.unimp(P``_unimp), .unsupp(P``_unsupp), \
 		.exc_req(P``_exc), .exc_vec(P``_vec), .dout(P``_dout), \
 		.fpcc(P``_cc), \
@@ -110,8 +111,14 @@ always @(posedge clk) begin
 		d_nend <= d_nend + 1; d_lastx <= d_unimp || d_unsupp || d_exc;
 	end
 end
-`FPU_INST(r, 0)
-`FPU_INST(d, 1)
+`ifdef REF_OLD
+// REF_OLD: the reference is the committed FPU (ap040_fpu_ref, renamed by
+// tb/build_fpu_pipe.sh), both with the pipeline: a check of a refactor
+`FPU_INST(r, 1, ap040_fpu_ref)
+`else
+`FPU_INST(r, 0, ap040_fpu)
+`endif
+`FPU_INST(d, 1, ap040_fpu)
 
 //--------------------------------------------------------------------------
 // values
@@ -157,6 +164,18 @@ function automatic logic [79:0] rnd_x(int unsigned r);
 	rnd_x = {s, e, m};
 endfunction
 
+// the interface's din_nice (ap68040_fpif.sv nice_mem)
+function automatic logic nice_mem(input logic [95:0] d, input logic [2:0] f);
+	case (f)
+		3'd0, 3'd4, 3'd6: nice_mem = 1'b1;
+		3'd1: nice_mem = (d[94:64] == 31'd0) || (d[94:87] >= 8'd67 && d[94:87] <= 8'd187);
+		3'd5: nice_mem = (d[94:32] == 63'd0) || (d[94:84] >= 11'd963 && d[94:84] <= 11'd1083);
+		3'd2: nice_mem = (d[63:0] == 64'd0) ? (d[94:80] != 15'h7FFF)
+		                 : (d[63] && d[94:80] >= 15'd16323 && d[94:80] <= 15'd16443);
+		default: nice_mem = 1'b0;
+	endcase
+endfunction
+
 // the 96-bit extended memory image of {s, e, m}
 function automatic logic [95:0] xmem(logic [79:0] x);
 	xmem = {x[79:64], 16'd0, x[63:0]};
@@ -199,7 +218,8 @@ endfunction
 logic [6:0] pipe_ops [18] = '{7'h00, 7'h40, 7'h44, 7'h22, 7'h62, 7'h66,
                               7'h28, 7'h68, 7'h6C, 7'h23, 7'h63, 7'h67,
                               7'h18, 7'h58, 7'h5C, 7'h1A, 7'h5A, 7'h5E};
-logic [6:0] seq_ops  [6]  = '{7'h20, 7'h04, 7'h38, 7'h3A, 7'h27, 7'h24};
+logic [6:0] seq_ops  [10] = '{7'h20, 7'h04, 7'h38, 7'h3A, 7'h27, 7'h24,
+                              7'h60, 7'h64, 7'h41, 7'h45};
 logic [2:0] fmts     [6]  = '{3'd1, 3'd5, 3'd2, 3'd0, 3'd4, 3'd6};
 
 int sync_at [$];         // the command index after which both are compared
@@ -229,7 +249,7 @@ task automatic gen(int n);
 		else begin
 			c.kind = 0;
 			c.opm  = (pipeonly || $urandom_range(0, 9) < 8) ? pipe_ops[$urandom_range(0, 17)]
-			                                     : seq_ops[$urandom_range(0, 5)];
+			                                     : seq_ops[$urandom_range(0, 9)];
 			c.sr   = 3'($urandom());
 			// dependent chains half the time: the destination of one is a
 			// source of the next
