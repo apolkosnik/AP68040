@@ -1104,12 +1104,15 @@ always_comb begin
 end
 
 // front-file write by EX, and its broadcast to younger operands
-wire ex_d_eff = ex_u.d_v && !ex_dkill && !(ex_u.op == OP_CAS && cas_eq);
+// (CAS writes Dc either way: on a match the value written -- the
+// operand read, over Dc's bits above the size -- is Dc itself, so the
+// compare stays off the write enable)
+wire ex_d_eff = ex_u.d_v && !ex_dkill;
 // (the odd-target check as it concerns a register write: only DBcc and
 // FDBcc are branches that write one, so the ALU's taken stays off the
-// operand forwarding)
+// operand forwarding -- the FPU's own taken, not EX's selected one)
 wire ex_odd_w = ex_br && (ex_bdb ? ex_u.target[0] :
-                          (ex_u.op == OP_FPU) && ex_taken && ex_target[0]);
+                          (ex_u.op == OP_FPU) && fp_taken && ex_target[0]);
 assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd_w &&
                  (ex_u.exc == 8'd0);
 assign exw_reg = ex_u.d_reg;

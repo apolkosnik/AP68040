@@ -269,8 +269,34 @@ further needs a pipelined adder and multiplier.  A memory source converted from
 single, double or extended goes straight to F_BIN for a binary operation
 and straight to F_ROUND for a move, as a register source does (an
 extended operand that reaches conversion is normalized already: unnormals
-and denormals take the unsupported-data-type trap); FMOVE.D (An),FPn
-takes about 8 cycles, FMOVE.X 9, FADD.D 10.
+and denormals take the unsupported-data-type trap).
+
+**The arithmetic pipeline.**  FMOVE, FABS, FNEG, FADD, FSUB and FMUL
+(FPCR precision and the FS/FD forms) from a register or a single, double
+or extended memory operand, and FMOVE from a long, word or byte integer
+(normalized in P4), run in a pipeline beside the state machine when both
+operands are ordinary -- zero, or normalized with an unbiased exponent
+within +-60 -- and every FPCR exception enable is clear: such an operation
+can neither overflow nor underflow at any rounding precision and raises
+nothing that traps.  Each register carries an "ordinary" flag, set as it
+is written (the dispatch reads flags, not exponents).  Stages: P1 zero
+cases, operand order, exponent difference (FMUL: exponent sum); P2
+alignment shift (FMUL: the 64x64 product); P3 add or subtract (product
+normalize); P4 normalize after a subtraction or of an integer; P5 round; P6 register write,
+INEX, condition codes -- the state machine's F_BIN, F_SHR, F_ADDX, F_NORM2,
+F_ROUND and F_WB, so the results and FPSR are bit-identical to it
+(tb/tb_fpu_pipe.sv runs both side by side on random streams).  The pipeline
+takes an operation every cycle; one whose source a P5 or P6 operation is
+writing gets it forwarded into P1 (from P6, or P7: P6 a cycle on), one
+whose source is in P1-P4 waits.  An operation the pipeline takes is done
+at issue for the core, in the same cycle (pdone; no exception can
+follow); any other FPU operation
+starts only when the pipeline is empty, and every uop that reads or
+writes FPU state (condition codes, FMOVE of a control register, FMOVEM,
+FSAVE/FRESTORE) waits for it.  A dependent FADD chain runs at 5 cycles an
+operation, FMOVE.D (An),FPn 6, FADD.D (An),FPn 6, FMOVE.L Dn,FPn 4;
+independent operations at 3 (an FPU uop acts only once the instruction
+before it has left WB).
 
 ## Pins beyond the bus
 

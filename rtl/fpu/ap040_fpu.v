@@ -30,6 +30,11 @@
 `include "ap040_defs.svh"
 
 module ap040_fpu
+#(
+	// the arithmetic pipeline (FMOVE/FADD/FSUB/FMUL on ordinary operands);
+	// 0: every operation through the sequential state machine
+	parameter PIPE = 1
+)
 (
 	input             clk,
 	input             nreset,
@@ -81,6 +86,12 @@ module ap040_fpu
 	// revision-$41 68040 state-frame payload here until a successful FSAVE
 	// acknowledges it.  FRESTORE can reinstate that pending state.
 	output reg        fpu_used,    // 0: NULL frame, 1: IDLE or exception frame
+	output            pdone,       // the request went into the pipeline this
+	                               // cycle (done, combinationally; done itself
+	                               // pulses only for the state machine)
+	output            pbusy,       // pipelined operations in flight: FPU state
+	                               // (registers, FPSR, condition codes) is not
+	                               // current until they complete
 	output reg        fstate_unimp,
 	output reg [15:0] fstate_cmd1,
 	output reg [15:0] fstate_cmd3,
@@ -161,7 +172,8 @@ reg [31:0] fpcr;                  // [15:8] enables, [7:6] prec, [5:4] rnd
 reg [31:0] fpsr;                  // [27:24] cc, [23:16] quot, [15:8] exc, [7:3] aexc
 reg [31:0] fpiar;
 
-assign fpcc = fpsr[27:24];        // {N, Z, I, NAN}
+assign fpcc = fpsr[27:24];
+        // {N, Z, I, NAN}
 
 wire [1:0] rnd_mode = fpcr[5:4];  // 00 RN, 01 RZ, 10 RM, 11 RP
 
@@ -488,6 +500,443 @@ reg        fstate_e1;    // the prepared/restored frame is an arithmetic
                          // E1 state, not an unimplemented instruction
 
 // Collapse FMOVEM restore and arithmetic result writes into the regfile's
+//---------------------------------------------------------------------------
+// arithmetic pipeline
+//---------------------------------------------------------------------------
+// FMOVE, FABS, FNEG, FADD, FSUB and FMUL (FPCR precision and the FS/FD
+// forms; FMOVE also from a long, word or byte integer) whose
+// operands are ordinary -- zeros, or normalized numbers whose unbiased
+// exponent is within +-60 ("nice") -- can neither overflow nor underflow
+// at any rounding precision, and with every FPCR exception enable clear
+// they raise nothing that traps.  They run in a pipeline that takes one
+// a cycle and writes its results in order; the sequential state machine
+// starts an operation only once the pipeline is empty, and everything
+// that reads FPU state waits for it (pbusy).  The arithmetic is the state
+// machine's, stage for stage, so results and FPSR are bit-identical
+// (tb/tb_fpu_pipe.sv runs both side by side):
+//   P1  zero cases, operand order and exponent difference (FMUL: the
+//       exponent sum)                                          (F_BIN)
+//   P2  alignment shift with sticky (FMUL: the 64x64 product)  (F_SHR)
+//   P3  add or subtract (FMUL: the product's one-bit normalize) (F_ADDX)
+//   P4  normalize after a subtraction, or an integer source    (F_NORM2)
+//   P5  round to the precision                                 (F_ROUND)
+//   P6  register, FPSR condition codes, INEX                   (F_WB)
+// A source that an operation in P5 or P6 is writing when the next one is
+// dispatched is forwarded into its P1 (from P6, or P7: P6 one cycle on);
+// one written by P1-P4 holds the dispatch.
+
+function pipe_opm;
+	input [6:0] op;
+	begin
+		case (op)
+			7'h00, 7'h40, 7'h44, 7'h22, 7'h62, 7'h66,
+			7'h28, 7'h68, 7'h6C, 7'h23, 7'h63, 7'h67,
+			7'h18, 7'h58, 7'h5C, 7'h1A, 7'h5A, 7'h5E: pipe_opm = 1'b1;
+			default: pipe_opm = 1'b0;
+		endcase
+	end
+endfunction
+
+// 0 move, 1 add/subtract, 2 multiply
+function [1:0] pipe_kind;
+	input [6:0] op;
+	begin
+		case (op)
+			7'h22, 7'h62, 7'h66, 7'h28, 7'h68, 7'h6C: pipe_kind = 2'd1;
+			7'h23, 7'h63, 7'h67:                      pipe_kind = 2'd2;
+			default:                                  pipe_kind = 2'd0;
+		endcase
+	end
+endfunction
+
+// an ordinary extended value: zero (not infinity), or normalized with
+// an exponent of 16383 +- 60
+function nice_x;
+	input [14:0] e;
+	input [63:0] m;
+	begin
+		nice_x = (m == 64'd0) ? (e != 15'h7FFF)
+		                      : (m[63] && e >= 15'd16323 && e <= 15'd16443);
+	end
+endfunction
+
+reg   [7:0] fr_nice;          // per register: nice_x of its contents
+reg         req_pend;         // a request waiting for the pipeline
+wire        rq = req || req_pend;
+
+// stage registers
+reg         p1_v, p2_v, p3_v, p4_v, p5_v, p6_v, p7_v;
+reg   [6:0] p1_op, p2_op, p3_op, p4_op, p5_op;
+reg   [2:0] p1_d, p2_d, p3_d, p4_d, p5_d, p6_d;
+reg         p1_as, p1_bs, p1_az, p1_bz;
+reg  [16:0] p1_ae, p1_be;
+reg  [63:0] p1_am, p1_bm;
+reg   [1:0] p1_af, p1_bf;     // forwarded from: 0 no, 1 P6, 2 P7
+reg   [1:0] p2_k, p3_k;
+reg         p2_z, p3_z, p4_z, p5_z, p6_z, p7_z;   // the result is zero
+reg         p2_s, p3_s, p4_s, p5_s, p6_s, p7_s;
+reg  signed [17:0] p2_e, p3_e, p4_e, p5_e;
+reg  [16:0] p6_e, p7_e;
+reg  [63:0] p2_bm, p2_sm, p3_bm, p4_m, p5_m, p6_m, p7_m;
+reg   [6:0] p2_sh;
+reg         p2_es, p3_es, p4_n;
+reg  [66:0] p3_sv;
+reg [127:0] p3_pd;
+reg   [2:0] p4_g, p5_g;
+reg         p6_inx, p6_nice;
+reg         p1_ni, p2_ni, p3_ni;   // an integer source: normalize in P4
+
+// one 64x64 multiplier for both: the state machine multiplies only in
+// F_MULT, which it reaches with the pipeline empty
+// (its operands are registers of its own, loaded by whichever goes to
+// multiply: F_BIN as it enters F_MULT, P1 for an FMUL)
+reg   [63:0] mul_x, mul_y;
+wire [127:0] mul_out = mul_x * mul_y;
+
+assign pbusy = p1_v || p2_v || p3_v || p4_v || p5_v || p6_v;
+assign pdone = pipe_issue;
+
+// the youngest writer in flight of register r: 0 none, 1 P1-P4 (wait),
+// 2 P5 (forward from P6), 3 P6 (forward from P7)
+function [1:0] pw;
+	input [2:0] r;
+	begin
+		if ((p1_v && p1_d == r) || (p2_v && p2_d == r) ||
+		    (p3_v && p3_d == r) || (p4_v && p4_d == r)) pw = 2'd1;
+		else if (p5_v && p5_d == r) pw = 2'd2;
+		else if (p6_v && p6_d == r) pw = 2'd3;
+		else pw = 2'd0;
+	end
+endfunction
+
+// P5's result will be nice, decided a stage early (a register: it feeds
+// the dispatch, pdone, and so the core's stall path): its exponent before
+// rounding within +-59 (rounding adds at most one), P4's normalize taking
+// up to 64 off -- conservative: a result this misses is only not
+// forwarded (the dispatch waits for its write and reads the flag then)
+reg  p5_nice;
+
+// the memory operand: single, double or extended; or an integer (long,
+// word, byte) for a move, normalized in P4 as F_NORM does
+reg         q_s, q_z, q_n, q_i;
+reg  [16:0] q_e;
+reg  [63:0] q_m;
+always @* begin
+	q_s = din[95]; q_z = 1'b0; q_n = 1'b0; q_i = 1'b0; q_e = 17'd0; q_m = 64'd0;
+	case (src_fmt)
+		3'd0: begin
+			q_i = 1'b1; q_n = 1'b1;
+			q_z = (din[95:64] == 32'd0);
+			q_e = 17'd16383 + 17'd31;
+			q_m = {(din[95] ? (32'd0 - din[95:64]) : din[95:64]), 32'd0};
+		end
+		3'd4: begin
+			q_i = 1'b1; q_n = 1'b1;
+			q_z = (din[95:80] == 16'd0);
+			q_e = 17'd16383 + 17'd15;
+			q_m = {(din[95] ? (16'd0 - din[95:80]) : din[95:80]), 48'd0};
+		end
+		3'd6: begin
+			q_i = 1'b1; q_n = 1'b1;
+			q_z = (din[95:88] == 8'd0);
+			q_e = 17'd16383 + 17'd7;
+			q_m = {(din[95] ? (8'd0 - din[95:88]) : din[95:88]), 56'd0};
+		end
+		3'd1: begin
+			q_z = (din[94:64] == 31'd0);
+			q_n = q_z || (din[94:87] >= 8'd67 && din[94:87] <= 8'd187);
+			q_e = q_z ? 17'd0 : ({9'd0, din[94:87]} + 17'd16256);
+			q_m = q_z ? 64'd0 : {1'b1, din[86:64], 40'd0};
+		end
+		3'd5: begin
+			q_z = (din[94:32] == 63'd0);
+			q_n = q_z || (din[94:84] >= 11'd963 && din[94:84] <= 11'd1083);
+			q_e = q_z ? 17'd0 : ({6'd0, din[94:84]} + 17'd15360);
+			q_m = q_z ? 64'd0 : {1'b1, din[83:32], 11'd0};
+		end
+		default: begin
+			q_z = (din[63:0] == 64'd0);
+			q_n = nice_x(din[94:80], din[63:0]);
+			q_e = {2'd0, din[94:80]};
+			q_m = din[63:0];
+		end
+	endcase
+end
+
+wire [1:0] q_kind = pipe_kind(opmode);
+wire       q_reg  = (op_class == 3'b000);
+wire       q_mem  = (op_class == 3'b010) &&
+                    ((src_fmt == 3'd1 || src_fmt == 3'd5 || src_fmt == 3'd2) ||
+                     // an integer (always ordinary) only for a move: a binary
+                     // operation needs its source normalized before P1
+                     ((src_fmt == 3'd0 || src_fmt == 3'd4 || src_fmt == 3'd6) &&
+                      q_kind == 2'd0));
+wire [1:0] q_aw   = pw(src_r);
+wire [1:0] q_bw   = pw(dst_r);
+wire       q_aok  = q_mem ? q_n :
+                    (q_aw == 2'd0) ? (fr_valid[src_r] && fr_nice[src_r]) :
+                    (q_aw == 2'd2) ? p5_nice :
+                    (q_aw == 2'd3) ? p6_nice : 1'b0;
+wire       q_bok  = (q_kind == 2'd0) ? 1'b1 :
+                    (q_bw == 2'd0) ? (fr_valid[dst_r] && fr_nice[dst_r]) :
+                    (q_bw == 2'd2) ? p5_nice :
+                    (q_bw == 2'd3) ? p6_nice : 1'b0;
+wire pipe_issue = (PIPE != 0) && ce && rq && (fst == F_IDLE) &&
+                  !(frestore_unimp && frestore_resume) &&
+                  !fstate_unimp && !fstate_e1 && !fstate_busy && !fstate_resig &&
+                  (fpcr[15:8] == 8'd0) && pipe_opm(opmode) &&
+                  (q_reg || q_mem) && q_aok && q_bok;
+
+// P1: the operands (forwarded), the zero cases, order and exponents
+reg         s1_as, s1_bs, s1_az, s1_bz;
+reg  [16:0] s1_ae, s1_be;
+reg  [63:0] s1_am, s1_bm;
+always @* begin
+	{s1_as, s1_ae, s1_am, s1_az} = (p1_af == 2'd1) ? {p6_s, p6_e, p6_m, p6_z} :
+	                               (p1_af == 2'd2) ? {p7_s, p7_e, p7_m, p7_z} :
+	                                                 {p1_as, p1_ae, p1_am, p1_az};
+	{s1_bs, s1_be, s1_bm, s1_bz} = (p1_bf == 2'd1) ? {p6_s, p6_e, p6_m, p6_z} :
+	                               (p1_bf == 2'd2) ? {p7_s, p7_e, p7_m, p7_z} :
+	                                                 {p1_bs, p1_be, p1_bm, p1_bz};
+end
+
+always @(posedge clk) begin
+	if (!nreset) begin
+		p1_v <= 0; p2_v <= 0; p3_v <= 0; p4_v <= 0; p5_v <= 0; p6_v <= 0; p7_v <= 0;
+	end
+	else if (ce) begin
+		//----------------------------------------------------------- dispatch
+		p1_v <= pipe_issue;
+		if (pipe_issue) begin
+			p1_op <= opmode;
+			p1_d  <= dst_r;
+			p1_af <= (q_mem || q_aw == 2'd0) ? 2'd0 : (q_aw == 2'd2) ? 2'd1 : 2'd2;
+			p1_bf <= (q_bw == 2'd0) ? 2'd0 : (q_bw == 2'd2) ? 2'd1 : 2'd2;
+			p1_ni <= q_mem && q_i;
+			if (q_mem) begin
+				p1_as <= q_s; p1_ae <= q_e; p1_am <= q_m; p1_az <= q_z;
+			end
+			else begin
+				p1_as <= fr_src_s; p1_ae <= {2'd0, fr_src_e}; p1_am <= fr_src_m;
+				p1_az <= (fr_src_m == 64'd0);
+			end
+			p1_bs <= fr_dst_s; p1_be <= {2'd0, fr_dst_e}; p1_bm <= fr_dst_m;
+			p1_bz <= (fr_dst_m == 64'd0);
+		end
+
+		//----------------------------------------------------------------- P1
+		p2_v  <= p1_v;
+		p2_ni <= p1_ni;
+		p2_op <= p1_op;
+		p2_d  <= p1_d;
+		p2_z  <= 1'b0;
+		p2_es <= 1'b0;
+		p2_sh <= 7'd0;
+		p2_sm <= 64'd0;
+		case (pipe_kind(p1_op))
+			2'd1: begin : p1_add
+				reg        sa, aswap;
+				reg [16:0] dd;
+				// FSUB family: the source sign folded
+				sa = (p1_op == 7'h28 || p1_op == 7'h68 || p1_op == 7'h6C) ? ~s1_as : s1_as;
+				if (s1_az && s1_bz) begin
+					p2_k <= 2'd0; p2_z <= 1'b1;
+					p2_s <= (sa == s1_bs) ? sa : (rnd_mode == 2'b10);
+					p2_e <= 18'sd0; p2_bm <= 64'd0;
+				end
+				else if (s1_az) begin
+					// a zero source: the destination, rounded
+					p2_k <= 2'd0; p2_s <= s1_bs;
+					p2_e <= $signed({1'b0, s1_be}); p2_bm <= s1_bm;
+				end
+				else if (s1_bz) begin
+					p2_k <= 2'd0; p2_s <= sa;
+					p2_e <= $signed({1'b0, s1_ae}); p2_bm <= s1_am;
+				end
+				else begin
+					aswap = (s1_ae > s1_be) || (s1_ae == s1_be && s1_am > s1_bm);
+					dd    = aswap ? (s1_ae - s1_be) : (s1_be - s1_ae);
+					p2_k  <= 2'd1;
+					p2_es <= (sa != s1_bs);
+					p2_s  <= aswap ? sa : s1_bs;
+					p2_e  <= $signed({1'b0, aswap ? s1_ae : s1_be});
+					p2_bm <= aswap ? s1_am : s1_bm;
+					p2_sm <= aswap ? s1_bm : s1_am;
+					p2_sh <= (dd > 17'd66) ? 7'd67 : dd[6:0];
+				end
+			end
+			2'd2: begin
+				p2_s <= s1_as ^ s1_bs;
+				if (s1_az || s1_bz) begin
+					p2_k <= 2'd0; p2_z <= 1'b1; p2_e <= 18'sd0; p2_bm <= 64'd0;
+				end
+				else begin
+					p2_k  <= 2'd2;
+					p2_e  <= $signed({1'b0, s1_ae}) + $signed({1'b0, s1_be}) - 18'sd16383;
+					p2_bm <= s1_am;
+					p2_sm <= s1_bm;
+				end
+			end
+			default: begin
+				// FMOVE; FABS clears the sign, FNEG flips it (F_EXEC)
+				p2_k <= 2'd0; p2_z <= s1_az;
+				p2_s <= (p1_op == 7'h18 || p1_op == 7'h58 || p1_op == 7'h5C) ? 1'b0 :
+				        (p1_op == 7'h1A || p1_op == 7'h5A || p1_op == 7'h5E) ? ~s1_as : s1_as;
+				p2_e <= s1_az ? 18'sd0 : $signed({1'b0, s1_ae});
+				p2_bm <= s1_am;
+			end
+		endcase
+
+		//----------------------------------------------------------------- P2
+		p3_v  <= p2_v;
+		p3_ni <= p2_ni;
+		p3_op <= p2_op;
+		p3_d  <= p2_d;
+		p3_k  <= p2_k;
+		p3_z  <= p2_z;
+		p3_s  <= p2_s;
+		p3_e  <= p2_e;
+		p3_es <= p2_es;
+		p3_bm <= p2_bm;
+		p3_sv <= shr_sticky({p2_sm, 3'd0}, p2_sh);
+		p3_pd <= mul_out;
+
+		//----------------------------------------------------------------- P3
+		p4_v  <= p3_v;
+		p4_op <= p3_op;
+		p4_d  <= p3_d;
+		p4_s  <= p3_s;
+		p4_z  <= p3_z;
+		p4_e  <= p3_e;
+		p4_n  <= p3_ni && !p3_z;      // an integer move: normalize
+		p4_g  <= 3'd0;
+		p4_m  <= p3_bm;
+		case (p3_k)
+			2'd1: begin : p3_add
+				reg [67:0] sum;
+				reg [66:0] diff;
+				if (!p3_es) begin
+					sum = {1'b0, p3_bm, 3'd0} + {1'b0, p3_sv};
+					if (sum[67]) begin
+						p4_m <= sum[67:4];
+						p4_g <= {sum[3], sum[2], sum[1] | sum[0]};
+						p4_e <= p3_e + 18'sd1;
+					end
+					else begin
+						p4_m <= sum[66:3];
+						p4_g <= sum[2:0];
+					end
+				end
+				else begin
+					diff = {p3_bm, 3'd0} - p3_sv;
+					if (diff == 67'd0) begin
+						p4_z <= 1'b1;
+						p4_s <= (rnd_mode == 2'b10);
+					end
+					else begin
+						p4_m <= diff[66:3];
+						p4_g <= diff[2:0];
+						p4_n <= 1'b1;
+					end
+				end
+			end
+			2'd2: begin
+				if (p3_pd[127]) begin
+					p4_m <= p3_pd[127:64];
+					p4_g <= {p3_pd[63], p3_pd[62], (p3_pd[61:0] != 0)};
+					p4_e <= p3_e + 18'sd1;
+				end
+				else begin
+					p4_m <= p3_pd[126:63];
+					p4_g <= {p3_pd[62], p3_pd[61], (p3_pd[60:0] != 0)};
+				end
+			end
+			default: ;
+		endcase
+
+		//----------------------------------------------------------------- P4
+		p5_v  <= p4_v;
+		p5_op <= p4_op;
+		p5_d  <= p4_d;
+		p5_s  <= p4_s;
+		p5_z  <= p4_z;
+		p5_e  <= p4_e;
+		p5_m  <= p4_m;
+		p5_g  <= p4_g;
+		p5_nice <= p4_z || (p4_n ? (p4_e >= 18'sd16388 && p4_e <= 18'sd16442)
+		                         : (p4_e >= 18'sd16324 && p4_e <= 18'sd16442));
+		if (p4_n) begin : p4_norm
+			reg [6:0]  lz;
+			reg [66:0] nv;
+			lz = clz64(p4_m);
+			if (lz == 7'd64) begin
+				p5_m <= {p4_g, 61'd0};
+				p5_g <= 3'd0;
+				p5_e <= p4_e - 18'sd64;
+			end
+			else begin
+				nv = {p4_m, p4_g} << lz;
+				p5_m <= nv[66:3];
+				p5_g <= nv[2:0];
+				p5_e <= p4_e - {11'd0, lz};
+			end
+		end
+
+		//----------------------------------------------------------------- P5
+		p6_v <= p5_v;
+		p6_d <= p5_d;
+		p6_s <= p5_s;
+		p6_z <= p5_z;
+		p6_inx <= 1'b0;
+		p6_nice <= p5_nice;
+		if (p5_z) begin
+			p6_e <= 17'd0;
+			p6_m <= 64'd0;
+		end
+		else begin : p5_round
+			reg [64:0] mr, mk, mi;
+			reg [63:0] rmask, rinc;
+			reg        inx, up;
+			reg signed [17:0] er;
+			case (prec_of(p5_op))
+				2'd1: begin
+					up = round_up(p5_m[40], p5_m[39], (p5_m[38:0] != 0) || (p5_g != 0), p5_s);
+					inx = (p5_m[39:0] != 0) || (p5_g != 0);
+					rmask = 64'hFFFF_FF00_0000_0000;
+					rinc  = 64'h0000_0100_0000_0000;
+				end
+				2'd2: begin
+					up = round_up(p5_m[11], p5_m[10], (p5_m[9:0] != 0) || (p5_g != 0), p5_s);
+					inx = (p5_m[10:0] != 0) || (p5_g != 0);
+					rmask = 64'hFFFF_FFFF_FFFF_F800;
+					rinc  = 64'h0000_0000_0000_0800;
+				end
+				default: begin
+					up = round_up(p5_m[0], p5_g[2], p5_g[1:0] != 0, p5_s);
+					inx = (p5_g != 0);
+					rmask = 64'hFFFF_FFFF_FFFF_FFFF;
+					rinc  = 64'h0000_0000_0000_0001;
+				end
+			endcase
+			mk = {1'b0, p5_m & rmask};
+			mi = mk + {1'b0, rinc};
+			mr = up ? mi : mk;
+			er = (up && mi[64]) ? (p5_e + 18'sd1) : p5_e;
+			if (mr[64]) mr = {2'b01, 63'd0};
+			p6_e <= er[16:0];
+			p6_m <= mr[63:0];
+			p6_inx <= inx;
+		end
+
+		//------------------------------------------------- P6 (and P7 after)
+		p7_v <= p6_v;
+		p7_s <= p6_s;
+		p7_e <= p6_e;
+		p7_m <= p6_m;
+		p7_z <= p6_z;
+	end
+end
+
 // single physical write port.  The core cannot dispatch FMOVEM while the FPU
 // is in F_WB; keeping the explicit priority also matches the old procedural
 // assignment order if that invariant is ever violated.
@@ -496,9 +945,10 @@ wire fr_wb_we = (fst == F_WB) && !(|(fpsr[15:8] & fpcr[15:8])) &&
 wire [14:0] fr_wb_e = (a_t == T_ZERO) ? 15'd0 :
                        (a_t == T_INF || a_t == T_NAN) ? 15'h7FFF : a_e[14:0];
 wire [63:0] fr_wb_m = (a_t == T_ZERO) ? 64'd0 : a_m;
-wire        fr_bank_we = fm_we || fr_wb_we;
-wire  [2:0] fr_bank_wa = fr_wb_we ? r_dst : fm_sel;
-wire [79:0] fr_bank_wd = fr_wb_we ? {a_s, fr_wb_e, fr_wb_m} :
+wire        fr_bank_we = fm_we || fr_wb_we || p6_v;
+wire  [2:0] fr_bank_wa = p6_v ? p6_d : fr_wb_we ? r_dst : fm_sel;
+wire [79:0] fr_bank_wd = p6_v ? {p6_s, p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 : p6_m} :
+                         fr_wb_we ? {a_s, fr_wb_e, fr_wb_m} :
                                     {fm_wdata[95], fm_wdata[94:80],
                                      fm_wdata[63:0]};
 
@@ -719,10 +1169,31 @@ always @(posedge clk) begin
 		// Invalid entries read as the default positive nonsignaling NaN.
 		fr_valid <= 0;
 		fr_unsup <= 0;
+		fr_nice  <= 0;
+		req_pend <= 0;
 	end
 	else if (ce) begin
-		if (fr_bank_we)
+		if (fr_bank_we) begin
 			fr_unsup[fr_bank_wa] <= unsupported_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
+			fr_nice[fr_bank_wa]  <= nice_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
+		end
+		// a request the pipeline or the state machine cannot take yet
+		// (the pipeline draining, or a source still being computed)
+		req_pend <= rq && !(fst == F_IDLE && (pipe_issue || !pbusy) &&
+		                    !(frestore_unimp && frestore_resume));
+		// the multiplier's operands for an FMUL in P1 (the state machine
+		// is idle whenever the pipeline holds an operation)
+		if (p1_v && pipe_kind(p1_op) == 2'd2) begin
+			mul_x <= s1_am;
+			mul_y <= s1_bm;
+		end
+		// the pipeline's writeback (P6): FPSR as F_WB and F_ROUND leave it
+		if (p6_v) begin
+			fr_valid[p6_d] <= 1;
+			fpsr[15:8]  <= p6_inx ? 8'h02 : 8'h00;    // INEX2
+			if (p6_inx) fpsr[3] <= 1;                 // accrued INEX
+			fpsr[27:24] <= {p6_s, p6_z, 1'b0, 1'b0};
+		end
 		done <= 0;
 		unimp <= 0;
 		unsupp <= 0;
@@ -812,6 +1283,7 @@ always @(posedge clk) begin
 			// architectural default NaN through the validity view above.
 			fr_valid <= 0;
 			fr_unsup <= 0;
+			fr_nice  <= 0;
 		end
 		if (fsave_ack) begin
 			fstate_unimp <= 0;
@@ -893,7 +1365,12 @@ always @(posedge clk) begin
 				sh_ret <= F_RESTORE_A;
 				fst <= F_SHR;
 			end
-			else if (req) begin
+			else if (pipe_issue) begin
+				// into the pipeline: complete as far as the core is concerned
+				// (pdone, this cycle)
+				fpu_used <= 1;
+			end
+			else if (rq && !pbusy) begin
 				if (fstate_unimp && !fstate_e1 && fstate_resig) begin
 					// A restored exception frame remains pending until FSAVE.
 					// Re-enter the software package without destroying its state.
@@ -1762,6 +2239,8 @@ always @(posedge clk) begin
 								acc_hi <= 0;
 								acc_lo <= 0;
 								loop_n <= 0;
+								mul_x  <= am_eff;
+								mul_y  <= bm_eff;
 								fst <= F_MULT;
 							end
 						end
@@ -1923,7 +2402,7 @@ always @(posedge clk) begin
 					// One registered 64x64 DSP-tree multiply replaces the
 					// 32-cycle serial radix-4 loop.  At this clock (34.8 ns
 					// budget) the cascade closes in a single cycle.
-					mul_pd <= a_m * b_m;
+					mul_pd <= mul_out;
 					loop_n <= 7'd1;
 				end
 			end
@@ -2060,8 +2539,10 @@ always @(posedge clk) begin
 					emin = op_sgl(r_op) ? 18'sd0 :
 					       (pr == 2'd1) ? 18'sd16257 :
 					       (pr == 2'd2) ? 18'sd15361 : 18'sd0;
-					ovf = (er > emax);
-					unf = (er < emin);
+					// (decided for the exponent with and without the rounding
+					// carry side by side, the carry selecting: a timing path)
+					ovf = (up && mi[64]) ? (e_w >= emax) : (e_w > emax);
+					unf = (up && mi[64]) ? (e_w + 18'sd1 < emin) : (e_w < emin);
 					// WBTEMP capture for a possible BUSY frame: rounded for
 					// OVFL and the plain inexact path, unrounded for UNFL
 					wb_s   <= a_s;

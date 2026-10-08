@@ -40,7 +40,9 @@ retries, BCLK at half PCLK, and all of those together.
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
 t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress,
-t_eredir, t_cbsplit, t_cmodes, t_loops, t_early.
+t_eredir, t_cbsplit, t_cmodes, t_loops, t_early.  The FPU pipeline also
+has its own bench: tb/build_fpu_pipe.sh, then obj/obj_fpu_pipe/tb_fpu_pipe
++seed=<n> [+pipeonly] compares it against the sequential FPU.
 
 The bench counts the CPU's bus transfers in a window ($F2D0-$F2DC);
 t_cbsplit uses it to show that misaligned and line- or page-crossing
@@ -112,7 +114,13 @@ parallel and leaves the illegal-word override off them, the FPU's
 rounding increment is formed beside the rounding decision, the dispatch's
 datatype check reads a per-register flag kept as registers are written,
 F_UNFL's rounding increment likewise, and the zero tests of F_NORM and
-F_UNFL no longer gate a_m.
+F_UNFL no longer gate a_m.  In the FPU pipeline round (78 % of the ALMs): the
+two engines share one 64x64 multiplier with operand registers of its own,
+F_ROUND decides overflow/underflow for both rounding carries side by side,
+the pipeline's forwarding flag for P5 is a register (it feeds pdone and so
+the core's stall path), EX's register write no longer waits on the CAS
+compare (CAS writes Dc either way) or on EX's selected taken (the odd-
+target check uses the FPU's), and the FMOVEM slot map is a register.
 
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
@@ -164,9 +172,14 @@ small program linked against WinUAE's readcpu.cpp; see tools/README).
   can restart it after the read.
 * FDIV/FSQRT: two quotient bits (root digits) per clock, 33 iterations.
 * FADD/FSUB/FMUL register to register: 6 cycles back to back (the 68040
-  takes 3 and 5); 15 and 11 before the interface and dispatch work.  From
-  memory: FMOVE.D 8, FMOVE.X 9, FADD.D 10, FADD.X 11 (bench_insn: before
-  it set its FP registers, the FP forms measured NaN and zero operands).
+  takes 3 and 5); 15 and 11 before the interface and dispatch work; with
+  the arithmetic pipeline a dependent FADD chain is 5 a step, independent
+  operations 3.  From memory: FMOVE.D 6, FMOVE.X 7, FADD.D 6, FADD.X 7;
+  FMOVE.L Dn,FPn 4 (bench_insn: before it set its
+  FP registers, the FP forms measured NaN and zero operands).  Operations
+  on unordinary operands (beyond +-60 in exponent, denormals, NaNs,
+  infinities), with an exception enabled, or other than FMOVE/FABS/FNEG/
+  FADD/FSUB/FMUL still take the state machine (6 cycles and up).
 * Branch prediction is invisible to programs except for self-modified
   code: like the 68040 (which prefetches both paths of a branch) the core
   may fetch a branch target before an older store to it; CPUSHA must

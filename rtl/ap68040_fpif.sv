@@ -32,6 +32,9 @@
 //   SV0   SVW   FSAVE: frame size (signed for -(An)) / frame word imm/4   //
 //   RS0   RSW   FRESTORE: header check, frame size / frame word immb/4    //
 //                                                                          //
+// FMOVE/FADD/FSUB/FMUL on ordinary operands go into the FPU's pipeline,  //
+// done at issue (one may follow every cycle); every other uop that reads  //
+// or writes FPU state waits until the pipeline is empty (pbusy).         //
 // Register-destination arithmetic past every datatype check is released  //
 // to the background (as the 68040 runs its FPU beside the integer unit); //
 // an enabled exception of a released operation becomes pending and is    //
@@ -190,6 +193,8 @@ logic [95:0] f_din, f_fmwd;
 logic  [1:0] f_crsel;
 logic [31:0] f_crwd, f_iapc;
 logic        f_done, f_accepted, f_unimp, f_unsupp, f_excreq, f_used, f_wbok;
+logic        f_pbusy;          // pipelined operations in flight
+logic        f_pdone;          // the request went into the pipeline (this cycle)
 // the released operation ends cleanly: done, or its F_WB without an
 // enabled exception (a cycle sooner)
 wire         f_end = (f_done || f_wbok) && !f_excreq;
@@ -223,7 +228,7 @@ ap040_fpu fpu (
 	.bsun_req(f_bsun), .bsun_enable(f_bsun_en),
 	.ia_we(f_iawe), .ia_wdata(f_iapc),
 	.fm_sel(f_fmsel), .fm_we(f_fmwe), .fm_wdata(f_fmwd), .fm_rdata(f_fmrd),
-	.fpu_used(f_used),
+	.fpu_used(f_used), .pbusy(f_pbusy), .pdone(f_pdone),
 	.fstate_unimp(s_unimp),
 	.fstate_cmd1(s_cmd1), .fstate_cmd3(s_cmd3),
 	.fstate_stag(s_stag), .fstate_dtag(s_dtag), .fstate_flags(s_flags),
@@ -342,7 +347,9 @@ end
 function automatic logic [2:0] slot_bit(input logic [2:0] k, input logic lsb);
 	slot_bit = lsb ? k : (3'd7 - k);
 endfunction
-always_comb for (int k = 0; k < 8; k++) mv_slots[k] = list[slot_bit(3'(k), mv_lsb)];
+// mv_slots: list in slot order, a register of its own (set with list and
+// mv_lsb, so the same value a cycle earlier than a decode of them: it feeds
+// AG's dynamic cancel, and so the register file's write enable)
 wire [2:0] cur_bit = slot_bit(slot, mv_lsb);
 wire [2:0] cur_reg = (!mv_st || mv_m1) ? (3'd7 - cur_bit) : cur_bit;  // loads: bit 7 = FP0
 wire       cur_on  = list[cur_bit];
@@ -445,12 +452,20 @@ always_comb begin
 	st_kill = sx_kill;
 	if (ex_v) begin
 		if (!safe && !nosafe) hold = 1'b1;
+		// FPU state (registers, FPSR, condition codes, control registers,
+		// frames) is current only once the pipelined operations complete:
+		// only a new operation (CHK, EAL, DISP) goes ahead of them
+		else if (f_pbusy && !(sub == FC_CHK || sub == FC_EAL || sub == FC_DISP || sub == FC_GET))
+			hold = 1'b1;
 		else case (sub)
 			FC_CHK: begin
 				// the released operation completing this cycle without an
 				// exception lets CHK go (one that raises one makes it pending
 				// at this edge: CHK waits and delivers it)
-				if (fuse && go && fresh) hold = 1'b1;   // the FPU sees it now
+				// the FPU sees it now: done at once if it went into the
+				// pipeline (pdone: the registered done of this cycle may be
+				// a released operation's, which fresh masks)
+				if (fuse && go && fresh && !f_pdone) hold = 1'b1;
 				else if (fuse && go) begin
 					// dispatched (below): DISP's outcome
 					if (f_unimp) begin
@@ -462,7 +477,7 @@ always_comb begin
 						xaddr = 32'd0; xcommit = 1'b1;
 					end
 					else if (f_excreq) begin xvec = f_excvec; xnext = 1'b1; end
-					else if (!(f_accepted || f_done)) hold = 1'b1;
+					else if (!(f_accepted || f_done || f_pdone)) hold = 1'b1;
 				end
 				else if (bg && !f_end) hold = 1'b1;
 				else if (chk_pend) begin
@@ -503,7 +518,7 @@ always_comb begin
 				else if (go && f_excreq) begin
 					xvec = f_excvec; xnext = 1'b1;
 				end
-				else if (!(go && (f_accepted || f_done))) hold = 1'b1;
+				else if (!(go && (f_accepted || f_done || f_pdone))) hold = 1'b1;
 			end
 			FC_GET: res = (imm[1:0] == 2'd1) ? get_q[63:32] : get_q[31:0];
 			FC_END: begin
@@ -575,7 +590,7 @@ always_ff @(posedge clk) begin
 		bg <= 1'b0; pend <= 1'b0; pend_vec <= '0; fresh <= 1'b0;
 		go <= 1'b0; done_q <= 1'b0; eaa <= '0; eav <= 1'b0;
 		sx_v <= 1'b0; sx_vec <= '0; sx_fmt <= '0; sx_addr <= '0; sx_kill <= 1'b0;
-		list <= '0; mv_lsb <= 1'b0; mv_rev <= 1'b0; mv_st <= 1'b0; mv_m1 <= 1'b0;
+		list <= '0; mv_slots <= '0; mv_lsb <= 1'b0; mv_rev <= 1'b0; mv_st <= 1'b0; mv_m1 <= 1'b0;
 		slot <= '0; mvr_wait <= 1'b0; crr_wait <= 1'b0; get_q <= '0;
 		sv_kind <= '0; rs_kind <= '0;
 		f_req <= 1'b0; f_crwe <= 1'b0; f_iawe <= 1'b0; f_bsun <= 1'b0; f_fmwe <= 1'b0; f_rst <= 1'b0;
@@ -705,6 +720,8 @@ always_ff @(posedge clk) begin
 			end
 			FC_LIST: if (adv) begin
 				list   <= l_now;
+				for (int k = 0; k < 8; k++)
+					mv_slots[k] <= l_now[slot_bit(3'(k), ext[13] && ea_pd)];
 				mv_st  <= ext[13];
 				mv_m1  <= ext[12];
 				mv_lsb <= ext[13] && ea_pd;
