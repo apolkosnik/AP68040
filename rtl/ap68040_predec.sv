@@ -40,33 +40,42 @@ always_comb begin
 	logic [NENT-1:0] s;
 	pla_t a;
 	logic [3:0] i0, i1;
-	logic [2:0] nimm, l0, l1;
+	logic [2:0] nimm_l, nimm_n, l0_l, l0_n, l1_l, l1_n, b_l, b_n;
 	logic [1:0] sz;
+	logic       isl;
 	s  = dec_sel(op);
 	a  = ent_attr(sel_index(s), |s);
 	i0 = a.ea0v ? ea_idx(op[5:3], op[2:0]) : EM_NONE;
 	i1 = a.ea1v ? ea_idx(op[8:6], op[11:9]) : EM_NONE;
 	sz = (a.szc == 2'd3) ? op[7:6] : a.szc;
+	// the lengths are formed for a long and for a shorter size side by
+	// side, and the size picks one last (a timing path: the size comes
+	// out of the decode table)
+	isl = (a.szc == 2'd3) ? (op[7:6] == SZ_L) : (a.szc == SZ_L);
 	case (a.immk)
-		3'd1:       nimm = (sz == SZ_L) ? 3'd2 : 3'd1;
-		3'd2, 3'd3: nimm = 3'd1;
-		3'd4:       nimm = 3'd2;
-		3'd5:       nimm = (op[7:0] == 8'h00) ? 3'd1 : (op[7:0] == 8'hFF) ? 3'd2 : 3'd0;
-		3'd6:       nimm = (op[2:0] == 3'd2) ? 3'd1 : (op[2:0] == 3'd3) ? 3'd2 : 3'd0;
-		3'd7:       nimm = op[6] ? 3'd2 : 3'd1;
-		default:    nimm = 3'd0;
+		3'd1:       begin nimm_l = 3'd2; nimm_n = 3'd1; end
+		3'd2, 3'd3: begin nimm_l = 3'd1; nimm_n = 3'd1; end
+		3'd4:       begin nimm_l = 3'd2; nimm_n = 3'd2; end
+		3'd5:       begin nimm_l = (op[7:0] == 8'h00) ? 3'd1 : (op[7:0] == 8'hFF) ? 3'd2 : 3'd0; nimm_n = nimm_l; end
+		3'd6:       begin nimm_l = (op[2:0] == 3'd2) ? 3'd1 : (op[2:0] == 3'd3) ? 3'd2 : 3'd0; nimm_n = nimm_l; end
+		3'd7:       begin nimm_l = op[6] ? 3'd2 : 3'd1; nimm_n = nimm_l; end
+		default:    begin nimm_l = 3'd0; nimm_n = 3'd0; end
 	endcase
-	l0 = ea_brief_len(i0, sz);
-	l1 = ea_brief_len(i1, sz);
+	l0_l = ea_brief_len(i0, SZ_L);
+	l0_n = ea_brief_len(i0, SZ_W);
+	l1_l = ea_brief_len(i1, SZ_L);
+	l1_n = ea_brief_len(i1, SZ_W);
+	b_l  = 3'd1 + {1'b0, a.nfix} + nimm_l;
+	b_n  = 3'd1 + {1'b0, a.nfix} + nimm_n;
 	pd.legal = a.match &&
 	           (!a.ea0v || (i0 != EM_NONE && a.ea0m[i0])) &&
 	           (!a.ea1v || (i1 != EM_NONE && a.ea1m[i1]));
 	pd.ent  = a.ent;
 	pd.sz   = sz;
-	// (the EA lengths are summed beside the base length, not after it)
-	pd.b    = 3'd1 + {1'b0, a.nfix} + nimm;
-	pd.p1   = pd.b + l0;
-	pd.tot  = {1'b0, pd.b} + ({1'b0, l0} + {1'b0, l1});
+	pd.b    = isl ? b_l : b_n;
+	pd.p1   = isl ? (b_l + l0_l) : (b_n + l0_n);
+	pd.tot  = isl ? ({1'b0, b_l} + ({1'b0, l0_l} + {1'b0, l1_l}))
+	              : ({1'b0, b_n} + ({1'b0, l0_n} + {1'b0, l1_n}));
 	pd.x0   = (i0 == EM_AX) || (i0 == EM_PCX);
 	pd.x1   = (i1 == EM_AX) || (i1 == EM_PCX);
 	pd.slow = (a.rt == UA_FPU_GEN) && (i0 == EM_IMM);

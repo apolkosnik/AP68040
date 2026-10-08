@@ -256,14 +256,21 @@ with the frames an FPSP expects; `FPU_REVISION` selects the FSAVE frame
 revision ($41 or $40).
 
 An FPm-to-FPn operation is one uop (FPU_RRF: CHK and DISP fused); others
-are CHK then DISP, DISP allowed to act behind its own CHK at WB.  The next
+are CHK then DISP, DISP allowed to act behind its own CHK at WB.  The
+common memory forms (FPU_K_*) fuse CHK with EAL, the uop that records the
+operand's address for the frames (size B marks it).  The next
 FPU instruction is released in the cycle the previous one writes back
 without an enabled exception.  Inside the FPU a binary operation on a
 non-NaN source goes from dispatch straight to F_BIN; the alignment shift
 takes one cycle.  An FADD or FMUL takes 6 cycles back to back
 (tb/asm/bench_fpu.s): dispatch, F_BIN, F_SHR, F_ADDX (or the multiply),
 F_ROUND, F_WB -- each of the last four is near the clock period, so going
-further needs a pipelined adder and multiplier.
+further needs a pipelined adder and multiplier.  A memory source converted from
+single, double or extended goes straight to F_BIN for a binary operation
+and straight to F_ROUND for a move, as a register source does (an
+extended operand that reaches conversion is normalized already: unnormals
+and denormals take the unsupported-data-type trap); FMOVE.D (An),FPn
+takes about 8 cycles, FMOVE.X 9, FADD.D 10.
 
 ## Pins beyond the bus
 

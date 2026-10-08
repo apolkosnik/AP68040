@@ -72,8 +72,10 @@ FORMS = [
     ("fmove.x FPm,FPn", "fmove.x fp0,fp6", ""),
     ("fadd.x FPm,FPn", "fadd.x fp0,fp1", ""),
     ("fmul.x FPm,FPn", "fmul.x fp0,fp2", ""),
-    ("fmove.d (An),FPn", "fmove.d (a0),fp3", ""),
-    ("fadd.d (An),FPn", "fadd.d (a0),fp4", ""),
+    ("fmove.d (An),FPn", "fmove.d (a6),fp3", ""),
+    ("fadd.d (An),FPn", "fadd.d (a6),fp4", ""),
+    ("fmove.x (An),FPn", "fmove.x (16,a6),fp3", ""),
+    ("fadd.x (An),FPn", "fadd.x (16,a6),fp4", ""),
     ("fmove.d FPn,(An)", "fmove.d fp1,(a2)", ""),
     ("fmove.s FPn,(An)", "fmove.s fp1,(a2)", ""),
     ("fmove.l FPn,Dn", "fmove.l fp1,d5", ""),
@@ -93,6 +95,11 @@ def main(path):
     w("\tlea\t(BUF).l,a0\n\tlea\t(BUF+$100).l,a2\n\tlea\t(BUF+$200).l,a4\n\tmove.l\ta0,(a4)")
     w("\tmoveq\t#1,d1\n\tmoveq\t#2,d3\n\tmoveq\t#7,d4\n\tmoveq\t#8,d6\n\tmoveq\t#5,d2")
     w("\tlea\t(BUF+$40).l,a1")
+    # FP registers hold ordinary numbers (after reset they read as NaN,
+    # which takes the FPU's short special-operand path); a double at BUF
+    w("\tfmove.l\t#3,fp0\n\tfmove.l\t#5,fp1\n\tfmove.l\t#7,fp2\n\tfmove.l\t#11,fp3")
+    w("\tfmove.l\t#13,fp4\n\tfmove.l\t#17,fp5\n\tfmove.l\t#19,fp6")
+    w("\tlea\t(BUF+$300).l,a6\n\tfmove.d\tfp0,(a6)\t; 3.0: the FP memory forms' operand\n\tfmove.x\tfp0,(16,a6)")
     for i, (name, body, setup) in enumerate(FORMS):
         w("; %d: %s" % (i + 1, name))
         w("\tstamp\t%d" % (2 * i + 1))

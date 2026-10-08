@@ -513,6 +513,12 @@ def FCHK():
     return F('CHK', a='EXT1', b='OPW')
 
 
+# CHK and EAL in one uop (sz B marks it: the FPU interface latches the EA
+# with the words); the operand's address goes to T11 for the transfers
+def FCHKEA():
+    return F('CHK', a='EXT1', b='OPW', sz='B', ag='FEA', agw='T11')
+
+
 def _fld(dst, off, **kw):
     # an operand long word at T11 + off (the instruction's address space)
     if dst == 'LATCH':
@@ -561,15 +567,15 @@ R('FPU_IND', F('DISP', a='EA0', last=1))
 # and the EA (no jump words: each costs the sequencer a cycle): the same
 # uops as the FPU_GEN / FPU_IN / FPU_OUT paths they replace
 R('FPU_K_IND',  FCHK(), F('DISP', a='EA0', last=1))
-R('FPU_K_IN4',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0),
+R('FPU_K_IN4',  FCHKEA(), _fld('T0', 0),
   F('DISP', a='T0', ag='FUPD', last=1))
-R('FPU_K_IN1',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0, msz='B'),
+R('FPU_K_IN1',  FCHKEA(), _fld('T0', 0, msz='B'),
   F('DISP', a='T0', ag='FUPD', last=1))
-R('FPU_K_IN2',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0, msz='W'),
+R('FPU_K_IN2',  FCHKEA(), _fld('T0', 0, msz='W'),
   F('DISP', a='T0', ag='FUPD', last=1))
-R('FPU_K_IN8',  FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0), _fld('T1', 4),
+R('FPU_K_IN8',  FCHKEA(), _fld('T0', 0), _fld('T1', 4),
   F('DISP', a='T0', b='T1', ag='FUPD', last=1))
-R('FPU_K_IN12', FCHK(), F('EAL', ag='FEA', agw='T11'), _fld('T0', 0), _fld('T1', 4),
+R('FPU_K_IN12', FCHKEA(), _fld('T0', 0), _fld('T1', 4),
   _fld('LATCH', 8), F('DISP', a='T0', b='T1', ag='FUPD', last=1))
 # FPn to <ea>
 R('FPU_OUT',
@@ -590,16 +596,16 @@ R('FPU_OUT12', F('GET', a='CONST', const=1, d='T1'), F('GET', a='CONST', const=2
   _fst('T0', 0), _fst('T1', 4), _fst('T2', 8), F('END', ag='FUPD', last=1))
 R('FPU_OUTD', F('DISP', b='EA0', d='EA0'), F('END', last=1))
 R('FPU_K_OUTD', FCHK(), F('DISP', b='EA0', d='EA0'), F('END', last=1))
-R('FPU_K_OUT4', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+R('FPU_K_OUT4', FCHKEA(), F('DISP', d='T0'),
   _fst('T0', 0), F('END', ag='FUPD', last=1))
-R('FPU_K_OUT1', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+R('FPU_K_OUT1', FCHKEA(), F('DISP', d='T0'),
   _fst('T0', 0, msz='B'), F('END', ag='FUPD', last=1))
-R('FPU_K_OUT2', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+R('FPU_K_OUT2', FCHKEA(), F('DISP', d='T0'),
   _fst('T0', 0, msz='W'), F('END', ag='FUPD', last=1))
-R('FPU_K_OUT8', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+R('FPU_K_OUT8', FCHKEA(), F('DISP', d='T0'),
   F('GET', a='CONST', const=1, d='T1'), _fst('T0', 0), _fst('T1', 4),
   F('END', ag='FUPD', last=1))
-R('FPU_K_OUT12', FCHK(), F('EAL', ag='FEA', agw='T11'), F('DISP', d='T0'),
+R('FPU_K_OUT12', FCHKEA(), F('DISP', d='T0'),
   F('GET', a='CONST', const=1, d='T1'), F('GET', a='CONST', const=2, d='T2'),
   _fst('T0', 0), _fst('T1', 4), _fst('T2', 8), F('END', ag='FUPD', last=1))
 # FMOVE(M) control registers: one slot each for FPCR, FPSR, FPIAR, the

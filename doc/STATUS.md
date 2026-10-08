@@ -164,7 +164,9 @@ small program linked against WinUAE's readcpu.cpp; see tools/README).
   can restart it after the read.
 * FDIV/FSQRT: two quotient bits (root digits) per clock, 33 iterations.
 * FADD/FSUB/FMUL register to register: 6 cycles back to back (the 68040
-  takes 3 and 5); 15 and 11 before the interface and dispatch work.
+  takes 3 and 5); 15 and 11 before the interface and dispatch work.  From
+  memory: FMOVE.D 8, FMOVE.X 9, FADD.D 10, FADD.X 11 (bench_insn: before
+  it set its FP registers, the FP forms measured NaN and zero operands).
 * Branch prediction is invisible to programs except for self-modified
   code: like the 68040 (which prefetches both paths of a branch) the core
   may fetch a branch target before an older store to it; CPUSHA must

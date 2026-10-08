@@ -1310,6 +1310,19 @@ always @(posedge clk) begin
 									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
 									fst <= F_BIN;
 								end
+								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
+									// a move: F_EXEC's work for it, here
+									// (as for a register source)
+									if (!r_resume) begin
+										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+										sh_src  <= {r_din[95], {7'd0, r_din[94:87]} + 15'd16256, 16'd0,
+										            1'b1, r_din[86:64], 40'd0};
+										sh_stag <= 3'd0;
+									end
+									grs <= 3'd0;
+									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
+									fst <= F_ROUND;
+								end
 								else fst <= F_EXEC;
 							end
 						end
@@ -1364,6 +1377,18 @@ always @(posedge clk) begin
 									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
 									fst <= F_BIN;
 								end
+								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
+									// a move: F_EXEC's work for it, here
+									if (!r_resume) begin
+										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+										sh_src  <= {r_din[95], {4'd0, r_din[94:84]} + 15'd15360, 16'd0,
+										            1'b1, r_din[83:32], 11'd0};
+										sh_stag <= 3'd0;
+									end
+									grs <= 3'd0;
+									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
+									fst <= F_ROUND;
+								end
 								else fst <= F_EXEC;
 							end
 						end
@@ -1386,11 +1411,41 @@ always @(posedge clk) begin
 									fst <= F_IDLE;
 								end
 							end
-							else begin
+							else if (r_unimp) begin
 								r_stag <= frame_tag_x(r_din[94:80], r_din[63:0]);
 								{a_s, a_e, a_m, a_t} <=
 									unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
 								fst <= F_NORM;
+							end
+							else begin : cv_xs
+								// a supported extended operand is normalized
+								// already (unnormals and denormals trapped
+								// above): F_NORM has nothing to do, so the
+								// operation starts as for a register source
+								reg [83:0] ua;
+								reg  [2:0] tg;
+								ua = unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
+								tg = frame_tag_x(r_din[94:80], r_din[63:0]);
+								r_stag <= tg;
+								{a_s, a_e, a_m, a_t} <= ua;
+								if (bin_op(r_op) && ua[1:0] != T_NAN) begin
+									op_kind <= bin_kind(r_op);
+									grs <= 3'd0;
+									e_w <= $signed({ua[82], ua[82:66]});
+									fst <= F_BIN;
+								end
+								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) &&
+								         ua[1:0] != T_NAN) begin
+									if (!r_resume) begin
+										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+										sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
+										sh_stag <= tg;
+									end
+									grs <= 3'd0;
+									e_w <= $signed({ua[82], ua[82:66]});
+									fst <= F_ROUND;
+								end
+								else fst <= F_EXEC;
 							end
 						end
 					endcase

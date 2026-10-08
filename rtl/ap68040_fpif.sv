@@ -51,6 +51,7 @@ module ap68040_fpif
 	input  logic        ex_v,           // an OP_FPU uop is in EX
 	input  logic  [3:0] sub,
 	input  logic        fuse,           // CHK: dispatch in the same uop (FPm to FPn)
+	input  logic        eal,            // CHK: latch the EA as well (EAL in the same uop)
 	input  logic  [7:0] imm,            // operand A constant
 	input  logic  [7:0] immb,           // operand B constant
 	input  logic [31:0] av,
@@ -631,7 +632,9 @@ always_ff @(posedge clk) begin
 			else if (adv) begin
 				opw_q <= opw;
 				ext_q <= ext;
-				eav   <= 1'b0;
+				// (an immediate operand has no address: its frames, EA 0)
+				eav   <= eal && !ea_imm;
+				if (eal) eaa <= ea;
 				sx_v  <= 1'b0;
 				sx_kill <= 1'b0;
 				go    <= 1'b0;
