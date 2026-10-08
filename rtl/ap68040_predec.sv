@@ -63,18 +63,18 @@ always_comb begin
 	           (!a.ea1v || (i1 != EM_NONE && a.ea1m[i1]));
 	pd.ent  = a.ent;
 	pd.sz   = sz;
+	// (the EA lengths are summed beside the base length, not after it)
 	pd.b    = 3'd1 + {1'b0, a.nfix} + nimm;
 	pd.p1   = pd.b + l0;
-	pd.tot  = {1'b0, pd.p1} + {1'b0, l1};
+	pd.tot  = {1'b0, pd.b} + ({1'b0, l0} + {1'b0, l1});
 	pd.x0   = (i0 == EM_AX) || (i0 == EM_PCX);
 	pd.x1   = (i1 == EM_AX) || (i1 == EM_PCX);
 	pd.slow = (a.rt == UA_FPU_GEN) && (i0 == EM_IMM);
 	pd.i0   = i0;
 	pd.i1   = i1;
+	// an illegal word: D1 takes one word and the exception; b, p1 and tot
+	// are not used for it (they stay off the override, a timing path)
 	if (!pd.legal) begin
-		pd.b   = 3'd1;
-		pd.p1  = 3'd1;
-		pd.tot = 4'd1;
 		pd.x0  = 1'b0;
 		pd.x1  = 1'b0;
 		pd.slow = 1'b0;

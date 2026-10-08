@@ -135,6 +135,10 @@ module ap040_fpu
 wire [79:0] fr_src_raw;
 wire [79:0] fr_dst_raw;
 reg   [7:0] fr_valid;
+// each register's unsupported data type (denormal/unnormal: the dispatch's
+// datatype check), kept beside it as it is written: the check reads a flag,
+// not a classification of the register file's read data
+reg   [7:0] fr_unsup;
 // Simulation/debug mirrors retain the long-standing hierarchical names used
 // by the AP68040 benches.  The live datapath does not read them, so synthesis
 // removes these arrays and their update logic.
@@ -151,6 +155,7 @@ wire [63:0] fr_src_m = fr_valid[src_r] ? fr_src_raw[63:0]  : 64'hFFFF_FFFF_FFFF_
 wire        fr_dst_s = fr_valid[dst_r] ? fr_dst_raw[79]    : 1'b0;
 wire [14:0] fr_dst_e = fr_valid[dst_r] ? fr_dst_raw[78:64] : 15'h7FFF;
 wire [63:0] fr_dst_m = fr_valid[dst_r] ? fr_dst_raw[63:0]  : 64'hFFFF_FFFF_FFFF_FFFF;
+wire        fr_src_unsup = fr_valid[src_r] && fr_unsup[src_r];
 
 reg [31:0] fpcr;                  // [15:8] enables, [7:6] prec, [5:4] rnd
 reg [31:0] fpsr;                  // [27:24] cc, [23:16] quot, [15:8] exc, [7:3] aexc
@@ -497,6 +502,20 @@ wire [79:0] fr_bank_wd = fr_wb_we ? {a_s, fr_wb_e, fr_wb_m} :
                                     {fm_wdata[95], fm_wdata[94:80],
                                      fm_wdata[63:0]};
 
+// synthesis translate_off
+always @(posedge clk)
+	if (ce && fst == F_NORM && a_t == T_NUM && a_m == 64'd0 && norm_shifted[66:3] != 64'd0) begin
+		$display("FAIL: F_NORM of a zero significand gave %h", norm_shifted[66:3]);
+		$finish;
+	end
+always @(posedge clk)
+	if (ce && !fr_bank_we && fr_src_unsup != unsupported_x(fr_src_e, fr_src_m)) begin
+		$display("FAIL: fr_unsup[%0d] = %b, the register classifies as %b",
+		         src_r, fr_src_unsup, unsupported_x(fr_src_e, fr_src_m));
+		$finish;
+	end
+// synthesis translate_on
+
 ap040_fp_regfile fpregs
 (
 	.clk(clk), .ce(ce), .we(fr_bank_we),
@@ -699,8 +718,11 @@ always @(posedge clk) begin
 		nsel <= 2'd0;
 		// Invalid entries read as the default positive nonsignaling NaN.
 		fr_valid <= 0;
+		fr_unsup <= 0;
 	end
 	else if (ce) begin
+		if (fr_bank_we)
+			fr_unsup[fr_bank_wa] <= unsupported_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
 		done <= 0;
 		unimp <= 0;
 		unsupp <= 0;
@@ -789,6 +811,7 @@ always @(posedge clk) begin
 			// FRESTORE of a NULL frame returns every data register to the
 			// architectural default NaN through the validity view above.
 			fr_valid <= 0;
+			fr_unsup <= 0;
 		end
 		if (fsave_ack) begin
 			fstate_unimp <= 0;
@@ -922,7 +945,7 @@ always @(posedge clk) begin
 						    frame_tag_x(fr_src_e, fr_src_m),
 						    1'b1, 1'b1);   // T, packed -> E1
 					end
-					else if (unsupported_x(fr_src_e, fr_src_m)) begin
+					else if (fr_src_unsup) begin
 						unsupp <= 1;
 						capture_datatype({op_class, src_fmt, dst_r, opmode},
 						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
@@ -969,7 +992,7 @@ always @(posedge clk) begin
 					end
 				end
 				else if (op_class == 3'b000) begin
-					if (unsupported_x(fr_src_e, fr_src_m)) begin
+					if (fr_src_unsup) begin
 						unsupp <= 1;
 						// OPCLASS 000: source in ETEMP; a dyadic op also
 						// carries its destination in FPTEMP
@@ -1409,13 +1432,15 @@ always @(posedge clk) begin
 
 			F_NORM: begin
 				if (a_t != T_NUM) fst <= F_EXEC;
-				else if (a_m == 64'd0) begin
-					a_t <= T_ZERO; a_e <= 0;
-					fst <= F_EXEC;
-				end
 				else begin
+					// a zero significand normalizes to zero: a_m takes the
+					// shifter's output either way, the zero test only
+					// decides the class and exponent (a timing path)
 					a_m <= norm_shifted[66:3];
-					a_e <= a_e - {10'd0, norm_lz};
+					if (a_m == 64'd0) begin
+						a_t <= T_ZERO; a_e <= 0;
+					end
+					else a_e <= a_e - {10'd0, norm_lz};
 					fst <= F_EXEC;
 				end
 			end
@@ -1924,7 +1949,7 @@ always @(posedge clk) begin
 			end
 
 			F_ROUND: begin : f_round
-				reg [64:0] mr;
+				reg [64:0] mr, mi;
 				reg [63:0] rmask, rinc;      // the precision's kept bits and its ulp
 				reg        inx, up, ovf, unf, tomax;
 				reg [1:0]  pr;
@@ -1954,9 +1979,12 @@ always @(posedge clk) begin
 							rinc  = 64'h0000_0000_0000_0001;
 						end
 					endcase
-					// one incrementer for the three precisions
-					mr = {1'b0, a_m & rmask} + {1'b0, up ? rinc : 64'd0};
-					er = e_w + (mr[64] ? 18'sd1 : 18'sd0);
+					// one incrementer for the three precisions, formed beside
+					// the rounding decision (which only selects it): the
+					// sticky compare and the carry chain are not in series
+					mi = {1'b0, a_m & rmask} + {1'b0, rinc};
+					mr = up ? mi : {1'b0, a_m & rmask};
+					er = (up && mi[64]) ? (e_w + 18'sd1) : e_w;
 					if (mr[64]) mr = {2'b01, 63'd0};
 					// Range control: the rounding precision narrows the
 					// exponent range as well as the significand (softfloat's
@@ -2250,28 +2278,32 @@ always @(posedge clk) begin
 				// rounding precision.  e_w holds that precision's minimum
 				// exponent, which the shift in F_SHR has already scaled the
 				// significand to.
-				reg [64:0] mr;
+				reg [64:0] mr, mk, mi;
 				reg        up, inx2;
 				if (r_pr == 2'd0) begin
 					up = round_up(sh_v[3], sh_v[2],
 					              (sh_v[1:0] != 0), a_s);
 					inx2 = (sh_v[2:0] != 0);
-					mr = {1'b0, sh_v[66:3]} + (up ? 65'd1 : 65'd0);
+					mk = {1'b0, sh_v[66:3]};
+					mi = mk + 65'd1;
 				end
 				else if (r_pr == 2'd1) begin
 					up = round_up(sh_v[43], sh_v[42],
 					              (sh_v[41:0] != 0), a_s);
 					inx2 = (sh_v[42:0] != 0);
-					mr = {1'b0, sh_v[66:3] & 64'hFFFF_FF00_0000_0000} +
-					     (up ? 65'h100_0000_0000 : 65'd0);
+					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FF00_0000_0000};
+					mi = mk + 65'h100_0000_0000;
 				end
 				else begin
 					up = round_up(sh_v[14], sh_v[13],
 					              (sh_v[12:0] != 0), a_s);
 					inx2 = (sh_v[13:0] != 0);
-					mr = {1'b0, sh_v[66:3] & 64'hFFFF_FFFF_FFFF_F800} +
-					     (up ? 65'h800 : 65'd0);
+					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FFFF_FFFF_F800};
+					mi = mk + 65'h800;
 				end
+				// the increment is formed beside the rounding decision,
+				// which only selects it (a timing path)
+				mr = up ? mi : mk;
 				if (inx2) begin
 					fpsr[9] <= 1;                   // INEX2
 					fpsr[3] <= 1;
@@ -2290,13 +2322,12 @@ always @(posedge clk) begin
 					a_e <= e_w[16:0] + 17'd1;
 					fst <= F_WB;
 				end
-				else if (mr[63:0] == 64'd0) begin
-					a_t <= T_ZERO;
-					fst <= F_WB;
-				end
 				else begin
+					// (a zero takes a_m = 0 as well: the zero test only
+					// decides the class and exponent)
 					a_m <= mr[63:0];
-					a_e <= (mr[63] || e_w != 18'sd1) ? e_w[16:0] : 17'd0;
+					if (mr[63:0] == 64'd0) a_t <= T_ZERO;
+					else a_e <= (mr[63] || e_w != 18'sd1) ? e_w[16:0] : 17'd0;
 					fst <= F_WB;
 				end
 			end

@@ -49,6 +49,8 @@ FORMS = [
     ("move.l Dn,An", "move.l d1,a3", ""),
     ("move+use as base", "move.l a0,a3\n\tmove.l (a3),d2", ""),
     ("load+use as base", "move.l (a4),a3\n\tmove.l (a3),d2", ""),
+    ("add+use as index", "move.l d6,d5\n\tadd.l d1,d5\n\tmove.l (a0,d5.l*4),d2", ""),
+    ("lsl+and+use as index", "move.w d4,d5\n\tlsl.w #2,d5\n\tand.l #$FFFF,d5\n\tmove.l (a0,d5.l),d2", ""),
     ("push+pop", "move.l d2,-(sp)\n\tmove.l (sp)+,d2", ""),
     ("bsr+rts", "bsr.s *+4\n\tbra.s *+4\n\trts", ""),
     ("link+unlk", "link a5,#-8\n\tunlk a5", ""),

@@ -242,10 +242,10 @@ initial for (int i = 0; i < 9; i++) rc[i] = 0;
 int lsl [5];
 initial for (int i = 0; i < 5; i++) lsl[i] = 0;
 always_ff @(posedge clk) if (rsti_n && dut.dmu.adv_dc1 && dut.dmu.m1.v && dut.dmu.m1.mem == 2'd1) begin
-	if (dut.dmu.m1_fast && !dut.dmu.m1_stale && !(dut.dmu.dw && dut.dmu.dw_set == dut.dmu.m1.a[9:4]) &&
+	if (dut.dmu.m1_fast && !dut.dmu.m1_stale && !(dut.dmu.dw && dut.dmu.dw_src != 0 && dut.dmu.dw_set == dut.dmu.m1.a[9:4]) &&
 	    dut.dmu.e_st == 0) lsl[0]++;
 	else if (!dut.dmu.x_dc1.hit) lsl[1]++;
-	else if (dut.dmu.m1_stale || (dut.dmu.dw && dut.dmu.dw_set == dut.dmu.m1.a[9:4])) lsl[2]++;
+	else if (dut.dmu.m1_stale || (dut.dmu.dw && dut.dmu.dw_src != 0 && dut.dmu.dw_set == dut.dmu.m1.a[9:4])) lsl[2]++;
 	else if (dut.dmu.e_st != 0) lsl[3]++;
 	else lsl[4]++;
 end
@@ -263,7 +263,7 @@ always_ff @(posedge clk) if (rsti_n) begin
 	if (dut.dmu.e_st == dut.dmu.E_M_START) ej[2]++;
 	if (dut.dmu.e_st == dut.dmu.E_TW_START) ej[3]++;
 	if (dut.dmu.e_st != dut.dmu.E_IDLE) ej[4]++;
-	if (dut.dmu.m2.r.v && dut.dmu.m2.fast && dut.dmu.hz) ej[5]++;
+	if (dut.dmu.m2.r.v && dut.dmu.m2.fast && dut.dmu.hzf) ej[5]++;
 end
 // snoops: lookups by where the line was (cache, push buffer, queued push,
 // miss), dirty supplies, sinks, invalidations, snoop-forced refetches

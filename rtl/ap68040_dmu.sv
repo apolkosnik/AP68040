@@ -485,6 +485,16 @@ function automatic logic st_line(input mrec_t m, input logic [27:0] l);
 	          (m.x.pa[31:4] == l || (m.split && m.x1.pa[31:4] == l));
 endfunction
 wire hz = st_line(m3, m2_line) || st_line(m4, m2_line);
+// the fast load (never split) waits only for a store whose bytes it reads:
+// a plain store within one line is compared by bytes, anything else (RMW,
+// split, MOVE16) by the line
+wire [15:0] m2_bm = bmask(m2.r.a[3:0], nbytes(m2.r.msz));
+function automatic logic st_byte(input mrec_t m);
+	st_byte = st_line(m, m2_line) &&
+	          (m.r.mem == M_RMW || m.split || m.r.msz == SZ_Q ||
+	           (bmask(m.x.pa[3:0], nbytes(m.r.msz)) & m2_bm) != 16'd0);
+endfunction
+wire hzf = st_byte(m3) || st_byte(m4);
 // any store older than the DC2 uop not yet performed: a table walk for the
 // DC2 uop must see it (the program may just have written a descriptor)
 wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
@@ -494,7 +504,7 @@ wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
 logic m1_stale;
 
 // (a store that left WB is still being written this cycle: dw)
-wire fast_now = m2.r.v && m2.fast && !hz && !(dw && !dwp && dw_set == m2.r.a[9:4]);
+wire fast_now = m2.r.v && m2.fast && !hzf && !(dw && !dwp && dw_set == m2.r.a[9:4]);
 wire [31:0] fast_data = take(dq_r[m2.x.way], m2.r.a[3:0], nbytes(m2.r.msz));
 
 // a store with its translation known needs nothing from DC2 unless it must
@@ -680,7 +690,7 @@ wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
 
 // a fast load behind an older store to its line waits for it (merged into
 // its copy) instead of taking the engine
-wire fast_wait = m2.r.v && m2.fast && (hz || (dw && !dwp && dw_set == m2.r.a[9:4]));
+wire fast_wait = m2.r.v && m2.fast && (hzf || (dw && !dwp && dw_set == m2.r.a[9:4]));
 wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job;
 wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
 

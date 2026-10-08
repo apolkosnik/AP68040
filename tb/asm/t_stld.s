@@ -11,9 +11,18 @@
 ;   9-10  another long word of the line, and another way of the same set
 ;  11-13  read-modify-write after a store; stores back to back, then loads
 ;  14     the same, in a loop with the offsets changing every pass
+;  15-17  user mode, plain MOVE (no serialization: the store is still in
+;         EX or WB when the load reaches DC2): every store size at every
+;         offset of the line, then every load size at every offset, the
+;         load right behind the store (15), one instruction behind (16),
+;         and behind two stores (17); each load is checked against the
+;         same load made after a NOP drained the pipeline.  A load waits
+;         only for an older store whose bytes it reads; offsets that
+;         cross into the next line (split accesses) are included
 ;
 ; User data is copyback (DTT0, user only); MOVES with SFC = DFC = 1 reach
-; it from supervisor mode.  Supervisor data (the bench registers) is
+; it from supervisor mode.  Tests 15-17 leave user mode by TRAP #1 (done)
+; and TRAP #2 (failure, d7 the test).  Supervisor data (the bench registers) is
 ; noncachable (DTT1).
 
 FAILREG	equ	$F100
@@ -32,10 +41,54 @@ chkl	macro
 .ok\@:
 	endm
 
+; tests 15-17: the store \1, the load \2, the case \3, the test \4
+; (d3 store offset, d4 load offset, both 0..15)
+stld	macro
+	moveq	#0,d3
+.so\@:	moveq	#0,d4
+.lo\@:	bsr	ufill
+	move.l	d3,d5
+	addq.l	#5,d5
+	and.l	#15,d5
+	moveq	#0,d1
+	moveq	#0,d2
+	if \3==0
+	move.\1	d0,(a0,d3.l)
+	move.\2	(a0,d4.l),d1
+	endif
+	if \3==1
+	move.\1	d0,(a0,d3.l)
+	moveq	#0,d7
+	move.\2	(a0,d4.l),d1
+	endif
+	if \3==2
+	move.\1	d0,(a0,d3.l)
+	move.\1	d6,(a0,d5.l)
+	move.\2	(a0,d4.l),d1
+	endif
+	nop
+	move.\2	(a0,d4.l),d2
+	cmp.l	d1,d2
+	beq.s	.ok\@
+	moveq	#\4,d7
+	trap	#2
+.ok\@:	addq.l	#1,d4
+	cmp.l	#16,d4
+	bne.s	.lo\@
+	addq.l	#1,d3
+	cmp.l	#16,d3
+	bne.s	.so\@
+	endm
+
 	org	0
 	dc.l	$3400
 	dc.l	start
-	rept	254
+	rept	31
+	dc.l	unexp
+	endr
+	dc.l	h_trap1		; 33 TRAP #1: user tests done
+	dc.l	h_trap2		; 34 TRAP #2: user test failed
+	rept	221
 	dc.l	unexp
 	endr
 
@@ -196,9 +249,52 @@ start:
 	failt	14
 .ok14:
 
+;----------------------------------- 15-17 user mode, every size and offset
+	lea	($5000).l,a2
+	move.l	a2,usp
+	move.l	#$C1C2C3C4,d0		; the first store's value
+	move.l	#$D1D2D3D4,d6		; the second's (17)
+	andi.w	#$DFFF,sr		; user mode
+	stld	b,b,0,15
+	stld	b,w,0,15
+	stld	b,l,0,15
+	stld	w,b,0,15
+	stld	w,w,0,15
+	stld	w,l,0,15
+	stld	l,b,0,15
+	stld	l,w,0,15
+	stld	l,l,0,15
+	stld	b,b,1,16
+	stld	b,l,1,16
+	stld	w,w,1,16
+	stld	l,b,1,16
+	stld	l,l,1,16
+	stld	b,b,2,17
+	stld	b,l,2,17
+	stld	w,w,2,17
+	stld	w,l,2,17
+	stld	l,b,2,17
+	stld	l,w,2,17
+	stld	l,l,2,17
+	trap	#1
+
+; the line at BUF and the next one: a byte pattern ($40 + offset)
+ufill:	move.l	#$40414243,(a0)
+	move.l	#$44454647,4(a0)
+	move.l	#$48494A4B,8(a0)
+	move.l	#$4C4D4E4F,12(a0)
+	move.l	#$50515253,16(a0)
+	move.l	#$54555657,20(a0)
+	nop
+	rts
+
+h_trap1:
 ;----------------------------------------------------------------- done
 	move.w	#$600D,(DONEREG).l
 	bra.s	*
+
+h_trap2:
+	bra	fail_all
 
 fail_all:
 	move.w	d7,(FAILREG).l

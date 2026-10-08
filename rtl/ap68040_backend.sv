@@ -154,6 +154,12 @@ uop_t        ag_u, dc1_u, dc2_u, ex_u, wb_u;
 
 // operand values carried with the uop
 logic [31:0] dc1_a, dc1_b, dc1_ea;
+// early results: a simple register operation computes its result in AG
+// as well (ag_er), carried beside the uop (ee: valid) for the base and
+// index of younger uops; EX still produces and writes it as always
+logic        dc1_ee, dc2_ee, ex_ee;
+logic [31:0] dc1_er, dc2_er, ex_er;
+logic        erb, erx;         // agb_q / agx_q hold the youngest writer's early result
 logic [31:0] dc2_a, dc2_b, dc2_ea;
 logic [31:0] ex_a,  ex_b,  ex_ea,  ex_ld;
 logic        ex_fault;
@@ -287,9 +293,23 @@ function automatic logic pend_dc(input logic [4:0] r);
 endfunction
 wire ex_wr_b = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.base;
 wire ex_wr_x = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.idx;
+// the youngest older writer of a register, and whether it is early:
+// {found, early, stage (1 DC1, 2 DC2, 3 EX)}
+function automatic logic [3:0] yw(input logic [4:0] r);
+	if (dc1_v && dc1_u.d_v && dc1_u.d_reg == r)      yw = {1'b1, dc1_ee, 2'd1};
+	else if (dc2_v && dc2_u.d_v && dc2_u.d_reg == r) yw = {1'b1, dc2_ee, 2'd2};
+	else if (ex_v && ex_u.d_v && ex_u.d_reg == r)    yw = {1'b1, ex_ee,  2'd3};
+	else                                             yw = 4'd0;
+endfunction
+function automatic logic [31:0] ywv(input logic [1:0] st);
+	ywv = (st == 2'd1) ? dc1_er : (st == 2'd2) ? dc2_er : ex_er;
+endfunction
+wire [3:0] yw_b = yw(ag_u.base);
+wire [3:0] yw_x = yw(ag_u.idx);
+// an early youngest writer: AG waits only until its result is loaded
 wire ag_interlock = ag_v && (
-	(ag_u.base_v && (pend_dc(ag_u.base) || (ex_wr_b && !cap_b))) ||
-	(ag_u.idx_v  && (pend_dc(ag_u.idx)  || (ex_wr_x && !cap_x))) ||
+	(ag_u.base_v && (yw_b[2] ? !erb : (pend_dc(ag_u.base) || (ex_wr_b && !cap_b)))) ||
+	(ag_u.idx_v  && (yw_x[2] ? !erx : (pend_dc(ag_u.idx)  || (ex_wr_x && !cap_x)))) ||
 	// a register AG writes waits for every older writer (else the EX write
 	// of the captured load could land after this one)
 	(ag_u.upd_v  && pend_w(ag_u.upd_reg)) ||
@@ -371,6 +391,62 @@ endfunction
 
 wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
 wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
+
+// AG's early result: MOVE, ADD, SUB, AND, OR, EOR and LSL/ASL by an
+// immediate count, from register or immediate operands whose values are
+// known here (no older writer still to produce one, or an early one).
+// The same function as EX (ap68040_alu, ap68040_alu_slow): checked in
+// simulation against what EX writes.
+function automatic logic e_op(input uop_t u);
+	e_op = u.d_v && (u.mem == M_NONE) && (u.br == BR_NONE) && (u.exc == 8'd0) &&
+	       (u.cond == 4'd0) && !u.a_sxw && !u.a_upd && !u.b_upd && !u.upd_v &&
+	       !u.upd2_v && (u.dyn == 3'd0) && !u.ser &&
+	       (u.a_src != OS_MEM) && (u.b_src != OS_MEM) &&
+	       ((u.op == OP_MOV) || (u.op == OP_ADD) || (u.op == OP_SUB) ||
+	        (u.op == OP_AND) || (u.op == OP_OR) || (u.op == OP_EOR) ||
+	        (((u.op == OP_LSL) || (u.op == OP_ASL)) && (u.a_src == OS_IMM) &&
+	         (u.imm[31:4] == 28'd0) && (u.imm[3:0] <= 4'd8)));
+endfunction
+logic        ea_ok, eb_ok, ag_ee;
+logic [31:0] ea_v, eb_v, ag_er;
+always_comb begin
+	logic [3:0]  w;
+	logic [31:0] m, am, bm, r;
+	// (the register file read, not EX's broadcast of this cycle: a
+	// writer still in EX that is not early leaves the operand unknown)
+	ea_v  = (ag_u.a_src == OS_REG) ? rrd[3] : (ag_u.a_src == OS_IMM) ? ag_u.imm : 32'd0;
+	ea_ok = 1'b1;
+	if (ag_u.a_src == OS_REG) begin
+		w = yw(ag_u.a_reg);
+		if (w[3]) begin
+			if (w[2]) ea_v = ywv(w[1:0]);
+			else ea_ok = 1'b0;
+		end
+	end
+	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_u.imm_b : 32'd0;
+	eb_ok = 1'b1;
+	if (ag_u.b_src == OS_REG) begin
+		w = yw(ag_u.b_reg);
+		if (w[3]) begin
+			if (w[2]) eb_v = ywv(w[1:0]);
+			else eb_ok = 1'b0;
+		end
+	end
+	ag_ee = ag_v && e_op(ag_u) && ea_ok && eb_ok;
+	m  = (ag_u.sz == SZ_B) ? 32'h0000_00FF : (ag_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
+	am = ea_v & m;
+	bm = eb_v & m;
+	case (ag_u.op)
+		OP_MOV:  r = am;
+		OP_ADD:  r = bm + am;
+		OP_SUB:  r = bm - am;
+		OP_AND:  r = bm & am;
+		OP_OR:   r = bm | am;
+		OP_EOR:  r = bm ^ am;
+		default: r = (bm << ea_v[3:0]) & m;           // LSL, ASL
+	endcase
+	ag_er = (r & m) | (eb_v & ~m);
+end
 
 // A snoop dropped instruction-cache data the front end may already have
 // run ahead into (it predicts calls and returns, beyond the 68040's
@@ -1038,6 +1114,13 @@ assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd
                  (ex_u.exc == 8'd0);
 assign exw_reg = ex_u.d_reg;
 assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && exw_v && ex_ee && exw_val != ex_er) begin
+		$display("FAIL: early result %h, EX wrote %h (pc %h op %0d)", ex_er, exw_val, ex_u.pc, ex_u.op);
+		$finish;
+	end
+// synthesis translate_on
 
 //--------------------------------------------------------------------------
 // WB
@@ -1355,6 +1438,8 @@ always_ff @(posedge clk) begin
 			end
 			dc1_a   <= ag_a;
 			dc1_b   <= ag_b;
+			dc1_ee  <= ag_ee && !ag_snref && !ag_cancel;
+			dc1_er  <= ag_er;
 			dc1_ea  <= ag_u.ag ? ag_maddr : 32'd0;
 			dc1_upd <= ag_updv;
 			dc1_upd2 <= ag_u2v;
@@ -1375,6 +1460,8 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (adv_dc1) begin
 			dc2_u    <= dc1_u;
+			dc2_ee   <= dc1_ee;
+			dc2_er   <= dc1_er;
 			dc2_a    <= (exw_v && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) ? exw_val : dc1_a;
 			dc2_b    <= (exw_v && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) ? exw_val : dc1_b;
 			dc2_ea   <= dc1_ea;
@@ -1392,6 +1479,8 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (adv_dc2) begin
 			ex_u     <= dc2_u;
+			ex_ee    <= dc2_ee;
+			ex_er    <= dc2_er;
 			ex_a     <= (exw_v && dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) ? exw_val : dc2_a;
 			ex_b     <= (exw_v && dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) ? exw_val : dc2_b;
 			ex_ea    <= dc2_ea;
@@ -1756,11 +1845,14 @@ always_ff @(posedge clk) begin
 	if (adv_ex) begin cap_b <= 1'b0; cap_x <= 1'b0; end
 	if (!flush && !stall_ag && in_v && !stopped) begin
 		logic [31:0] b, x;
-		logic        cb, cx;
+		logic        cb, cx, eb, ex;
+		logic  [3:0] wb, wx;
 		b = rrd[0];
 		x = rrd[1];
 		cb = 1'b0;
 		cx = 1'b0;
+		eb = 1'b0;
+		ex = 1'b0;
 		for (int i = 0; i < 3; i++) begin
 			if (fwe[i] && fwa[i] == in_u.base) b = fwd[i];
 			if (fwe[i] && fwa[i] == in_u.idx)  x = fwd[i];
@@ -1769,24 +1861,54 @@ always_ff @(posedge clk) begin
 		// (it will be waited for in any case)
 		if (dc2_cap && dc2_u.d_reg == in_u.base) begin b = dc2_capv; cb = 1'b1; end
 		if (dc2_cap && dc2_u.d_reg == in_u.idx)  begin x = dc2_capv; cx = 1'b1; end
+		// the youngest writer's early result (not the uop leaving AG:
+		// its result is loaded next cycle)
+		wb = yw(in_u.base);
+		wx = yw(in_u.idx);
+		if (!(ag_v && ag_u.d_v && ag_u.d_reg == in_u.base) && wb[2]) begin
+			b = ywv(wb[1:0]); eb = 1'b1; cb = 1'b0;
+		end
+		if (!(ag_v && ag_u.d_v && ag_u.d_reg == in_u.idx) && wx[2]) begin
+			ex = 1'b1; cx = 1'b0;
+		end
 		agb_q <= in_u.base_v ? b : 32'd0;
-		agx_q <= ixf(x, in_u);
+		// (the early results are scaled beside the writer search)
+		agx_q <= !ex ? ixf(x, in_u) :
+		         (wx[1:0] == 2'd1) ? ixf(dc1_er, in_u) :
+		         (wx[1:0] == 2'd2) ? ixf(dc2_er, in_u) : ixf(ex_er, in_u);
 		cap_b <= cb;
 		cap_x <= cx;
+		erb   <= eb;
+		erx   <= ex;
 	end
 	else if (ag_v) begin
-		if (exw_v && ag_u.base_v && exw_reg == ag_u.base) agb_q <= exw_val;
-		if (exw_v && exw_reg == ag_u.idx) agx_q <= ixf(exw_val, ag_u);
-		if (dc2_cap && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
-			agb_q <= dc2_capv;
-			cap_b <= 1'b1;
+		if (yw_b[2]) begin
+			if (ag_u.base_v) agb_q <= ywv(yw_b[1:0]);
+			erb <= 1'b1;
 		end
-		if (dc2_cap && dc2_u.d_reg == ag_u.idx) begin
-			agx_q <= ixf(dc2_capv, ag_u);
-			cap_x <= 1'b1;
+		else begin
+			// (an older writer's value is overwritten in time by the
+			// youngest's: AG keeps waiting for it)
+			if (exw_v && ag_u.base_v && exw_reg == ag_u.base) agb_q <= exw_val;
+			if (dc2_cap && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
+				agb_q <= dc2_capv;
+				cap_b <= 1'b1;
+			end
+		end
+		if (yw_x[2]) begin
+			agx_q <= (yw_x[1:0] == 2'd1) ? ixf(dc1_er, ag_u) :
+			         (yw_x[1:0] == 2'd2) ? ixf(dc2_er, ag_u) : ixf(ex_er, ag_u);
+			erx <= 1'b1;
+		end
+		else begin
+			if (exw_v && exw_reg == ag_u.idx) agx_q <= ixf(exw_val, ag_u);
+			if (dc2_cap && dc2_u.d_reg == ag_u.idx) begin
+				agx_q <= ixf(dc2_capv, ag_u);
+				cap_x <= 1'b1;
+			end
 		end
 	end
-	if (flush || !nreset) begin cap_b <= 1'b0; cap_x <= 1'b0; end
+	if (flush || !nreset) begin cap_b <= 1'b0; cap_x <= 1'b0; erb <= 1'b0; erx <= 1'b0; end
 end
 
 endmodule

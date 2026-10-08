@@ -85,6 +85,16 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   memory-indirect pointer) hands its data to a waiting base or index as it
   leaves DC2, a cycle before EX would write it; a register AG itself
   updates still waits for every older writer.
+* **Early results.**  A register MOVE, ADD, SUB, AND, OR, EOR or LSL/ASL
+  by an immediate count (no memory operand, no address update, operands
+  from registers or immediates whose values AG has) is also computed in
+  AG.  The result travels beside the uop to EX; a younger base or index
+  whose youngest older writer carries one takes it instead of waiting for
+  EX (a writer right in front of it costs one cycle: the result is loaded
+  from DC1).  Early operands may themselves be early results, so chains
+  like `move.w d1,d0; lsl.w #2,d0; and.l #$FFFF,d0` feed an index at once.
+  EX still computes and writes every result; simulation checks that the
+  two agree (`FAIL: early result`).
 * **DC1/DC2**: the D-ATC/DTT lookup and tag compare (DC1) and the operand
   from DC2's copy of the set (see the DMU).
 * **EX**: ALU, shifter, bit-field unit, BCD, condition codes, branch
@@ -156,7 +166,9 @@ over three cycles before the routine starts.
   own copy of the set and merges every byte write to that set into it
   (including the two writes the RAM output cannot show yet), so a load
   after a store to its line stays on the fast path; a load behind an older
-  store to its line still in EX/WB waits for it in DC2.
+  store still in EX/WB waits for it in DC2 only if it reads the store's
+  bytes (a read-modify-write, a split store or a MOVE16 still holds the
+  whole line).
 * A later read may complete before an earlier write (MC68040UM 7.7), except
   that a cache-inhibited or locked read waits for older stores, and a read
   from a serialized page (or a locked read) is performed only once every
