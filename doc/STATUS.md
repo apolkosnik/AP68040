@@ -122,6 +122,35 @@ the core's stall path), EX's register write no longer waits on the CAS
 compare (CAS writes Dc either way) or on EX's selected taken (the odd-
 target check uses the FPU's), and the FMOVEM slot map is a register.
 
+Area round (branch area-wip, not yet closed at 60 MHz): register retiming
+is off (it added about 6,000 registers), and the core is 28,900-29,200
+ALMs (69 %) against 77 % with retiming.  What it changes besides the
+retiming: FMUL's 64x64 product takes two cycles (registered partial
+products), FDIV and FSQRT share one restoring datapath, BFINS takes a
+cycle more, EX's results reach AG's base and index through registers
+(+0.9 % Dhrystone cycles; DIV by zero takes a cycle more), and the rotates
+use two funnel shifters.  The timing work of the round: the FPU's
+dispatch reads flip-flops only (per-register ready flags, their selection
+by the next source and destination, and the static pipeline eligibility,
+all registered a cycle ahead from fpif's next values; FRESTORE's resume
+decode off it), CHK's encoding checks are decoded as the uop enters EX,
+the shift count and CHK's words come from EX's operand registers,
+the EX/WB same-instruction test is a register, the predecoder's
+attributes are OR trees of the one-hot selection (tools/ucode.py,
+ent_attr_oh), the return stack is written while a call waits in D1,
+the sequencer leaves the deferred-update and MOVEM displacement additions
+to AG (uop dmv/dma) and negates its small displacements without carry
+chains, the uop FIFO's pop selects last, the instruction cache compares
+its tags with both candidate addresses, the ATC selects its hit way
+AND-OR, the cache maintenance scan reads a copy of its set's valid and
+dirty bits, and the bit field rotates are funnels.  Status on four seeds:
+t66 met all corners on seeds 2 and 4 (seeds 1 and 3 -0.31 and -0.29 ns at
+100C); t68 meets none (-0.01 to -0.86 ns), with retiming on 78 % and no
+seed either.  The failing paths are now spread over the core (the stall
+chain from EX's holds to AG and the sequencer, the FPU normalizer, the
+slow ALU's memory operand) at 0.2-0.9 ns, and a seed moves them by about
+that much.
+
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
 ODD_EXC CHK/DIV*/TRAPV and ODD_IRQ EXT/SWAP slices (21).  Any other

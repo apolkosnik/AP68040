@@ -65,7 +65,10 @@ cmd_t cmds [$];
 `FPU_PORTS(r)
 `FPU_PORTS(d)
 
-`define FPU_INST(P, PIPEV, MOD) \
+// the current FPU's selection ports: unused here (the FPU selects its own
+// register-ready flags; the core selects them outside, checked in the FPU)
+`define XPORTS .okv_next(), .sel_x(1'b0), .aok_x(1'b0), .bok_x(1'b0), .opmode_n(7'd0), .op_class_n(3'd0), .src_fmt_n(3'd0),
+`define FPU_INST(P, PIPEV, MOD, X) \
 	MOD #(.PIPE(PIPEV)) P``_fpu ( \
 		.clk(clk), .nreset(nreset), .ce(1'b1), \
 		.req(P``_req), .op_class(P``_cls), .opmode(P``_opm), .wb_ok(P``_wbok), \
@@ -78,7 +81,7 @@ cmd_t cmds [$];
 		.bsun_req(1'b0), .bsun_enable(), \
 		.ia_we(1'b0), .ia_wdata(32'd0), \
 		.fm_sel(P``_fmsel), .fm_we(P``_fmwe), .fm_wdata(P``_fmwd), .fm_rdata(P``_fmrd), \
-		.fpu_used(), .pbusy(P``_pbusy), .pdone(P``_pdone), \
+		.fpu_used(), .pbusy(P``_pbusy), .pdone(P``_pdone), X \
 		.fstate_unimp(), .fstate_cmd1(), .fstate_cmd3(), \
 		.fstate_stag(), .fstate_dtag(), .fstate_flags(), \
 		.fstate_fpt(), .fstate_et(), \
@@ -114,11 +117,11 @@ end
 `ifdef REF_OLD
 // REF_OLD: the reference is the committed FPU (ap040_fpu_ref, renamed by
 // tb/build_fpu_pipe.sh), both with the pipeline: a check of a refactor
-`FPU_INST(r, 1, ap040_fpu_ref)
+`FPU_INST(r, 1, ap040_fpu_ref, )
 `else
-`FPU_INST(r, 0, ap040_fpu)
+`FPU_INST(r, 0, ap040_fpu, `XPORTS)
 `endif
-`FPU_INST(d, 1, ap040_fpu)
+`FPU_INST(d, 1, ap040_fpu, `XPORTS)
 
 //--------------------------------------------------------------------------
 // values

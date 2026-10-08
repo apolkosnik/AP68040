@@ -815,10 +815,16 @@ always_ff @(posedge clk) begin
 		if (fire) part_bt <= go_part && (part_bt || bt_restart);
 		if (flush) part_bt <= 1'b0;
 
-		// the return stack follows the records in program order
+		// the return stack follows the records in program order.  A call
+		// writes the slot above the top while it waits in D1, push or not
+		// (the write stays off D1's go, a timing path): only the push
+		// moves the top.  A call that never pushes (flushed, faulted) can
+		// cost the entry it overwrote -- the oldest, or one a recovery
+		// would restore -- which only costs a prediction: EX checks every
+		// return
+		if (rcall) ras[ras_tp + 3'd1] <= nrec.npc;
 		if (push && nrec_q.exc == 8'd0) begin
 			if (rcall) begin
-				ras[ras_tp + 3'd1] <= nrec.npc;
 				ras_tp <= ras_tp + 3'd1;
 				if (ras_n != 4'd8) ras_n <= ras_n + 4'd1;
 			end

@@ -44,7 +44,7 @@ always_comb begin
 	logic [1:0] sz;
 	logic       isl;
 	s  = dec_sel(op);
-	a  = ent_attr(sel_index(s), |s);
+	a  = ent_attr_oh(s);
 	i0 = a.ea0v ? ea_idx(op[5:3], op[2:0]) : EM_NONE;
 	i1 = a.ea1v ? ea_idx(op[8:6], op[11:9]) : EM_NONE;
 	sz = (a.szc == 2'd3) ? op[7:6] : a.szc;

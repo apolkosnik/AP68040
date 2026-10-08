@@ -103,6 +103,8 @@ module ap68040_backend
 	output logic        adv_wb,         // WB completes
 	input  logic        dm_dc2_rdy,     // DC2 memory op has its result
 	input  logic [31:0] dm_ldata,       // load data, right aligned
+	input  logic [31:0] dm_ldata_al,    // the aligned operand (AG's capture)
+	input  logic        dm_ldata_alv,   // ... is the load's data
 	input  logic        dm_fault,       // DC2 access fault (with info below)
 	input  logic  [7:0] dm_fvec,        // 2 access error, 3 address error
 	input  logic [31:0] dm_faddr,
@@ -205,9 +207,12 @@ logic [31:0] fv;
 // (a load's fault is known by now), not the last uop (no instruction
 // boundary between them: no interrupt or trace), and not a store (a bus
 // error on a store comes after WB)
+// (ew_same: ex_u.pc == wb_u.pc, kept as the two load -- the compare
+// stays off the FPU's hold, and so the stall chain)
+logic ew_same;
 wire wb_fpchk = wb_v && !wb_u.last && (wb_exc == 8'd0) &&
                 (wb_u.mem == M_NONE || wb_u.mem == M_LD) &&
-                ex_v && ex_u.op == OP_FPU && ex_u.pc == wb_u.pc;
+                ex_v && ex_u.op == OP_FPU && ew_same;
 // FPU interface outputs (ap68040_fpif)
 logic        fp_hold, fp_dkill, fp_taken, fp_xnext, fp_xcommit, fp_stkill;
 logic [31:0] fp_res, fp_xaddr;
@@ -307,9 +312,15 @@ endfunction
 wire [3:0] yw_b = yw(ag_u.base);
 wire [3:0] yw_x = yw(ag_u.idx);
 // an early youngest writer: AG waits only until its result is loaded
+// EX's result reaches AG's base/index a cycle after it is written, from a
+// register (exq_*): stale_b/x mark a base/index loaded before that write
+// (it entered AG as EX wrote it, or its writer left EX while AG waited);
+// AG waits that cycle and reloads it from exq_val
+logic        stale_b, stale_x;
+logic [31:0] exq_val;
 wire ag_interlock = ag_v && (
-	(ag_u.base_v && (yw_b[2] ? !erb : (pend_dc(ag_u.base) || (ex_wr_b && !cap_b)))) ||
-	(ag_u.idx_v  && (yw_x[2] ? !erx : (pend_dc(ag_u.idx)  || (ex_wr_x && !cap_x)))) ||
+	(ag_u.base_v && (yw_b[2] ? !erb : (pend_dc(ag_u.base) || (ex_wr_b && !cap_b) || stale_b))) ||
+	(ag_u.idx_v  && (yw_x[2] ? !erx : (pend_dc(ag_u.idx)  || (ex_wr_x && !cap_x) || stale_x))) ||
 	// a register AG writes waits for every older writer (else the EX write
 	// of the captured load could land after this one)
 	(ag_u.upd_v  && pend_w(ag_u.upd_reg)) ||
@@ -319,8 +330,10 @@ wire ag_interlock = ag_v && (
 // (a long MOVE, MOVEA.W sign-extended, a memory-indirect pointer)
 wire        dc2_cap  = adv_dc2 && dc2_u.d_v && dc2_u.op == OP_MOV && dc2_u.cond == 4'd0 &&
                        dc2_u.mem == M_LD && dc2_u.a_src == OS_MEM && dc2_u.sz == SZ_L &&
-                       dc2_u.exc == 8'd0;
-wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata[15]}}, dm_ldata[15:0]} : dm_ldata;
+                       dc2_u.exc == 8'd0 && dm_ldata_alv;
+// (from the DMU's aligned word, not its general byte gather: a short path;
+// a misaligned load reaches AG a cycle later, through EX's write)
+wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata_al[15]}}, dm_ldata_al[15:0]} : dm_ldata_al;
 
 assign ag_hold = ag_interlock;
 
@@ -411,7 +424,7 @@ logic        ea_ok, eb_ok, ag_ee;
 logic [31:0] ea_v, eb_v, ag_er;
 always_comb begin
 	logic [3:0]  w;
-	logic [31:0] m, am, bm, r;
+	logic [31:0] m, r;
 	// (the register file read, not EX's broadcast of this cycle: a
 	// writer still in EX that is not early leaves the operand unknown)
 	ea_v  = (ag_u.a_src == OS_REG) ? rrd[3] : (ag_u.a_src == OS_IMM) ? ag_u.imm : 32'd0;
@@ -434,16 +447,16 @@ always_comb begin
 	end
 	ag_ee = ag_v && e_op(ag_u) && ea_ok && eb_ok;
 	m  = (ag_u.sz == SZ_B) ? 32'h0000_00FF : (ag_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
-	am = ea_v & m;
-	bm = eb_v & m;
+	// (the size mask applies to the result only: the low bits of each of
+	// these depend on the operands' low bits alone)
 	case (ag_u.op)
-		OP_MOV:  r = am;
-		OP_ADD:  r = bm + am;
-		OP_SUB:  r = bm - am;
-		OP_AND:  r = bm & am;
-		OP_OR:   r = bm | am;
-		OP_EOR:  r = bm ^ am;
-		default: r = (bm << ea_v[3:0]) & m;           // LSL, ASL
+		OP_MOV:  r = ea_v;
+		OP_ADD:  r = eb_v + ea_v;
+		OP_SUB:  r = eb_v - ea_v;
+		OP_AND:  r = eb_v & ea_v;
+		OP_OR:   r = eb_v | ea_v;
+		OP_EOR:  r = eb_v ^ ea_v;
+		default: r = eb_v << ea_v[3:0];               // LSL, ASL
 	endcase
 	ag_er = (r & m) | (eb_v & ~m);
 end
@@ -538,6 +551,7 @@ logic [31:0] md_rem;          // remainder / product high, for OP_MDRES
 logic [31:0] md_lol;          // quotient / product low, for OP_MDRES
 logic        md_ovfl;         // the last divide overflowed
 logic        md_go;           // this EX uop has started the unit
+logic        md_z;            // ... is a divide by zero (from its second cycle)
 wire         ex_is_md   = (ex_u.op == OP_MUL) || (ex_u.op == OP_DIV);
 wire         ex_div0    = (ex_u.op == OP_DIV) &&
                           ((ex_u.sz == SZ_W) ? (ex_av[15:0] == 16'd0) : (ex_av == 32'd0));
@@ -567,7 +581,8 @@ ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
 	.ex_v(ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0), .sub(ex_u.cond),
 	.fuse(ex_u.sz == SZ_W), .eal(ex_u.sz == SZ_B),
 	.imm(ex_u.imm[7:0]), .immb(ex_u.imm_b[7:0]),
-	.av(ex_av), .bv(ex_bv), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
+	.av(ex_av), .bv(ex_bv), .aw(ex_a[15:0]), .bw(ex_b[15:0]),
+	.dw_a(dc2_a[15:0]), .dw_b(dc2_b[15:0]), .dw_ld(!stall_ex), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
 	.safe(!wb_v || wb_fpchk), .adv(adv_ex), .kill(kill_now),
 	.hold(fp_hold), .res(fp_res), .dkill(fp_dkill), .taken(fp_taken),
 	.xvec(fp_xvec), .xfmt(fp_xfmt), .xnext(fp_xnext), .xaddr(fp_xaddr),
@@ -577,7 +592,9 @@ ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
 );
 
 // EX holds while the unit runs, until the cycle its result is presented
-assign ex_hold = (ex_v && ex_is_md && !ex_div0 && !ex_fault && !md_done) ||
+// (a divide by zero holds its first cycle too: the zero test of the
+// operand stays off the stall path, and the exception goes a cycle later)
+assign ex_hold = (ex_v && ex_is_md && !md_z && !ex_fault && !md_done) ||
                  (ex_v && ex_slow && !ex_ph) ||
                  (ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0 && fp_hold);
 
@@ -646,6 +663,10 @@ logic [31:0] ex_latch;
 //--------------------------------------------------------------------------
 logic [31:0] bf_off;
 logic  [5:0] bf_w;
+// derived from the width when BFSET latches it (off the EX paths): 32 - width,
+// the field mask at the top, BFEXTS's sign mask
+logic  [5:0] bf_wn;
+logic [31:0] bf_top, bf_sx;
 logic  [2:0] bf_nb;             // memory form: bytes holding the field (1..5)
 
 // MOVEM continuation (MC68040UM 8.4.6.5, SSW CM)
@@ -671,6 +692,13 @@ endfunction
 logic  [7:0] bf_lonew;          // memory form: the new byte after the long
 logic [31:0] bf_res;
 logic  [7:0] bf_lo_out;
+// BFINS takes a cycle more: its source left-aligned to the field width
+// (ins_top) is registered first (bf_ins_q, in ex_pb's cycle), so the field
+// merge starts from flip-flops -- three variable shifts in a row do not
+// close at 60 MHz without register retiming
+logic        ex_pb;
+logic [31:0] bf_ins_q;
+wire         ex_bfins = (ex_u.op == OP_BF) && (ex_u.cond[2:0] == 3'd7);
 logic  [4:0] bf_flags;
 always_comb begin
 	logic [4:0]  o;
@@ -680,11 +708,12 @@ always_comb begin
 	logic        nflag, zflag;
 	logic [2:0]  t;
 	t   = ex_u.cond[2:0];
-	top = (bf_w == 6'd32) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> bf_w);
-	ins_top = (bf_w == 6'd32) ? ex_av : (ex_av << (6'd32 - bf_w));
+	top = bf_top;
+	ins_top = bf_ins_q;
 	if (!ex_u.cond[3]) begin
 		o   = bf_off[4:0];
-		rot = (ex_bv << o) | ((o == 5'd0) ? 32'd0 : (ex_bv >> (6'd32 - {1'b0, o})));
+		// rotate left by o: a funnel of B with itself
+		rot = 32'(({ex_bv, ex_bv} << o) >> 32);
 		win = '0; mask40 = '0; ins40 = '0;
 	end
 	else begin
@@ -698,18 +727,18 @@ always_comb begin
 			3'd4:    win = {ex_bv, 8'd0};
 			default: win = {ex_bv, ex_latch[7:0]};
 		endcase
-		rot = win[39:8] << o | ({24'd0, win[7:0]} >> (6'd8 - {1'b0, o}));
+		rot = 32'((win << o) >> 8);
 		mask40 = {top, 8'h00} >> o;
 		ins40  = {ins_top, 8'h00} >> o;
 	end
-	fld = (bf_w == 6'd32) ? rot : (rot >> (6'd32 - bf_w));
+	fld = rot >> bf_wn;
 	case (t)
 		3'd2: nrot = rot ^ top;                     // BFCHG
 		3'd4: nrot = rot & ~top;                    // BFCLR
 		3'd6: nrot = rot | top;                     // BFSET
 		default: nrot = (rot & ~top) | (ins_top & top);   // BFINS
 	endcase
-	nreg = (nrot >> o) | ((o == 5'd0) ? 32'd0 : (nrot << (6'd32 - {1'b0, o})));
+	nreg = 32'({nrot, nrot} >> o);
 	case (t)
 		3'd2: nwin = win ^ mask40;
 		3'd4: nwin = win & ~mask40;
@@ -733,8 +762,7 @@ always_comb begin
 	bf_lo_out = (bf_nb == 3'd3) ? nwin[23:16] : nwin[7:0];
 	case (t)
 		3'd1: bf_res = fld;                                            // BFEXTU
-		3'd3: bf_res = (bf_w == 6'd32) ? fld :                         // BFEXTS
-		               (fld | (rot[31] ? (32'hFFFF_FFFF << bf_w) : 32'd0));
+		3'd3: bf_res = fld | (rot[31] ? bf_sx : 32'd0);                  // BFEXTS
 		3'd5: bf_res = bf_off + {26'd0, lz};                           // BFFFO
 		3'd0: bf_res = ex_bv;                                          // BFTST
 		default: bf_res = !ex_u.cond[3] ? nreg :
@@ -816,9 +844,27 @@ exo_t xf, xs, xs_q;
 logic [31:0] sl_res;
 logic  [4:0] sl_flags;
 ap68040_alu_slow alu_s (
-	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .flags_in(ccr_f),
+	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
 	.res(sl_res), .flags_out(sl_flags)
 );
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && wb_v && ew_same != (ex_u.pc == wb_u.pc)) begin
+		$display("FAIL: ew_same %b, the EX and WB PCs %h %h", ew_same, ex_u.pc, wb_u.pc);
+		$finish;
+	end
+// synthesis translate_on
+// (the shift count is never a memory operand: a count register or a
+// constant, so it comes straight from the operand register)
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (ex_v && ex_u.a_src == OS_MEM &&
+	    (ex_u.op == OP_ASL || ex_u.op == OP_ASR || ex_u.op == OP_LSL || ex_u.op == OP_LSR ||
+	     ex_u.op == OP_ROL || ex_u.op == OP_ROR || ex_u.op == OP_ROXL || ex_u.op == OP_ROXR)) begin
+		$display("FAIL: a shift with its count from memory (pc %h)", ex_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 
 // fast operations
 always_comb begin
@@ -1087,9 +1133,16 @@ wire        ex_early = ex_mispred && !ex_u.ser && !ex_sr_we &&
 // (Bcc/DBcc: the decoded target, so the check does not wait for the ALU
 // result that decides taken -- that path ends in the register file write
 // enable.  Every other change of flow is unconditional or an FPU one.)
+// The unconditional transfers (and RTE) are always taken; the others'
+// target is the decoded one, and only the FPU's (FBcc FDBcc) can be taken
+// besides Bcc and DBcc: its own taken, not EX's selected one.
 wire        ex_bdb  = (ex_u.op == OP_BCC) || (ex_u.op == OP_DBCC);
-wire [31:0] ex_otgt = (ex_bdb || !ex_taken) ? ex_u.target : ex_target;
-wire        ex_odd  = ex_br && (ex_bdb ? ex_u.target[0] : (ex_taken && ex_target[0]));
+wire        ex_ubr  = (ex_u.br == BR_IMM) || (ex_u.br == BR_EA) ||
+                      (ex_u.br == BR_A) || (ex_u.br == BR_B) || (ex_u.op == OP_RTE);
+wire [31:0] ex_otgt = (!ex_bdb && ex_ubr) ? ex_target : ex_u.target;
+wire        ex_odd  = ex_br && (ex_bdb ? ex_u.target[0] :
+                                ex_ubr ? ex_target[0] :
+                                ((ex_u.op == OP_FPU) && fp_taken && ex_u.target[0]));
 logic [31:0] ex_odd_pc;
 always_comb begin
 	ex_odd_pc = ex_u.pc;
@@ -1115,6 +1168,9 @@ wire ex_odd_w = ex_br && (ex_bdb ? ex_u.target[0] :
                           (ex_u.op == OP_FPU) && fp_taken && ex_target[0]);
 assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd_w &&
                  (ex_u.exc == 8'd0);
+// the same for AG's base/index loads: without EX's exception decision (a
+// late signal) -- a uop that takes an exception flushes AG with the rest
+wire        exw_ag  = adv_ex && ex_d_eff;
 assign exw_reg = ex_u.d_reg;
 assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
 // synthesis translate_off
@@ -1355,7 +1411,9 @@ always_ff @(posedge clk) begin
 		mmusr_r <= 32'd0; urp_r  <= 32'd0; srp_r  <= 32'd0;
 		xi_pc   <= 32'd0; xi_addr <= 32'd0; xi_sr <= 16'd0; xi_vecw <= 16'd0; xi_ssw <= 16'd0;
 		md_go   <= 1'b0;
+		md_z    <= 1'b0;
 		ex_ph   <= 1'b0;
+		ex_pb   <= 1'b0;
 		xs_q    <= '0;
 		md_hiin <= 32'd0;
 		md_rem  <= 32'd0;
@@ -1364,6 +1422,9 @@ always_ff @(posedge clk) begin
 		ex_latch <= 32'd0;
 		bf_off   <= 32'd0;
 		bf_w     <= 6'd32;
+		bf_wn    <= 6'd0;
+		bf_top   <= 32'hFFFF_FFFF;
+		bf_sx    <= 32'd0;
 		bf_lonew <= 8'd0;
 		chk2_lo_lt <= 1'b0; chk2_lo_eq <= 1'b0;
 		cas2_eq <= 1'b0;
@@ -1495,14 +1556,23 @@ always_ff @(posedge clk) begin
 			ex_faddr <= dm_faddr;
 			ex_fssw  <= dm_fssw;
 			md_go    <= 1'b0;
+			md_z     <= 1'b0;
 		end
 		if (!stall_ex) ex_v <= adv_dc2;
+		// EX's next uop against WB's next: EX's own when it moves on
+		if (adv_dc2) ew_same <= adv_ex ? (dc2_u.pc == ex_u.pc) : (dc2_u.pc == wb_u.pc);
+		else if (adv_ex) ew_same <= 1'b1;
 		if (ex_md_start) md_go <= 1'b1;
-		if (ex_v && ex_slow && !ex_ph) begin
+		if (ex_v && ex_div0) md_z <= 1'b1;
+		if (ex_v && ex_bfins && !ex_pb) begin
+			ex_pb    <= 1'b1;
+			bf_ins_q <= ex_av << bf_wn;
+		end
+		else if (ex_v && ex_slow && !ex_ph) begin
 			ex_ph <= 1'b1;
 			xs_q  <= xs;
 		end
-		if (adv_ex || kill_now) ex_ph <= 1'b0;
+		if (adv_ex || kill_now) begin ex_ph <= 1'b0; ex_pb <= 1'b0; end
 
 		//------------------------------------------------------------------
 		// EX -> WB
@@ -1634,6 +1704,9 @@ always_ff @(posedge clk) begin
 				e = {4'd0, ex_av[2:0]} + {1'b0, w} + 7'd7;
 				bf_off <= ex_av;
 				bf_w   <= w;
+				bf_wn  <= 6'd32 - w;
+				bf_top <= ~(32'hFFFF_FFFF >> w);      // (a shift by 32 gives 0)
+				bf_sx  <= 32'hFFFF_FFFF << w;
 				bf_nb  <= e[5:3];
 			end
 			if (ex_u.op == OP_BF) bf_lonew <= bf_lo_out;
@@ -1805,7 +1878,10 @@ always_ff @(posedge clk) begin
 		else begin
 			// D2 -> AG (exactly when in_rdy says the uop is taken)
 			if (!stall_ag) ag_v <= in_v && !stopped;
-			if (!stall_ag && in_v && !stopped) ag_u <= in_u;
+			if (!stall_ag && in_v && !stopped) begin
+				ag_u      <= in_u;
+				ag_u.disp <= in_u.dmv ? in_u.disp + {{24{in_u.dma[7]}}, in_u.dma} : in_u.disp;
+			end
 		end
 		if (kill_now) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
@@ -1856,7 +1932,7 @@ always_ff @(posedge clk) begin
 		cx = 1'b0;
 		eb = 1'b0;
 		ex = 1'b0;
-		for (int i = 0; i < 3; i++) begin
+		for (int i = 0; i < 2; i++) begin
 			if (fwe[i] && fwa[i] == in_u.base) b = fwd[i];
 			if (fwe[i] && fwa[i] == in_u.idx)  x = fwd[i];
 		end
@@ -1875,6 +1951,10 @@ always_ff @(posedge clk) begin
 			ex = 1'b1; cx = 1'b0;
 		end
 		agb_q <= in_u.base_v ? b : 32'd0;
+		// EX writing it this cycle: the register file read is a cycle
+		// early (unless a younger load or early result supplied it)
+		stale_b <= exw_ag && in_u.base_v && exw_reg == in_u.base && !cb && !eb;
+		stale_x <= exw_ag && in_u.idx_v  && exw_reg == in_u.idx  && !cx && !ex;
 		// (the early results are scaled beside the writer search)
 		agx_q <= !ex ? ixf(x, in_u) :
 		         (wx[1:0] == 2'd1) ? ixf(dc1_er, in_u) :
@@ -1888,30 +1968,38 @@ always_ff @(posedge clk) begin
 		if (yw_b[2]) begin
 			if (ag_u.base_v) agb_q <= ywv(yw_b[1:0]);
 			erb <= 1'b1;
+			stale_b <= 1'b0;
 		end
 		else begin
 			// (an older writer's value is overwritten in time by the
 			// youngest's: AG keeps waiting for it)
-			if (exw_v && ag_u.base_v && exw_reg == ag_u.base) agb_q <= exw_val;
+			if (stale_b && ag_u.base_v) agb_q <= exq_val;
+			stale_b <= exw_ag && ag_u.base_v && exw_reg == ag_u.base && !cap_b;
 			if (dc2_cap && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
 				agb_q <= dc2_capv;
 				cap_b <= 1'b1;
 			end
 		end
 		if (yw_x[2]) begin
+			stale_x <= 1'b0;
 			agx_q <= (yw_x[1:0] == 2'd1) ? ixf(dc1_er, ag_u) :
 			         (yw_x[1:0] == 2'd2) ? ixf(dc2_er, ag_u) : ixf(ex_er, ag_u);
 			erx <= 1'b1;
 		end
 		else begin
-			if (exw_v && exw_reg == ag_u.idx) agx_q <= ixf(exw_val, ag_u);
+			if (stale_x) agx_q <= ixf(exq_val, ag_u);
+			stale_x <= exw_ag && ag_u.idx_v && exw_reg == ag_u.idx && !cap_x;
 			if (dc2_cap && dc2_u.d_reg == ag_u.idx) begin
 				agx_q <= ixf(dc2_capv, ag_u);
 				cap_x <= 1'b1;
 			end
 		end
 	end
-	if (flush || !nreset) begin cap_b <= 1'b0; cap_x <= 1'b0; erb <= 1'b0; erx <= 1'b0; end
+	exq_val <= exw_val;
+	if (flush || !nreset) begin
+		cap_b <= 1'b0; cap_x <= 1'b0; erb <= 1'b0; erx <= 1'b0;
+		stale_b <= 1'b0; stale_x <= 1'b0;
+	end
 end
 
 endmodule

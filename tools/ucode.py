@@ -957,6 +957,7 @@ def emit():
                 f.write('\ts[%d] = m[%d];\n' % (i, i))
         f.write('\tdec_sel = s;\nendfunction\n\n')
         # attributes of an entry index
+        lits = []
         f.write('function automatic pla_t ent_attr(input logic [8:0] ent, input logic hit);\n')
         f.write("\tent_attr = '0;\n\tcase (ent)\n")
         for i, e in enumerate(ents):
@@ -971,12 +972,22 @@ def emit():
             if u0['jt'] is not None:
                 rn, k = u0['jt'].split('.')
                 jt0 = ENTRY[rn] + int(k)
-            f.write("\t\t9'd%d: ent_attr = '{1'b1, 9'd%d, 10'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 6'd%d, 10'd%d, 1'b%d, 1'b%d, 2'd%d, 1'b%d};  // %s %s\n"
-                    % (i, i, ENTRY[e.rt], eop, ec or 0, 1 if ec is not None else 0,
-                       ccr, SZC[e.sz], mask0, mask1, e.nfix, IMMK[e.imm],
-                       1 if e.priv else 0, jc0, jt0, e.ea0 is not None,
-                       e.ea1 is not None, e.fea, e.rt in T0_RT, e.name, e.rt))
+            lit = ("'{1'b1, 9'd%d, 10'd%d, 7'd%d, 4'd%d, 1'b%d, 5'h%x, 2'd%d, 12'h%03x, 12'h%03x, 2'd%d, 3'd%d, 1'b%d, 6'd%d, 10'd%d, 1'b%d, 1'b%d, 2'd%d, 1'b%d}"
+                   % (i, ENTRY[e.rt], eop, ec or 0, 1 if ec is not None else 0,
+                      ccr, SZC[e.sz], mask0, mask1, e.nfix, IMMK[e.imm],
+                      1 if e.priv else 0, jc0, jt0, e.ea0 is not None,
+                      e.ea1 is not None, e.fea, e.rt in T0_RT))
+            lits.append((lit, e.name, e.rt))
+            f.write("\t\t9'd%d: ent_attr = %s;  // %s %s\n" % (i, lit, e.name, e.rt))
         f.write("\t\tdefault: ;\n\tendcase\n\tif (!hit) ent_attr = '0;\nendfunction\n\n")
+        # the same from the one-hot selection: every attribute bit an OR of
+        # the selecting entries (no index encode and table lookup in series)
+        f.write('function automatic pla_t ent_attr_oh(input logic [NENT-1:0] s);\n')
+        f.write("\tpla_t a;\n\ta = '0;\n")
+        for i, (lit, nm, rt) in enumerate(lits):
+            # (the packed struct's bits: the fields concatenated)
+            f.write("\tif (s[%d]) a = a | %s;  // %s %s\n" % (i, lit[1:], nm, rt))
+        f.write('\tent_attr_oh = a;\nendfunction\n\n')
         # one-hot -> index
         f.write('function automatic logic [8:0] sel_index(input logic [NENT-1:0] s);\n')
         f.write("\tlogic [8:0] x;\n\tx = '0;\n")

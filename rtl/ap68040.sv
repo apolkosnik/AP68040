@@ -212,7 +212,8 @@ logic        bht_dis;
 logic        lp_we, lp_tk, lp_mp;
 logic [11:0] lp_wa;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
-logic [31:0] dm_ldata, dm_faddr, dm_st_data;
+logic [31:0] dm_ldata, dm_faddr, dm_st_data, dm_ldata_al;
+logic        dm_ldata_alv;
 logic  [7:0] dm_fvec;
 logic [15:0] dm_fssw, dm_st_fssw;
 
@@ -235,7 +236,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
 	.irq_pending(irq_pending),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
-	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_fault(dm_fault),
+	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_ldata_al(dm_ldata_al), .dm_ldata_alv(dm_ldata_alv), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
 	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy),
 	.dm_st_fault(dm_st_fault), .dm_st_fssw(dm_st_fssw),
@@ -257,7 +258,7 @@ ap68040_dmu dmu (
 	.dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
-	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .fault(dm_fault), .fvec(dm_fvec),
+	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .ldata_al(dm_ldata_al), .ldata_alv(dm_ldata_alv), .fault(dm_fault), .fvec(dm_fvec),
 	.faddr(dm_faddr), .fssw(dm_fssw),
 	.st_v(dm_st_v), .st_data(dm_st_data), .st_rdy(dm_st_rdy),
 	.st_fault(dm_st_fault), .st_fssw(dm_st_fssw), .st_faddr(dm_st_faddr),

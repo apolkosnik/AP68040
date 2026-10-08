@@ -228,6 +228,8 @@ typedef struct packed {
 	logic        idx_l;
 	logic  [1:0] scale;
 	logic [31:0] disp;
+	logic        dmv;       // AG adds dma to disp as the uop enters it (a
+	logic  [7:0] dma;       // deferred update merged by the sequencer; signed)
 	logic        pinc;      // postincrement: EA = base, update = base + amt
 	logic        upd_v;     // AG write: upd_reg = pinc ? base + amt : EA
 	logic  [4:0] upd_reg;

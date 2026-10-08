@@ -99,6 +99,15 @@ function automatic logic is_reg(input logic [3:0] m);
 	is_reg = (m == EM_DN) || (m == EM_AN);
 endfunction
 
+// minus a small amount: the low bits negated, the rest the sign -- no
+// 32-bit carry chain after the sequencer's selects
+function automatic logic [31:0] neg5(input logic [4:0] x);
+	neg5 = {{27{x != 5'd0}}, 5'd0 - x};
+endfunction
+function automatic logic [31:0] neg7(input logic [6:0] x);
+	neg7 = {{25{x != 7'd0}}, 7'd0 - x};
+endfunction
+
 function automatic logic [4:0] size_bytes(input logic [1:0] s, input logic is_sp);
 	case (s)
 		SZ_B:    size_bytes = is_sp ? 5'd2 : 5'd1;
@@ -153,6 +162,10 @@ always_comb begin
 	endcase
 end
 
+logic        dbg_dm;             // (simulation: the merge and the
+logic [31:0] dbg_dpre;           // displacement it was formed for;
+logic        dbg_mvd;            // a MOVEM offset for AG, and the offset)
+logic [31:0] dbg_mvo;
 always_comb begin
 	opsel_t oa, ob, od;
 	ea_t    me;              // the uop's memory EA
@@ -171,6 +184,7 @@ always_comb begin
 	logic [31:0] pcx;
 
 	nu        = '0;
+	dbg_mvo   = '0;
 	n_ptr     = 1'b0;
 	n_ptr_ea1 = 1'b0;
 	n_jump    = 1'b0;
@@ -375,7 +389,7 @@ always_comb begin
 			end
 			EM_APD: begin
 				nu.base_v = 1'b1; nu.base = bre;
-				nu.disp = -{27'd0, amt};
+				nu.disp = neg5(amt);
 				nu.upd_v = 1'b1; nu.upd_reg = bre;
 			end
 			EM_AD16: begin nu.base_v = 1'b1; nu.base = bre; nu.disp = me.bd; end
@@ -493,7 +507,7 @@ always_comb begin
 			DS_IMM:    dsv = src.imm;
 			DS_NIMM:   dsv = -((src.sz == SZ_W) ? {{16{src.ea0.bd[15]}}, src.ea0.bd[15:0]} : src.ea0.bd);
 			DS_QUICK:  dsv = q;
-			DS_NQUICK: dsv = -q;
+			DS_NQUICK: dsv = neg5(q[4:0]);      // q: 1..8
 			DS_IMMC:   dsv = src.imm + {{16{uw.cval[15]}}, uw.cval};
 			DS_SZB:    dsv = {27'd0, size_bytes(src.sz, 1'b0)};
 			default:   dsv = {{16{uw.cval[15]}}, uw.cval};
@@ -501,7 +515,7 @@ always_comb begin
 		case (uw.ag)
 			AGM_PUSH: begin
 				nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = sp_reg;
-				nu.disp = -{27'd0, size_bytes(msz, 1'b1)};
+				nu.disp = neg5(size_bytes(msz, 1'b1));
 				nu.upd_v = 1'b1; nu.upd_reg = sp_reg;
 			end
 			AGM_POP: begin
@@ -558,7 +572,7 @@ always_comb begin
 				if (src.ea0.m == EM_AIP || src.ea0.m == EM_APD) begin
 					nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = areg(src.ea0.r, sp_reg);
 					nu.idx_v = 1'b0; nu.pinc = 1'b0;
-					nu.disp = (src.ea0.m == EM_APD) ? -{25'd0, fp_size} : 32'd0;
+					nu.disp = (src.ea0.m == EM_APD) ? neg7(fp_size) : 32'd0;
 				end
 				else if (src.ea0.m == EM_IMM) begin
 					nu.ag = 1'b1; nu.base_v = 1'b0; nu.idx_v = 1'b0; nu.pinc = 1'b0;
@@ -572,7 +586,7 @@ always_comb begin
 				if (src.ea0.m == EM_AIP || src.ea0.m == EM_APD) begin
 					nu.ag = 1'b1; nu.base_v = 1'b1; nu.base = areg(src.ea0.r, sp_reg);
 					nu.idx_v = 1'b0; nu.pinc = 1'b0;
-					nu.disp = (src.ea0.m == EM_APD) ? -{25'd0, fp_size} : {25'd0, fp_size};
+					nu.disp = (src.ea0.m == EM_APD) ? neg7(fp_size) : {25'd0, fp_size};
 					nu.upd_v = 1'b1; nu.upd_reg = areg(src.ea0.r, sp_reg);
 				end
 			end
@@ -679,9 +693,15 @@ always_comb begin
 				nu.cond   = 4'hC;
 				nu.target = off;
 			end
-			// address of this transfer
-			nu.disp = nu.disp + off;
+			// address of this transfer: the offset (within +-64) is added
+			// by AG as the uop enters it, as a deferred update's is (off
+			// the sequencer's EA selects)
 			if (pd) nu.disp = off;          // undo the generic -(An) offset
+			else begin
+				nu.dmv = 1'b1;
+				nu.dma = off[7:0];
+				dbg_mvo = off;
+			end
 			nu.pinc = 1'b0;
 			nu.upd_v = 1'b0;
 			if (lastx && pd) begin
@@ -711,7 +731,16 @@ always_comb begin
 	if (uw.mfc == MFC_EAP)
 		nu.mprog = (src.ea0.m == EM_PC16 || src.ea0.m == EM_PCX || src.ea0.m == EM_IMM);
 
-	if (dmerge) nu.disp = disp_pre + {{24{def_amt[7]}}, def_amt};
+	// (the addition itself is AG's, as the uop enters it: off the
+	// microcode ROM's path to the uop queue.  No upd2 uop has an explicit
+	// AG mode, so its displacement is still disp_pre -- checked below)
+	dbg_dm   = dmerge;
+	dbg_dpre = disp_pre;
+	dbg_mvd  = nu.dmv;              // (MOVEM's offset, before a merge)
+	if (dmerge) begin
+		nu.dmv  = 1'b1;
+		nu.dma  = def_amt;
+	end
 
 	// a pointer load replaces the uop this cycle
 	if (n_ptr) begin
@@ -723,7 +752,7 @@ always_comb begin
 		p.ag = 1'b1;
 		p.base_v = nu.base_v; p.base = nu.base;
 		p.idx_v = nu.idx_v; p.idx = nu.idx; p.idx_l = nu.idx_l; p.scale = nu.scale;
-		p.disp = nu.disp;
+		p.disp = nu.disp; p.dmv = nu.dmv; p.dma = nu.dma;
 		p.mem = M_LD; p.mprog = nu.mprog;
 		p.d_v = 1'b1;
 		p.d_reg = n_ptr_ea1 ? (R_T0 + 5'd12) : (R_T0 + 5'd13);
@@ -812,19 +841,18 @@ always_ff @(posedge clk) begin
 		upc  <= na;
 		uw_v <= nv;
 
-		// uop FIFO
-		case ({emit, uq_pop && uq_n != 2'd0})
-			2'b01: begin uq0 <= uq1; uq_n <= uq_n - 2'd1; end
-			2'b10: begin
-				if (uq_n == 2'd0) uq0 <= nu; else uq1 <= nu;
-				uq_n <= uq_n + 2'd1;
-			end
-			2'b11: begin
-				if (uq_n == 2'd1) uq0 <= nu;
-				else begin uq0 <= uq1; uq1 <= nu; end
-			end
-			default: ;
-		endcase
+		// uop FIFO: both outcomes formed without the pop (the back end's
+		// stall, a late signal), which selects between them last
+		if (uq_pop && uq_n != 2'd0) begin
+			uq0  <= (emit && uq_n == 2'd1) ? nu : uq1;
+			uq1  <= (emit && uq_n == 2'd2) ? nu : uq1;
+			uq_n <= emit ? uq_n : uq_n - 2'd1;
+		end
+		else begin
+			uq0  <= (emit && uq_n == 2'd0) ? nu : uq0;
+			uq1  <= (emit && uq_n == 2'd1) ? nu : uq1;
+			uq_n <= emit ? uq_n + 2'd1 : uq_n;
+		end
 
 		if (emit) begin
 			first <= 1'b0;
@@ -917,5 +945,18 @@ always_comb begin
 		default:     jc_now = 1'b0;
 	endcase
 end
+
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && emit && (dbg_mvd && (dbg_dm || dbg_mvo[31:7] != {25{dbg_mvo[7]}}))) begin
+		$display("FAIL: useq: a MOVEM offset %h for AG (merge %b)", dbg_mvo, dbg_dm);
+		$finish;
+	end
+always_ff @(posedge clk)
+	if (nreset && emit && dbg_dm && nu.disp != dbg_dpre) begin
+		$display("FAIL: useq: a merged uop's displacement %h changed from %h", nu.disp, dbg_dpre);
+		$finish;
+	end
+// synthesis translate_on
 
 endmodule

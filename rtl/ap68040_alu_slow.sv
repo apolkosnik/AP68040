@@ -15,6 +15,7 @@ module ap68040_alu_slow
 	input  logic  [1:0] sz,
 	input  logic [31:0] a,
 	input  logic [31:0] b,
+	input  logic  [5:0] cnt,        // shift count: a[5:0], without a's mux
 	input  logic  [4:0] flags_in,   // X N Z V C
 	output logic [31:0] res,
 	output logic  [4:0] flags_out
@@ -82,15 +83,21 @@ wire [15:0] unpk_r  = {4'd0, b[7:4], 4'd0, b[3:0]} + a[15:0];
 
 //--------------------------------------------------------------------------
 // shifts and rotates: closed forms of the 68040's per-step semantics.
-// count = a[5:0] (register counts are mod 64, immediate counts 1..8).
+// count = cnt (a[5:0]; register counts are mod 64, immediate counts 1..8).
 //--------------------------------------------------------------------------
 logic [31:0] sh_r;
 logic        sh_c, sh_x, sh_v;
+// The rotates use two funnels instead of a pair of shifters each: the
+// operand repeated with the rotate's period from bit 0 ({P, P}) shifted
+// right by k (< the period) has P rotated right by k at the bottom; a left
+// rotate is a right rotate by the period less the count.
+logic [65:0] rot_v, rox_v;      // the operand, and {X, operand}, repeated
+logic  [5:0] rot_k, rox_k;
+logic [65:0] rot_o, rox_o;
 always_comb begin
 	logic  [5:0] n, nm, nx, ne;
-	logic [32:0] w, rot, cmask;
 	logic [31:0] win;
-	n  = a[5:0];
+	n  = cnt;
 	nm = n & (nbits - 6'd1);
 	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider)
 	nx = n;
@@ -107,13 +114,19 @@ always_comb begin
 		default: if (nx >= 6'd33) nx = nx - 6'd33;
 	endcase
 	ne = (n > nbits) ? nbits : n;
-	cmask = (33'd2 << nbits) - 33'd1;
-	w  = ({32'd0, f_x} << nbits) | {1'b0, bm};
+	case (sz)
+		SZ_B:    begin rot_v = {50'd0, bm[7:0], bm[7:0]};   rox_v = {48'd0, f_x, bm[7:0], f_x, bm[7:0]}; end
+		SZ_W:    begin rot_v = {34'd0, bm[15:0], bm[15:0]}; rox_v = {32'd0, f_x, bm[15:0], f_x, bm[15:0]}; end
+		default: begin rot_v = {2'd0, bm, bm};              rox_v = {f_x, bm, f_x, bm}; end
+	endcase
+	rot_k = (op == OP_ROR) ? nm : ((nbits - nm) & (nbits - 6'd1));
+	rox_k = (op == OP_ROXR) ? nx : ((nx == 6'd0) ? 6'd0 : (nbits + 6'd1 - nx));
+	rot_o = rot_v >> rot_k;
+	rox_o = rox_v >> rox_k;
 	sh_r = bm;
 	sh_c = 1'b0;
 	sh_x = f_x;
 	sh_v = 1'b0;
-	rot  = '0;
 	win  = '0;
 	if (n != 6'd0) begin
 		case (op)
@@ -140,23 +153,16 @@ always_comb begin
 				sh_x = sh_c;
 			end
 			OP_ROL: begin
-				sh_r = ((bm << nm) | (bm >> (nbits - nm))) & szmask;
+				sh_r = rot_o[31:0] & szmask;
 				sh_c = sh_r[0];
 			end
 			OP_ROR: begin
-				sh_r = ((bm >> nm) | (bm << (nbits - nm))) & szmask;
-				sh_c = ((sh_r >> (nbits - 6'd1)) & 32'd1) != 0;
+				sh_r = rot_o[31:0] & szmask;
+				sh_c = sh_r[nbits - 6'd1];
 			end
-			OP_ROXL: begin
-				rot  = ((w << nx) | (w >> (nbits + 6'd1 - nx))) & cmask;
-				sh_x = ((rot >> nbits) & 33'd1) != 0;
-				sh_r = rot[31:0] & szmask;
-				sh_c = sh_x;
-			end
-			default: begin // OP_ROXR
-				rot  = ((w >> nx) | (w << (nbits + 6'd1 - nx))) & cmask;
-				sh_x = ((rot >> nbits) & 33'd1) != 0;
-				sh_r = rot[31:0] & szmask;
+			default: begin // OP_ROXL, OP_ROXR
+				sh_x = rox_o[nbits];
+				sh_r = rox_o[31:0] & szmask;
 				sh_c = sh_x;
 			end
 		endcase

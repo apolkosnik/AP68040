@@ -92,6 +92,13 @@ module ap040_fpu
 	output            pdone,       // the request went into the pipeline this
 	                               // cycle (done, combinationally; done itself
 	                               // pulses only for the state machine)
+	output      [7:0] okv_next,    // the register-ready flags next cycle, and
+	input             sel_x,       // those of src_r/dst_r selected outside
+	input             aok_x,       // into flip-flops, from the registers'
+	input             bok_x,       // next values (else selected here)
+	input       [6:0] opmode_n,    // with sel_x: opmode, op_class and src_fmt
+	input       [2:0] op_class_n,  // as they will be next cycle (the static
+	input       [2:0] src_fmt_n,   // pipeline eligibility is registered)
 	output            pbusy,       // pipelined operations in flight: FPU state
 	                               // (registers, FPSR, condition codes) is not
 	                               // current until they complete
@@ -640,16 +647,31 @@ assign pdone = pipe_issue;
 
 // the youngest writer in flight of register r: 0 none, 1 P1-P4 (wait),
 // 2 P5 (forward from P6), 3 P6 (forward from P7)
+// (from per-register vectors kept alongside the stages: the dispatch
+// feeds pdone, and so the core's stall path -- no destination compares)
+reg   [7:0] pb14, pb5, pb6;   // register r written by P1-P4, P5, P6
 function [1:0] pw;
 	input [2:0] r;
 	begin
-		if ((p1_v && p1_d == r) || (p2_v && p2_d == r) ||
-		    (p3_v && p3_d == r) || (p4_v && p4_d == r)) pw = 2'd1;
-		else if (p5_v && p5_d == r) pw = 2'd2;
-		else if (p6_v && p6_d == r) pw = 2'd3;
+		if (pb14[r]) pw = 2'd1;
+		else if (pb5[r]) pw = 2'd2;
+		else if (pb6[r]) pw = 2'd3;
 		else pw = 2'd0;
 	end
 endfunction
+
+// the pipeline's register writers one cycle on
+wire  [7:0] pb14_n = (pipe_issue ? (8'd1 << dst_r) : 8'd0) | (p1_v ? (8'd1 << p1_d) : 8'd0) |
+                     (p2_v ? (8'd1 << p2_d) : 8'd0) | (p3_v ? (8'd1 << p3_d) : 8'd0);
+wire  [7:0] pb5_n  = p4_v ? (8'd1 << p4_d) : 8'd0;
+wire  [7:0] pb6_n  = p5_v ? (8'd1 << p5_d) : 8'd0;
+
+// okv[r]: register r may be a pipelined operation's operand now -- not
+// being written by P1-P4, and nice (P5's or P6's result as it will be, or
+// the register's own).  Registered from the next state, so the dispatch
+// (pdone, and the core's stall path) selects one flip-flop per operand.
+reg   [7:0] okv;
+reg   [7:0] okv_n;
 
 // P5's result will be nice, decided a stage early (a register: it feeds
 // the dispatch, pdone, and so the core's stall path): its exponent before
@@ -657,6 +679,8 @@ endfunction
 // up to 64 off -- conservative: a result this misses is only not
 // forwarded (the dispatch waits for its write and reads the flag then)
 reg  p5_nice;
+wire p5_nice_n = p4_z || (p4_n ? (p4_e >= 18'sd16388 && p4_e <= 18'sd16442)
+                                : (p4_e >= 18'sd16324 && p4_e <= 18'sd16442));
 
 // the memory operand: single, double or extended; or an integer (long,
 // word, byte) for a move, normalized in P4 as F_NORM does
@@ -713,23 +737,58 @@ wire       q_mem  = (op_class == 3'b010) &&
                      // operation needs its source normalized before P1
                      ((src_fmt == 3'd0 || src_fmt == 3'd4 || src_fmt == 3'd6) &&
                       q_kind == 2'd0));
+// what the operation's words alone decide: it can go into the pipeline
+// (opmode, a register or memory source of a format it takes), its source
+// is memory, it is a move (no destination operand); with sel_x
+// registered from the next words, off the dispatch's path
+function [2:0] q_static;
+	input [6:0] opm;
+	input [2:0] cls, fmt;
+	reg [1:0] k;
+	reg       m;
+	begin
+		k = pipe_kind(opm);
+		m = (cls == 3'b010) && ((fmt == 3'd1 || fmt == 3'd5 || fmt == 3'd2) ||
+		                        ((fmt == 3'd0 || fmt == 3'd4 || fmt == 3'd6) && k == 2'd0));
+		q_static = {pipe_opm(opm) && ((cls == 3'b000) || m), m, k == 2'd0};
+	end
+endfunction
+reg  [2:0] qs_q;
+always @(posedge clk) qs_q <= q_static(opmode_n, op_class_n, src_fmt_n);
+wire [2:0] qs_l = q_static(opmode, op_class, src_fmt);
+wire [2:0] qs   = sel_x ? qs_q : qs_l;
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && sel_x && qs_q != qs_l) begin
+		$display("FAIL: the registered pipeline eligibility %b, the words' %b", qs_q, qs_l);
+		$finish;
+	end
+// synthesis translate_on
+
 wire [1:0] q_aw   = pw(src_r);
 wire [1:0] q_bw   = pw(dst_r);
-wire       q_aok  = q_mem ? din_nice :
-                    (q_aw == 2'd0) ? (fr_valid[src_r] && fr_nice[src_r]) :
-                    (q_aw == 2'd2) ? p5_nice :
-                    (q_aw == 2'd3) ? p6_nice : 1'b0;
-wire       q_bok  = (q_kind == 2'd0) ? 1'b1 :
-                    (q_bw == 2'd0) ? (fr_valid[dst_r] && fr_nice[dst_r]) :
-                    (q_bw == 2'd2) ? p5_nice :
-                    (q_bw == 2'd3) ? p6_nice : 1'b0;
+wire       q_aok  = qs[1] ? din_nice : sel_x ? aok_x : okv[src_r];
+wire       q_bok  = qs[0] ? 1'b1 : sel_x ? bok_x : okv[dst_r];
+assign okv_next = okv_n;
+// (not in FRESTORE's unimplemented-frame cycle at all: the frame's
+// resume decode stays off the dispatch, and with it the core's stall path;
+// a request then goes to the state machine)
 wire pipe_issue = (PIPE != 0) && ce && rq && (fst == F_IDLE) &&
-                  !(frestore_unimp && frestore_resume) &&
+                  !frestore_unimp &&
                   !fstate_unimp && !fstate_e1 && !fstate_busy && !fstate_resig &&
-                  (fpcr[15:8] == 8'd0) && pipe_opm(opmode) &&
-                  (q_reg || q_mem) && q_aok && q_bok;
+                  (fpcr[15:8] == 8'd0) && qs[2] && q_aok && q_bok;
 
 // synthesis translate_off
+always @(posedge clk) begin : pb_check
+	integer r;
+	for (r = 0; r < 8; r = r + 1)
+		if (nreset && (pb14[r] != ((p1_v && p1_d == r) || (p2_v && p2_d == r) ||
+		                           (p3_v && p3_d == r) || (p4_v && p4_d == r)) ||
+		               pb5[r] != (p5_v && p5_d == r) || pb6[r] != (p6_v && p6_d == r))) begin
+			$display("FAIL: pipe writer vectors disagree with the stages (r %0d)", r);
+			$finish;
+		end
+end
 always @(posedge clk)
 	if (ce && rq && q_mem && din_nice !== q_n) begin
 		$display("FAIL: din_nice %b, the operand classifies as %b (fmt %0d din %h)",
@@ -754,10 +813,15 @@ end
 always @(posedge clk) begin
 	if (!nreset) begin
 		p1_v <= 0; p2_v <= 0; p3_v <= 0; p4_v <= 0; p5_v <= 0; p6_v <= 0; p7_v <= 0;
+		pb14 <= 8'd0; pb5 <= 8'd0; pb6 <= 8'd0; okv <= 8'd0;
 	end
 	else if (ce) begin
 		//----------------------------------------------------------- dispatch
 		p1_v <= pipe_issue;
+		pb14 <= pb14_n;
+		pb5  <= pb5_n;
+		pb6  <= pb6_n;
+		okv  <= okv_n;
 		if (pipe_issue) begin
 			p1_op <= opmode;
 			p1_d  <= dst_r;
@@ -914,8 +978,7 @@ always @(posedge clk) begin
 		p5_e  <= p4_e;
 		p5_m  <= p4_m;
 		p5_g  <= p4_g;
-		p5_nice <= p4_z || (p4_n ? (p4_e >= 18'sd16388 && p4_e <= 18'sd16442)
-		                         : (p4_e >= 18'sd16324 && p4_e <= 18'sd16442));
+		p5_nice <= p5_nice_n;
 		if (p4_n) begin : p4_norm
 			reg [6:0]  lz;
 			reg [66:0] nv;
@@ -1002,6 +1065,39 @@ wire [79:0] fr_bank_wd = p6_v ? {p6_s, p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 :
                          fr_wb_we ? {a_s, fr_wb_e, fr_wb_m} :
                                     {fm_wdata[95], fm_wdata[94:80],
                                      fm_wdata[63:0]};
+
+// okv one cycle on: the writers' next state, P5's niceness as it is
+// decided, P6's as it moves on, and the register file's flags after this
+// cycle's write (every write makes the register valid) or FRESTORE NULL
+always @* begin : okv_nx
+	integer r;
+	reg wnice;
+	wnice = nice_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
+	for (r = 0; r < 8; r = r + 1)
+		okv_n[r] = pb14_n[r] ? 1'b0 :
+		           pb5_n[r]  ? p5_nice_n :
+		           pb6_n[r]  ? p5_nice :
+		           fp_reset  ? 1'b0 :
+		           (fr_bank_we && fr_bank_wa == r) ? wnice :
+		           (fr_valid[r] && fr_nice[r]);
+end
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && sel_x && (aok_x != okv[src_r] || bok_x != okv[dst_r])) begin
+		$display("FAIL: the outside selection of okv %b%b, src %0d dst %0d: %b%b",
+		         aok_x, bok_x, src_r, dst_r, okv[src_r], okv[dst_r]);
+		$finish;
+	end
+always @(posedge clk) begin : okv_check
+	integer r;
+	for (r = 0; r < 8; r = r + 1)
+		if (nreset && okv[r] != (pw(r) == 2'd1 ? 1'b0 : pw(r) == 2'd2 ? p5_nice :
+		                         pw(r) == 2'd3 ? p6_nice : (fr_valid[r] && fr_nice[r]))) begin
+			$display("FAIL: okv[%0d] %b disagrees with the pipeline and register flags", r, okv[r]);
+			$finish;
+		end
+end
+// synthesis translate_on
 
 // synthesis translate_off
 always @(posedge clk)
@@ -2238,10 +2334,14 @@ always @(posedge clk) begin
 					end
 					4'd2: begin : bin_mul
 						reg [63:0] am_eff, bm_eff;
-						am_eff = (r_op == 7'h27) ?
-						         (a_m & 64'hFFFF_FF00_0000_0000) : a_m;
-						bm_eff = (r_op == 7'h27) ?
-						         (b_m & 64'hFFFF_FF00_0000_0000) : b_m;
+						reg        chop, a_p2, b_p2;
+						chop   = (r_op == 7'h27);
+						am_eff = chop ? (a_m & 64'hFFFF_FF00_0000_0000) : a_m;
+						bm_eff = chop ? (b_m & 64'hFFFF_FF00_0000_0000) : b_m;
+						// an exact power of two (after the chop): the compare
+						// in parts on the operand, beside the chop's select
+						a_p2 = (a_m[63:40] == 24'h80_0000) && (chop || a_m[39:0] == 40'd0);
+						b_p2 = (b_m[63:40] == 24'h80_0000) && (chop || b_m[39:0] == 40'd0);
 						// Latch chopped operands before testing the fast path.  The
 						// old code used nonblocking masks and then immediately
 						// tested the unmasked values, bypassing the chop.
@@ -2277,11 +2377,10 @@ always @(posedge clk) begin
 							a_s <= a_s ^ b_s;
 							e_w <= $signed({a_e[16], a_e}) +
 							       $signed({b_e[16], b_e}) - 18'sd16383;
-							if (am_eff == 64'h8000_0000_0000_0000 ||
-							    bm_eff == 64'h8000_0000_0000_0000) begin
+							if (a_p2 || b_p2) begin
 								// Multiplication by an exact power of two only changes
 								// sign/exponent and needs no iterative multiply.
-								a_m <= (am_eff == 64'h8000_0000_0000_0000) ? bm_eff : am_eff;
+								a_m <= a_p2 ? bm_eff : am_eff;
 								grs <= 0;
 								fst <= F_ROUND;
 							end

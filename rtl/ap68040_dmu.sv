@@ -76,6 +76,8 @@ module ap68040_dmu
 	output logic        dm_hold1,       // DC1 must hold (the engine owns its ports)
 	output logic        dc2_rdy,
 	output logic [31:0] ldata,
+	output logic [31:0] ldata_al,       // the aligned long (or word, low half)
+	output logic        ldata_alv,      // ... is the load's data
 	output logic        fault,
 	output logic  [7:0] fvec,
 	output logic [31:0] faddr,
@@ -275,6 +277,10 @@ endfunction
 //--------------------------------------------------------------------------
 logic [3:0]  lv  [64];             // line valid, per set and way
 logic        ld  [64][4];          // dirty [set][way] (the push writes the whole line)
+// the maintenance scan's set, its valid and dirty bits: a copy the write
+// port keeps current (the scan's decision reads 4 bits, not 256)
+logic  [5:0] sc_set;
+logic  [3:0] sc_lv, sc_ld;
 logic [1:0]  rrc;                  // replacement counter
 
 // lookup ports: DC1, or the engine while it holds DC1
@@ -754,6 +760,7 @@ always_ff @(posedge clk) begin
 		pv_v <= 1'b0; pv_line <= '0; pv_lpa <= '0; pv_dirty <= 1'b0; pv_tln <= '0;
 		mv_line <= '0;
 		ms_i <= '0;
+		sc_set <= '0; sc_lv <= '0; sc_ld <= '0;
 		tw_lvl <= TW_ROOT; tw_va <= '0; tw_s <= 1'b0; tw_wr <= 1'b0; tw_pt <= 1'b0;
 		tw_i <= 1'b0; tw_da <= '0; tw_d <= '0; tw_wp <= 1'b0; tw_fail <= 1'b0;
 		tw_berr <= 1'b0; tw_pd <= '0;
@@ -1341,16 +1348,22 @@ always_ff @(posedge clk) begin
 			tset_b <= ms_i[7:2];
 			steal  <= 1'b1;
 			st_set <= ms_i[7:2];
+			sc_set <= ms_i[7:2];
 			e_st   <= E_M_SCANW;
 		end
-		E_M_SCANW: e_st <= E_M_SCAN2;
+		E_M_SCANW: begin
+			// (a write this cycle reaches the copy at the write port)
+			sc_lv <= lv[sc_set];
+			for (int j = 0; j < 4; j++) sc_ld[j] <= ld[sc_set][j];
+			e_st <= E_M_SCAN2;
+		end
 		E_M_SCAN2: begin
 			logic [5:0] s; logic [1:0] w; logic m;
 			s = ms_i[7:2]; w = ms_i[1:0];
-			m = lv[s][w] && ((mt_scope == 2'd3) ||
+			m = sc_lv[w] && ((mt_scope == 2'd3) ||
 			                 (mt_scope == 2'd1 && tq_b[w] == mt_addr[31:10]) ||
 			                 (mt_scope == 2'd2 && tq_b[w][21:2] == mt_addr[31:12]));
-			if (m && mt_op == MT_CPUSH && ld[s][w]) begin
+			if (m && mt_op == MT_CPUSH && sc_ld[w]) begin
 				// push (it is invalidated with the push)
 				f_set  <= s;
 				f_way  <= w;
@@ -1884,16 +1897,29 @@ always_ff @(posedge clk) begin
 				lv[i] <= 4'd0;
 				for (int j = 0; j < 4; j++) ld[i][j] <= 1'b0;
 			end
+			sc_lv <= 4'd0;
+			sc_ld <= 4'd0;
 		end
 		else begin
 			for (int j = 0; j < 4; j++)
 				if (vp_wm[j]) begin
 					if (vp_lwe) lv[vp_set][j] <= vp_lv;
 					if (vp_dwe) ld[vp_set][j] <= vp_dv;
+					if (vp_lwe && vp_set == sc_set) sc_lv[j] <= vp_lv;
+					if (vp_dwe && vp_set == sc_set) sc_ld[j] <= vp_dv;
 				end
 		end
 	end
 end
+
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && e_st == E_M_SCAN2 &&
+	    (sc_lv != lv[sc_set] || sc_ld != {ld[sc_set][3], ld[sc_set][2], ld[sc_set][1], ld[sc_set][0]})) begin
+		$display("FAIL: the scan's valid/dirty copy %b %b, the set's %b", sc_lv, sc_ld, lv[sc_set]);
+		$finish;
+	end
+// synthesis translate_on
 
 // snoop: the line found, valid with sn_look (the RAM still reads the
 // snooped set in the first H cycle)
@@ -1907,6 +1933,15 @@ assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DE
 // once the engine has taken the DC2 uop, only its completion releases it
 assign dc2_rdy = !m2.r.v || e_dc2_done || (!e_job && (fast_now || st_simple));
 assign ldata   = e_dc2_done ? e_ldata : fast_data;
+// for AG's capture of a load into a base or index (a short path): the long
+// word of the line the address points at -- the operand itself for an
+// aligned long or an even word (in the low half), else not offered
+wire [31:0] al_word = dq_r[m2.x.way][127 - 32 * m2.r.a[3:2] -: 32];
+assign ldata_al  = e_dc2_done ? e_ldata :
+                   (m2.r.msz == SZ_W) ? {16'd0, m2.r.a[1] ? al_word[15:0] : al_word[31:16]} : al_word;
+assign ldata_alv = e_dc2_done ||
+                   (m2.r.msz == SZ_L && m2.r.a[1:0] == 2'd0) ||
+                   (m2.r.msz == SZ_W && !m2.r.a[0]);
 assign fault   = e_dc2_done && e_flt;
 assign fvec    = 8'd2;
 assign faddr   = e_faddr;

@@ -59,6 +59,12 @@ module ap68040_fpif
 	input  logic  [7:0] immb,           // operand B constant
 	input  logic [31:0] av,
 	input  logic [31:0] bv,
+	input  logic [15:0] aw,             // av, bv without the memory operand
+	input  logic [15:0] bw,             // (CHK's words: registers, no mux)
+	input  logic [15:0] dw_a,           // the same words of the uop entering
+	input  logic [15:0] dw_b,           // EX (DC2's), and EX not holding
+	input  logic        dw_ld,          // (DC2 moving on or EX emptying: the
+	                                    // decode is of the uop EX has next)
 	input  logic [31:0] latch,
 	input  logic [31:0] ea,             // the uop's EA (EAL)
 	input  logic [31:0] pc,
@@ -203,6 +209,8 @@ endfunction
 logic        f_req, f_crwe, f_iawe, f_bsun, f_fmwe, f_rst;
 logic        f_fsave_ack, f_rest_idle, f_rest_unimp, f_pendcap;
 logic  [2:0] f_class, f_fmt, f_srcr, f_dstr, f_fmsel;
+logic  [7:0] f_okvn;          // the FPU's register-ready flags, next cycle
+logic        f_aok, f_bok;    // ... of the next source and destination
 logic  [6:0] f_opm;
 logic [95:0] f_din, f_fmwd;
 logic        f_dnice;          // f_din is an ordinary operand (the FPU pipeline)
@@ -245,6 +253,8 @@ ap040_fpu fpu (
 	.ia_we(f_iawe), .ia_wdata(f_iapc),
 	.fm_sel(f_fmsel), .fm_we(f_fmwe), .fm_wdata(f_fmwd), .fm_rdata(f_fmrd),
 	.fpu_used(f_used), .pbusy(f_pbusy), .pdone(f_pdone),
+	.okv_next(f_okvn), .sel_x(1'b1), .aok_x(f_aok), .bok_x(f_bok),
+	.opmode_n(n_opm), .op_class_n(n_class), .src_fmt_n(n_fmt),
 	.fstate_unimp(s_unimp),
 	.fstate_cmd1(s_cmd1), .fstate_cmd3(s_cmd3),
 	.fstate_stag(s_stag), .fstate_dtag(s_dtag), .fstate_flags(s_flags),
@@ -289,8 +299,8 @@ logic  [1:0] sv_kind;          // FSAVE frame: 0 NULL, 1 IDLE, 2 UNIMP, 3 BUSY
 logic  [1:0] rs_kind;          // FRESTORE frame, same codes
 
 // the words decoded: CHK's own, else the latched ones
-wire [15:0] opw = (sub == FC_CHK) ? bv[15:0] : opw_q;
-wire [15:0] ext = (sub == FC_CHK) ? av[15:0] : ext_q;
+wire [15:0] opw = (sub == FC_CHK) ? bw : opw_q;
+wire [15:0] ext = (sub == FC_CHK) ? aw : ext_q;
 wire  [2:0] eam = opw[5:3];
 wire  [2:0] ear = opw[2:0];
 wire  [2:0] ocl = ext[15:13];
@@ -315,49 +325,81 @@ wire  [2:0] crl      = (ext[12:10] == 3'd0) ? 3'b001 : ext[12:10];
 //--------------------------------------------------------------------------
 // CHK: the encoding faults, in the 68040's order (old core S_FPU_DEC)
 //--------------------------------------------------------------------------
-logic chk_x, chk_ill, chk_un, chk_ia;
-always_comb begin
+// (a function of the two words: CHK's are immediates, known in DC2, so the
+// decode is registered as the uop enters EX -- off the hold and exception
+// paths; the live decode checks it in simulation)
+function automatic logic [5:0] chk_dec(input logic [15:0] ow, input logic [15:0] ew);
 	logic [1:0] oc;
-	chk_x = 1'b0; chk_ill = 1'b0; chk_un = 1'b0; chk_ia = 1'b0;
-	oc = opmode_class(opm);
-	if (is_gen) case (ocl)
+	logic [2:0] em, er, ol, fm, cl;
+	logic       dn, an, pi, pd, im, pc, dalt, x, ill, un, ia;
+	em = ow[5:3]; er = ow[2:0];
+	ol = ew[15:13]; fm = ew[12:10];
+	cl = (ew[12:10] == 3'd0) ? 3'b001 : ew[12:10];
+	dn = (em == 3'd0); an = (em == 3'd1); pi = (em == 3'd3); pd = (em == 3'd4);
+	im = (em == 3'd7) && (er == 3'd4);
+	pc = (em == 3'd7) && (er == 3'd2 || er == 3'd3);
+	dalt = (em >= 3'd2) && !(em == 3'd7 && er >= 3'd2);
+	x = 1'b0; ill = 1'b0; un = 1'b0; ia = 1'b0;
+	oc = opmode_class(ew[6:0]);
+	if (ow[15:6] == 10'b1111_0010_00) case (ol)
 		3'b000: begin
-			if (oc == 2'd1) chk_x = 1'b1;
-			else if (oc == 2'd2) begin chk_x = 1'b1; chk_ill = 1'b1; end
+			if (oc == 2'd1) x = 1'b1;
+			else if (oc == 2'd2) begin x = 1'b1; ill = 1'b1; end
 		end
-		3'b001: chk_x = 1'b1;
+		3'b001: x = 1'b1;
 		3'b010: begin
-			if (fmt != 3'd7 && oc == 2'd1) chk_x = 1'b1;
-			else if (fmt != 3'd7 && oc == 2'd2) begin chk_x = 1'b1; chk_ill = 1'b1; end
-			else if (fmt == 3'd7) ;
-			else if (ea_dn && fp_bytes(fmt) > 4'd4) begin
+			if (fm != 3'd7 && oc == 2'd1) x = 1'b1;
+			else if (fm != 3'd7 && oc == 2'd2) begin x = 1'b1; ill = 1'b1; end
+			else if (fm == 3'd7) ;
+			else if (dn && fp_bytes(fm) > 4'd4) begin
 				// an unimplemented Dn source format records FPIAR first;
 				// a software opmode reports through the FPSP route
-				chk_x = 1'b1; chk_ia = 1'b1;
-				chk_un = !(op_in_hw(opm) || fmt == 3'd3);
+				x = 1'b1; ia = 1'b1;
+				un = !(op_in_hw(ew[6:0]) || fm == 3'd3);
 			end
-			else if (ea_an) begin
-				chk_x = 1'b1; chk_ia = 1'b1; chk_un = !op_in_hw(opm);
+			else if (an) begin
+				x = 1'b1; ia = 1'b1; un = !op_in_hw(ew[6:0]);
 			end
 		end
 		3'b011: begin
-			if (ea_dn) begin
-				if (!(fmt == 3'd3 || fmt == 3'd7) && fp_bytes(fmt) > 4'd4) chk_x = 1'b1;
+			if (dn) begin
+				if (!(fm == 3'd3 || fm == 3'd7) && fp_bytes(fm) > 4'd4) x = 1'b1;
 			end
-			else if (!ea_dalt) chk_x = 1'b1;
+			else if (!dalt) x = 1'b1;
 		end
 		3'b100, 3'b101: begin
-			if (ea_dn && !(crl == 3'b100 || crl == 3'b010 || crl == 3'b001)) chk_x = 1'b1;
-			else if (ea_an && crl != 3'b001) chk_x = 1'b1;
-			else if (ext[13] && (ea_imm || ea_pcrel)) chk_x = 1'b1;
+			if (dn && !(cl == 3'b100 || cl == 3'b010 || cl == 3'b001)) x = 1'b1;
+			else if (an && cl != 3'b001) x = 1'b1;
+			else if (ew[13] && (im || pc)) x = 1'b1;
 		end
 		default: begin   // FMOVEM data registers
-			if (eam < 3'd2 || ea_imm) chk_x = 1'b1;
-			else if (ext[13] && (ea_pi || ea_pcrel)) chk_x = 1'b1;
-			else if (!ext[13] && ea_pd) chk_x = 1'b1;
+			if (em < 3'd2 || im) x = 1'b1;
+			else if (ew[13] && (pi || pc)) x = 1'b1;
+			else if (!ew[13] && pd) x = 1'b1;
 		end
 	endcase
-end
+	// with FSAVE/FRESTORE (CHK's pending rule) and the conditionals
+	chk_dec = {x, ill, un, ia,
+	           (ow[15:7] == 9'b1111_0011_0),
+	           (ow[15:6] == 10'b1111_0010_01)};
+endfunction
+logic [5:0] cq;                 // chk_dec of the uop in EX (CHK's words)
+always_ff @(posedge clk)
+	if (!nreset) cq <= '0;
+	else if (dw_ld) cq <= chk_dec(dw_b, dw_a);
+wire chk_x   = cq[5];
+wire chk_ill = cq[4];
+wire chk_un  = cq[3];
+wire chk_ia  = cq[2];
+wire chk_fs  = cq[1];           // FSAVE or FRESTORE
+wire chk_cc  = cq[0];           // FScc FDBcc FTRAPcc
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && sub == FC_CHK && cq != chk_dec(bw, aw)) begin
+		$display("FAIL: fpif: CHK's registered decode %b, its words decode %b", cq, chk_dec(bw, aw));
+		$finish;
+	end
+// synthesis translate_on
 
 // FMOVEM slot -> list bit -> register
 function automatic logic [2:0] slot_bit(input logic [2:0] k, input logic lsb);
@@ -448,7 +490,7 @@ endfunction
 //--------------------------------------------------------------------------
 // the uop in EX
 //--------------------------------------------------------------------------
-wire chk_pend = pend && !is_fsave && !is_frest;   // FSAVE/FRESTORE: their own rules
+wire chk_pend = pend && !chk_fs;     // (CHK's) FSAVE/FRESTORE: their own rules
 // uops with no FPU side effect need not wait to be the oldest: GET reads
 // the latched result; END of an instruction with no store exception
 // pending and not FSAVE/FRESTORE does nothing (a fault of an older uop
@@ -600,6 +642,43 @@ end
 //--------------------------------------------------------------------------
 wire act = ex_v && (safe || nosafe);
 
+// the source and destination registers as they will be next cycle (CHK
+// with DISP, DISP, the MVR read): the FPU's register-ready flags are
+// selected by them ahead, into flip-flops (f_aok, f_bok), so its dispatch
+// -- pdone, and with it the core's stall path -- starts from those
+// (and the operation's class, opmode and format: the FPU registers whether
+// the request can go into its pipeline from them, a cycle ahead)
+logic [2:0] n_srcr, n_dstr, n_class, n_fmt;
+logic [6:0] n_opm;
+always_comb begin
+	n_srcr  = f_srcr;
+	n_dstr  = f_dstr;
+	n_class = f_class;
+	n_opm   = f_opm;
+	n_fmt   = f_fmt;
+	if (!nreset) begin
+		n_srcr = '0; n_dstr = '0; n_class = '0; n_opm = '0; n_fmt = '0;
+	end
+	else if (act) case (sub)
+		FC_CHK: if (fuse && !go && !(bg && !f_end) && !chk_pend && !chk_x) begin
+			n_srcr  = ext[12:10];
+			n_dstr  = ext[9:7];
+			n_class = ocl;
+			n_opm   = opm;
+			n_fmt   = fmt;
+		end
+		FC_DISP: if (!go) begin
+			n_srcr  = (ocl == 3'b011) ? ext[9:7] : ext[12:10];
+			n_dstr  = ext[9:7];
+			n_class = ocl;
+			n_opm   = opm;
+			n_fmt   = fmt;
+		end
+		FC_MVR: if (!mvr_wait) n_srcr = cur_reg;
+		default: ;
+	endcase
+end
+
 always_ff @(posedge clk) begin
 	if (!nreset) begin
 		opw_q <= '0; ext_q <= '0;
@@ -612,6 +691,7 @@ always_ff @(posedge clk) begin
 		f_req <= 1'b0; f_crwe <= 1'b0; f_iawe <= 1'b0; f_bsun <= 1'b0; f_fmwe <= 1'b0; f_rst <= 1'b0;
 		f_fsave_ack <= 1'b0; f_rest_idle <= 1'b0; f_rest_unimp <= 1'b0; f_pendcap <= 1'b0;
 		f_class <= '0; f_fmt <= '0; f_srcr <= '0; f_dstr <= '0; f_fmsel <= '0; f_opm <= '0;
+		f_aok <= 1'b0; f_bok <= 1'b0;
 		f_din <= '0; f_dnice <= 1'b0; f_fmwd <= '0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
 		r_cmd1 <= '0; r_cmd3 <= '0; r_stag <= '0; r_dtag <= '0; r_flags <= '0; r_grs <= '0;
 		r_fpt <= '0; r_et <= '0; r_wbt <= '0; r_fpiar <= '0; r_cusavepc <= '0;
@@ -633,6 +713,14 @@ always_ff @(posedge clk) begin
 			f_pendcap <= 1'b1;
 		end
 
+		f_srcr  <= n_srcr;
+		f_dstr  <= n_dstr;
+		f_class <= n_class;
+		f_opm   <= n_opm;
+		f_fmt   <= n_fmt;
+		f_aok  <= f_okvn[n_srcr];
+		f_bok  <= f_okvn[n_dstr];
+
 		if (act) case (sub)
 			FC_CHK: if (fuse && !go && !(bg && !f_end) && !chk_pend && !chk_x) begin
 				// FPm to FPn: CHK's latching and DISP's request at once
@@ -646,11 +734,6 @@ always_ff @(posedge clk) begin
 				f_req   <= 1'b1;
 				f_iawe  <= 1'b1;
 				f_iapc  <= pc;
-				f_class <= ocl;
-				f_opm   <= opm;
-				f_fmt   <= fmt;
-				f_srcr  <= ext[12:10];
-				f_dstr  <= ext[9:7];
 				f_din   <= din_of(fmt, av, bv, latch);
 				f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
 				fresh   <= 1'b1;
@@ -674,7 +757,7 @@ always_ff @(posedge clk) begin
 				if (chk_pend) pend <= 1'b0;
 				// FScc FDBcc FTRAPcc record FPIAR once decoded; so do the
 				// encodings that fault after recording it
-				else if ((is_cc || (chk_x && chk_ia))) begin
+				else if ((chk_cc || (chk_x && chk_ia))) begin
 					f_iawe <= 1'b1;
 					f_iapc <= pc;
 				end
@@ -690,14 +773,8 @@ always_ff @(posedge clk) begin
 					f_req   <= 1'b1;
 					f_iawe  <= 1'b1;
 					f_iapc  <= pc;
-					f_class <= ocl;
-					f_opm   <= opm;
-					f_fmt   <= fmt;
-					f_srcr  <= (ocl == 3'b011) ? ext[9:7] : ext[12:10];
-					f_dstr  <= ext[9:7];
 					f_din   <= din_of(fmt, av, bv, latch);
 					f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
-				f_dnice <= nice_mem(din_of(fmt, av, bv, latch), fmt);
 				end
 				else if (ocl == 3'b011) begin
 					if (f_unimp || f_unsupp || f_done) begin
@@ -750,7 +827,6 @@ always_ff @(posedge clk) begin
 			FC_MVR: begin
 				if (!mvr_wait) begin
 					// the raw image comes through the source-register port
-					f_srcr   <= cur_reg;
 					mvr_wait <= 1'b1;
 				end
 				else if (adv) begin

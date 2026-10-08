@@ -320,7 +320,7 @@ logic [31:0] x_chunk;
 // serializes and refetches), so F1 starts from them
 logic        f1_tt0, f1_tt1;
 always_comb begin
-	logic tt0, tt1;
+	logic tt0, tt1, use_t;
 	logic [21:0] tg;
 	x_ok = 1'b0; x_flt = 1'b0; x_walk = 1'b0;
 	x_pa = f1_pc; x_cm = 2'b00; x_upa = 2'b00;
@@ -342,13 +342,20 @@ always_comb begin
 	end
 	else x_walk = 1'b1;
 	x_cach = x_ok && ic_en && !x_cm[1];
-	tg     = x_pa[31:10];
+	// the tags compare with both candidate addresses, the logical one (a
+	// TTR or no translation) and the ATC's, and the translation selects
+	// the outcome: it stays off the front of the compare (the ATC's
+	// address matters only with a hit, x_cach is clear without one)
+	use_t  = !(tt0 || tt1) && tc_e;
+	tg     = {f1_e.pa[19:1], tc_p ? f1_pc[12] : f1_e.pa[0], f1_pc[11:10]};
 	x_hit  = 1'b0;
 	x_way  = 2'd0;
 	for (int i = 3; i >= 0; i--)
-		if (iv[f1_pc[9:4]][i] && ct[i][21:0] == tg) begin x_hit = 1'b1; x_way = 2'(i); end
+		if (iv[f1_pc[9:4]][i] && (use_t ? (ct[i][21:0] == tg) : (ct[i][21:0] == f1_pc[31:10]))) begin
+			x_hit = 1'b1; x_way = 2'(i);
+		end
 	x_hit  = x_hit && x_cach;
-	x_lb   = x_cach && lb_v && lb_pa == x_pa[31:4];
+	x_lb   = x_cach && lb_v && (use_t ? (lb_pa == {tg, f1_pc[9:4]}) : (lb_pa == f1_pc[31:4]));
 	x_chunk = x_lb ? m_line[127 - 32 * f1_pc[3:2] -: 32]
 	               : cd[x_way][127 - 32 * f1_pc[3:2] -: 32];
 end

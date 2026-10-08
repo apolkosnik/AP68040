@@ -86,9 +86,18 @@ logic [3:0] hv;
 always_comb begin
 	for (int i = 0; i < 4; i++) hv[i] = v[lset][i] && tag_eq(s[i], la, fc2, p8k);
 	hit = |hv;
-	ent = s[0].e;
-	for (int i = 3; i >= 0; i--) if (hv[i]) ent = s[i].e;
+	// at most one way holds a page (install reuses its way): AND-OR, no
+	// priority chain
+	ent = '0;
+	for (int i = 0; i < 4; i++) ent = ent | (hv[i] ? s[i].e : '0);
 end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && !$onehot0(hv)) begin
+		$display("FAIL: ATC: more than one way hits (set %0d, ways %b)", lset, hv);
+		$finish;
+	end
+// synthesis translate_on
 
 // install way: the same page if present (an M-bit update), else invalid, else rr
 logic [1:0] wway;

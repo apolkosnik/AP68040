@@ -14,6 +14,9 @@ echo "set_global_assignment -name SDC_FILE ooc.sdc"
 echo "set_global_assignment -name OPTIMIZATION_MODE \"HIGH PERFORMANCE EFFORT\""
 echo "set_global_assignment -name NUM_PARALLEL_PROCESSORS 4"
 echo "set_global_assignment -name OPTIMIZE_HOLD_TIMING \"ALL PATHS\""
+# register retiming off: with it on, the fitter adds ~6,000 registers
+# (13,000 retiming moves); the core is closed at 60 MHz without it
+echo "set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF"
 echo "set_instance_assignment -name VIRTUAL_PIN ON -to *"
 [ -n "$SEED" ] && echo "set_global_assignment -name SEED $SEED"
 for f in "$@"; do
