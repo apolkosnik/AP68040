@@ -74,6 +74,7 @@ module ap68040_fetch
 	output logic  [7:0] win_bt,       // ... ends a branch the BTB took
 	output logic [31:0] bt_tgt,       // the target of the first such word
 	output pd_t         pd0,          // predecode of win[0]
+	output pd_t         pd0_n,        // ... as it will be next cycle
 	output logic  [3:0] qcnt,         // words available in win (0..8)
 	output logic [31:0] qpc,
 	input  logic  [2:0] consume,
@@ -162,6 +163,9 @@ assign qcnt  = (cnt > 5'd8) ? 4'd8 : cnt[3:0];
 assign qpc   = qpc_r;
 assign q_odd = odd;
 assign pd0   = qp0;
+// the head's predecode as it will be next cycle (qp0's load): D1's
+// attribute ROM reads it a cycle ahead
+assign pd0_n = (cnt == {2'b00, consume}) ? f3_p[0] : qpr[qwrap(5'(qh) + {2'b00, consume})];
 function automatic logic [3:0] qwrap(input logic [4:0] x);   // x mod QN, x < 2*QN
 	qwrap = (x >= 5'(QN)) ? 4'(x - 5'(QN)) : x[3:0];
 endfunction

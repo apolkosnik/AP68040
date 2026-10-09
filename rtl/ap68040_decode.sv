@@ -39,6 +39,7 @@ module ap68040_decode
 	input  logic  [7:0] win_bt,       // the word ends a branch the fetch BTB took
 	input  logic [31:0] bt_tgt,       // its target (the first flagged word's)
 	input  pd_t         pd0,
+	input  pd_t         pd0_n,         // pd0 next cycle (the attribute ROM's address)
 	input  logic  [3:0] qcnt,
 	input  logic [31:0] qpc,
 	input  logic        q_odd,
@@ -222,8 +223,20 @@ endfunction
 //--------------------------------------------------------------------------
 // the instruction at the head: attributes of its decoder entry
 //--------------------------------------------------------------------------
+// the head's attributes: a ROM (block RAM) read with the head's entry a
+// cycle ahead, so it lines up with pd0 -- not a 276-entry table in logic
 pla_t a0;
-always_comb a0 = ent_attr(pd0.ent, pd0.legal);
+pla_t a0_r;
+always_ff @(posedge clk) a0_r <= ent_attr(pd0_n.ent, 1'b1);
+always_comb a0 = pd0.legal ? a0_r : '0;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && a0 != ent_attr(pd0.ent, pd0.legal)) begin
+		$display("FAIL: decode: the attribute ROM's %h, the table's %h (entry %0d)",
+		         a0, ent_attr(pd0.ent, pd0.legal), pd0.ent);
+		$finish;
+	end
+// synthesis translate_on
 wire [15:0] opw = win[0];
 
 //--------------------------------------------------------------------------
