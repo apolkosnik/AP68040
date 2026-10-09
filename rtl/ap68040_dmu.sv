@@ -126,7 +126,6 @@ module ap68040_dmu
 	input  logic        ic_inv_done,
 	output logic        iatc_flush_all,
 	output logic        iatc_flush_page,
-	output logic        iatc_flush_pre,  // the cycle before iatc_flush_page
 	output logic        iatc_flush_ng,
 	output logic [31:0] iatc_flush_la,
 	output logic        iatc_flush_fc2,
@@ -436,14 +435,10 @@ logic        atc_wfc2;
 atce_t       atc_went;
 logic        atc_fall, atc_fpage, atc_fng;
 
-// (its RAM reads next cycle's lookup: the engine's stolen address, AG's
-// as it enters DC1, else DC1's again -- as the cache tags do; a lookup
-// the RAM did not read misses, and DC1 takes the slow path)
 ap68040_atc datc (
 	.clk(clk), .nreset(nreset), .p8k(tc_p),
-	.la_n(steal ? st_la : adv_ag ? dm_va : m1.a),
 	.la(steal ? st_la : m1.a), .fc2(steal ? st_fc2 : m1.smode),
-	.hit(atc_hit), .ent(atc_e), .stale(),
+	.hit(atc_hit), .ent(atc_e),
 	.wr(atc_wr), .wla(atc_wla), .wfc2(atc_wfc2), .went(atc_went),
 	.flush_all(atc_fall), .flush_page(atc_fpage), .flush_nonglobal(atc_fng)
 );
@@ -788,7 +783,6 @@ always_ff @(posedge clk) begin
 	atc_fpage <= 1'b0;
 	iatc_flush_all  <= 1'b0;
 	iatc_flush_page <= 1'b0;
-	iatc_flush_pre  <= 1'b0;
 	iatc_wr   <= 1'b0;
 	tw_b      <= 1'b0;
 	dw        <= 1'b0;
@@ -1349,7 +1343,6 @@ always_ff @(posedge clk) begin
 						st_fc2 <= mt_fc[2];
 						iatc_flush_la  <= mt_addr;
 						iatc_flush_fc2 <= mt_fc[2];
-						iatc_flush_pre <= 1'b1;   // the I-ATC reads the page's set
 						e_st <= E_M_PG;
 					end
 				end

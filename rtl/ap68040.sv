@@ -271,7 +271,7 @@ ap68040_dmu dmu (
 	.iw_req(iw_req), .iw_va(iw_va), .iw_fc2(iw_fc2), .iw_done(iw_done), .iw_ent(),
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
-	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page), .iatc_flush_pre(iatc_flush_pre),
+	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page),
 	.iatc_flush_ng(iatc_flush_ng), .iatc_flush_la(iatc_flush_la),
 	.iatc_flush_fc2(iatc_flush_fc2), .iatc_wr(iatc_wr), .iatc_wla(iatc_wla),
 	.iatc_wfc2(iatc_wfc2), .iatc_went(iatc_went),
@@ -291,7 +291,6 @@ logic        ic_inv, ic_inv_done;
 logic  [1:0] ic_inv_scope;
 logic [31:0] ic_inv_pa;
 logic        iatc_flush_all, iatc_flush_page, iatc_flush_ng, iatc_flush_fc2;
-logic        iatc_flush_pre;
 logic [31:0] iatc_flush_la;
 logic        iatc_wr, iatc_wfc2;
 logic [31:0] iatc_wla;
@@ -337,7 +336,7 @@ ap68040_fetch fetch (
 	.d_ras(d_ras), .d_ras_tp(d_ras_tp), .d_ras_n(d_ras_n),
 	.iw_req(iw_req), .iw_va(iw_va), .iw_fc2(iw_fc2), .iw_done(iw_done),
 	.iatc_wr(iatc_wr), .iatc_wla(iatc_wla), .iatc_wfc2(iatc_wfc2), .iatc_went(iatc_went),
-	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page), .iatc_flush_pre(iatc_flush_pre),
+	.iatc_flush_all(iatc_flush_all), .iatc_flush_page(iatc_flush_page),
 	.iatc_flush_ng(iatc_flush_ng), .iatc_flush_la(iatc_flush_la),
 	.iatc_flush_fc2(iatc_flush_fc2),
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),

@@ -7,21 +7,14 @@
 // pages) or LA16-13 (8K pages).  The tag is FC2 and the logical page; the  //
 // entry holds the physical page and the page attributes.  Valid and global //
 // bits are flip-flops (PFLUSHA/PFLUSHAN in one cycle); tags and entries    //
-// are in block RAM, one true-dual-port RAM per way.                         //
+// are MLAB (asynchronous read).                                            //
 //                                                                          //
-// Lookup: the RAM registers la_n, the address the caller will look up the  //
-// next cycle; la/fc2 are that cycle's address, compared here with the four //
-// ways and the hit way's entry returned.  A lookup whose set the RAM did   //
-// not read (la_n was another address) misses: a wrong address can cost a  //
-// lookup, never give a hit.  A way an install wrote at the edge its set    //
-// was read gives the entry written (the RAM's output is undefined then).   //
-//                                                                          //
-// Install: two cycles.  wr registers the page and reads its set through   //
-// port B; the next cycle picks the way -- an existing entry for the same  //
-// page, else the first invalid way, else the way a 2-bit counter points   //
-// to (the counter advances on every fill of a full set) -- and writes it.  //
-// PFLUSH by page compares through the lookup port: the caller presents    //
-// the page as la_n a cycle ahead and as la while flush_page is high.       //
+// Lookup: la/fc2 are the caller's registered address; the four ways are   //
+// compared here and the hit way's entry returned.  Replacement takes an    //
+// existing entry for the same page, else the first invalid way, else the  //
+// way a 2-bit counter points to (the counter advances on every miss fill).//
+// PFLUSH by page reads the set through the lookup port: the caller holds  //
+// the lookup inputs on the page for one cycle while flush_page is high.   //
 //--------------------------------------------------------------------------//
 
 module ap68040_atc
@@ -32,14 +25,12 @@ module ap68040_atc
 	input  logic        p8k,           // TC.P: 8 Kbyte pages
 
 	// lookup
-	input  logic [31:0] la_n,          // next cycle's lookup address (the RAM's)
 	input  logic [31:0] la,
 	input  logic        fc2,
 	output logic        hit,
 	output atce_t       ent,
-	output logic        stale,         // the RAM did not read this lookup's set
 
-	// install (one cycle; the entry is written the next)
+	// install (one cycle)
 	input  logic        wr,
 	input  logic [31:0] wla,
 	input  logic        wfc2,
@@ -63,47 +54,23 @@ logic [3:0] v   [16];     // valid, per set and way
 logic [3:0] g   [16];     // global
 logic [1:0] rr;           // replacement counter
 
-function automatic logic [3:0] aset(input logic [31:0] a, input logic p8);
-	aset = p8 ? a[16:13] : a[15:12];
-endfunction
-
-wire [3:0] lset   = aset(la, p8k);
-wire [3:0] lset_n = aset(la_n, p8k);
-
-// the install's second cycle
-logic        w1_v;
-logic [31:0] w1_la;
-logic        w1_fc2;
-atce_t       w1_e;
-wire  [3:0]  w1_set = aset(w1_la, p8k);
-logic [1:0]  wway;
+wire [3:0] lset = p8k ? la[16:13]  : la[15:12];
+wire [3:0] wset = p8k ? wla[16:13] : wla[15:12];
 
 slot_t s [4];
 slot_t ws [4];
-slot_t sx [4];            // s, with a way written as it was read: the entry
-
-// the lookup RAMs' read set, and the way an install wrote at the edge the
-// lookup's set was read (with what it wrote)
-logic [3:0]  ra;
-logic [3:0]  cfw;
-slot_t       cfs;
-always_ff @(posedge clk) begin
-	ra  <= lset_n;
-	for (int i = 0; i < 4; i++) cfw[i] <= w1_v && (w1_set == lset_n) && (wway == 2'(i));
-	cfs <= {w1_fc2, w1_la[31:12], w1_e};
-end
-always_comb for (int i = 0; i < 4; i++) sx[i] = cfw[i] ? cfs : s[i];
 
 genvar w;
 generate
 	for (w = 0; w < 4; w++) begin : g_way
 		logic [SW-1:0] q, wq;
-		ap68040_tdp #(.AW(4), .DW(SW)) ram (
-			.clk(clk),
-			.addr_a(lset_n), .we_a(1'b0), .wd_a('0), .q_a(q),
-			.addr_b(w1_v ? w1_set : aset(wla, p8k)),
-			.we_b(w1_v && wway == 2'(w)),
-			.wd_b({w1_fc2, w1_la[31:12], w1_e}), .q_b(wq)
+		ap68040_lutram #(.AW(4), .DW(SW)) ram (
+			.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
+			.wdata({wfc2, wla[31:12], went}), .raddr(lset), .q(q)
+		);
+		ap68040_lutram #(.AW(4), .DW(SW)) ram_w (
+			.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
+			.wdata({wfc2, wla[31:12], went}), .raddr(wset), .q(wq)
 		);
 		assign s[w]  = q;
 		assign ws[w] = wq;
@@ -117,27 +84,33 @@ endfunction
 
 logic [3:0] hv;
 always_comb begin
-	for (int i = 0; i < 4; i++)
-		hv[i] = (ra == lset) && v[lset][i] && tag_eq(sx[i], la, fc2, p8k);
+	for (int i = 0; i < 4; i++) hv[i] = v[lset][i] && tag_eq(s[i], la, fc2, p8k);
 	hit = |hv;
-	stale = (ra != lset);
 	// at most one way holds a page (install reuses its way): AND-OR, no
 	// priority chain
 	ent = '0;
-	for (int i = 0; i < 4; i++) ent = ent | (hv[i] ? sx[i].e : '0);
+	for (int i = 0; i < 4; i++) ent = ent | (hv[i] ? s[i].e : '0);
 end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && !$onehot0(hv)) begin
+		$display("FAIL: ATC: more than one way hits (set %0d, ways %b)", lset, hv);
+		$finish;
+	end
+// synthesis translate_on
 
 // install way: the same page if present (an M-bit update), else invalid, else rr
+logic [1:0] wway;
 always_comb begin
 	logic found;
 	found = 1'b0;
 	wway  = rr;
 	for (int i = 3; i >= 0; i--)
-		if (v[w1_set][i] && tag_eq(ws[i], w1_la, w1_fc2, p8k)) begin wway = 2'(i); found = 1'b1; end
+		if (v[wset][i] && tag_eq(ws[i], wla, wfc2, p8k)) begin wway = 2'(i); found = 1'b1; end
 	if (!found) begin
 		logic fi;
 		fi = 1'b0;
-		for (int i = 3; i >= 0; i--) if (!v[w1_set][i]) begin wway = 2'(i); fi = 1'b1; end
+		for (int i = 3; i >= 0; i--) if (!v[wset][i]) begin wway = 2'(i); fi = 1'b1; end
 	end
 end
 
@@ -145,46 +118,22 @@ end
 initial begin
 	for (int i = 0; i < 16; i++) begin v[i] = 4'd0; g[i] = 4'd0; end
 	rr = 2'd0;
-	w1_v = 1'b0;
 end
 
 always_ff @(posedge clk) begin
-	w1_v <= wr;
 	if (wr) begin
-		w1_la  <= wla;
-		w1_fc2 <= wfc2;
-		w1_e   <= went;
-	end
-	if (w1_v) begin
-		v[w1_set][wway] <= 1'b1;
-		g[w1_set][wway] <= w1_e.g;
-		if (v[w1_set] == 4'hF) rr <= rr + 2'd1;
+		v[wset][wway] <= 1'b1;
+		g[wset][wway] <= went.g;
+		if (v[wset] == 4'hF) rr <= rr + 2'd1;
 	end
 	if (flush_all)
 		for (int i = 0; i < 16; i++)
 			v[i] <= flush_nonglobal ? (v[i] & g[i]) : 4'd0;
 	if (flush_page)
 		for (int i = 0; i < 4; i++)
-			if (v[lset][i] && tag_eq(sx[i], la, fc2, p8k) &&
+			if (v[lset][i] && tag_eq(s[i], la, fc2, p8k) &&
 			    !(flush_nonglobal && g[lset][i]))
 				v[lset][i] <= 1'b0;
 end
-
-// synthesis translate_off
-always_ff @(posedge clk) begin
-	if (nreset && !$onehot0(hv)) begin
-		$display("FAIL: ATC: more than one way hits (set %0d, ways %b)", lset, hv);
-		$finish;
-	end
-	if (nreset && flush_page && ra != lset) begin
-		$display("FAIL: ATC: a page flush without its set read (read %0d, set %0d)", ra, lset);
-		$finish;
-	end
-	if (nreset && wr && w1_v) begin
-		$display("FAIL: ATC: an install in the previous one's write cycle");
-		$finish;
-	end
-end
-// synthesis translate_on
 
 endmodule
