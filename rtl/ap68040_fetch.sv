@@ -196,20 +196,25 @@ logic [31:0] fpc;              // F0 fetch address (A0 clear)
 // branches in one long word (BSR then RTS, a short branch then RTS) no
 // longer evict each other
 localparam int BTB_DW = 1 + BTB_TW + 2 + 31;
+logic [31:0] f1_pc;              // F1's address
+// (block RAM: F0 presents fpc, F1 compares with f1_pc; an entry D1 writes
+// at the edge F0's read registers it is not trusted -- no prediction)
 logic [BTB_DW-1:0] btb_q0, btb_q1, btb_q;
-ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb0 (
+logic        btb_cf;
+ap68040_sdpr #(.AW(BTB_AW), .DW(BTB_DW)) btb0 (
 	.clk(clk), .we(btb_we && !btb_wslot), .waddr(btb_wi),
 	.wdata({btb_wv, btb_wtag, btb_wkind, btb_wtgt}),
 	.raddr(fpc[BTB_AW+1:2]), .q(btb_q0)
 );
-ap68040_lutram #(.AW(BTB_AW), .DW(BTB_DW)) btb1 (
+ap68040_sdpr #(.AW(BTB_AW), .DW(BTB_DW)) btb1 (
 	.clk(clk), .we(btb_we && btb_wslot), .waddr(btb_wi),
 	.wdata({btb_wv, btb_wtag, btb_wkind, btb_wtgt}),
 	.raddr(fpc[BTB_AW+1:2]), .q(btb_q1)
 );
+always_ff @(posedge clk) btb_cf <= btb_we && (btb_wi == fpc[BTB_AW+1:2]);
 // the first branch of the fetch: word 0's when the fetch starts there
-wire btb_hit0 = btb_q0[BTB_DW-1] && btb_q0[BTB_DW-2 -: BTB_TW] == fpc[31:BTB_AW+2] && !fpc[1];
-wire btb_hit1 = btb_q1[BTB_DW-1] && btb_q1[BTB_DW-2 -: BTB_TW] == fpc[31:BTB_AW+2];
+wire btb_hit0 = !btb_cf && btb_q0[BTB_DW-1] && btb_q0[BTB_DW-2 -: BTB_TW] == f1_pc[31:BTB_AW+2] && !f1_pc[1];
+wire btb_hit1 = !btb_cf && btb_q1[BTB_DW-1] && btb_q1[BTB_DW-2 -: BTB_TW] == f1_pc[31:BTB_AW+2];
 wire btb_hit  = btb_hit0 || btb_hit1;
 wire btb_qslot = !btb_hit0;
 assign btb_q   = btb_hit0 ? btb_q0 : btb_q1;
@@ -296,10 +301,11 @@ logic        fnew;             // the next F0 starts a redirected stream
 
 // F1
 logic        f1_v;
-logic [31:0] f1_pc;
-logic        f1_bt, f1_bslot;   // the BTB hit at F0, and where the branch ends
-logic  [1:0] f1_bkind;
-logic [30:0] f1_btgt;
+logic        f1_btok;           // F0 had room for a taken branch's target
+wire         f1_bt    = f1_btok && btb_hit;   // the BTB hit (in F1)
+wire         f1_bslot = btb_qslot;            // ... where the branch ends
+wire   [1:0] f1_bkind = btb_q[32:31];
+wire  [30:0] f1_btgt  = btb_q[30:0];
 logic        f1_s, f1_dem;
 logic        f1_hit;
 atce_t       f1_e;
@@ -444,7 +450,7 @@ always_ff @(posedge clk) begin
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
 		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0;
-		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0; f1_bkind <= '0;
+		f1_btok <= 1'b0;
 		fras_tp <= '0; fras_n <= '0;
 		f2_b  <= '0; f2_t <= '0; f3_b <= '0; f3_t <= '0;
 		qb    <= '0; tq_n <= '0;
@@ -544,13 +550,10 @@ always_ff @(posedge clk) begin
 		// F0 -> F1
 		//------------------------------------------------------------------
 		f1_v  <= 1'b0;
-		f1_bt <= 1'b0;
+		f1_btok <= 1'b0;
 		if (f0_go) begin
 			f1_v   <= 1'b1;
-			f1_bt  <= btb_hit && bt_room;
-			f1_bslot <= btb_qslot;
-			f1_bkind <= btb_q[32:31];
-			f1_btgt  <= btb_q[30:0];
+			f1_btok <= bt_room;
 			f1_pc  <= fpc;
 			f1_s   <= smode;
 			f1_tt0 <= ttr_hit(itt0, fpc, smode);
@@ -582,7 +585,7 @@ always_ff @(posedge clk) begin
 				f2_b <= (f1_pc[1] || !f1_bslot) ? 2'b01 : 2'b10;
 				f2_t <= t;
 				f1_v <= 1'b0;
-				f1_bt <= 1'b0;
+				f1_btok <= 1'b0;
 				fpc  <= {t, 1'b0};
 				fnew <= 1'b0;
 				if (f1_bkind == 2'd1) begin
@@ -743,7 +746,7 @@ always_ff @(posedge clk) begin
 			f3_b  <= '0;
 			tq_n  <= '0;
 			f1_v  <= 1'b0;
-			f1_bt <= 1'b0;
+			f1_btok <= 1'b0;
 			frw  = 1'b1;
 			frwa = d_ras_tp;
 			frwd = d_ras;

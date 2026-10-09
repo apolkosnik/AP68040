@@ -135,3 +135,30 @@ module ap68040_rf #(
 		for (int r = 0; r < NR; r++)
 			rd[r] = q[lvt[ra[r]]][r];
 endmodule
+
+//--------------------------------------------------------------------------
+// ap68040_sdpr: simple dual-port block RAM, one write and one read port,
+// the read address registered (data the cycle after it is presented).  A
+// read of the word written at the same edge is undefined (no_rw_check):
+// the caller handles it.
+//--------------------------------------------------------------------------
+module ap68040_sdpr #(
+	parameter int AW = 8,
+	parameter int DW = 32
+)(
+	input  logic          clk,
+	input  logic          we,
+	input  logic [AW-1:0] waddr,
+	input  logic [DW-1:0] wdata,
+	input  logic [AW-1:0] raddr,
+	output logic [DW-1:0] q
+);
+	(* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
+	logic [AW-1:0] ra;
+	initial for (int i = 0; i < (1 << AW); i++) mem[i] = '0;
+	always_ff @(posedge clk) begin
+		if (we) mem[waddr] <= wdata;
+		ra <= raddr;
+	end
+	assign q = mem[ra];
+endmodule

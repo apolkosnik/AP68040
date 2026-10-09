@@ -519,9 +519,12 @@ wire        m1_fast  = ((m1.mem == M_LD) || (m1.mem == M_RMW && !m1.lock)) &&
 //--------------------------------------------------------------------------
 // a store older than the DC2 load and not yet in the data RAM (EX, WB)
 wire  [27:0] m2_line = m2.x.pa[31:4];
+// (by the line within the page only, PA11-4: a store to the same offset of
+// another page is taken for the line too -- the load waits for it, or takes
+// the slow path; a smaller, shorter compare on DC2's hold)
 function automatic logic st_line(input mrec_t m, input logic [27:0] l);
 	st_line = m.r.v && (m.r.mem == M_ST || m.r.mem == M_RMW) &&
-	          (m.x.pa[31:4] == l || (m.split && m.x1.pa[31:4] == l));
+	          (m.x.pa[11:4] == l[7:0] || (m.split && m.x1.pa[11:4] == l[7:0]));
 endfunction
 wire hz = st_line(m3, m2_line) || st_line(m4, m2_line);
 // the fast load (never split) waits only for a store whose bytes it reads:
