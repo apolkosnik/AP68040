@@ -159,6 +159,32 @@ first), and every cache-inhibited read -- not only a serialized one --
 waits until no older instruction is in flight, so a device is never read
 on a path an older instruction discards (t_cmodes and t_snoop found both).
 
+Area round, measured (seed 1, 16.667 ns, retiming off; a per-entity fit
+after every step, which caught two changes that saved nothing):
+
+| state | ALMs | what changed |
+|---|---:|---|
+| ed5ff93 | 27,912 | skid removed (its two bus-ordering rules kept), DC2 copies its hit way only, dirty bits and return stacks in LUT RAM |
+| a4f5c08 | ~27,250 | cache valid bits in LUT RAM (CINVA, a snooped clear and reset sweep the 64 sets) |
+| 23c76c8 | 27,491 | ATCs in block RAM: REVERTED -- two read ports became two RAM copies plus bypass registers, +80 to +157 ALMs per ATC |
+| b86fc10 | 26,363 | BTBs in simple-dual-port block RAM (F1 compares), DC2's store hazard by the line within the page |
+| 1e5eef1 | 25,947 | FRESTORE writes the FPU's frame registers directly; the queue's predecode in a ring with a registered head |
+| 522fca8 | 25,815 | the FPU pipeline shares the normalizer and the sticky right shifter with the state machine |
+| 8e58dd6 | 25,530 | D1's attribute table a block RAM ROM read a cycle ahead (an initialized array: a clocked case or a function behind a register stays logic) |
+| 1571385 | | D1's return stack one read address (MLAB), SDP RAMs with registered output (no bypass), the multiplier's partial products summed in two adders |
+| 33ec2d8 | 25,118 | the predecode ring as two MLAB banks by slot parity; one right and one left funnel for every slow-ALU shift (833 -> 628 ALMs) |
+| 035e51d | 24,935 | the ring banks with one write statement each (two read as two ports and stayed logic) |
+
+Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
+the only change from 1,786,890); bench_fpu unchanged.  Kept at 8 entries:
+the loop predictor (4 cost 4.4 % Dhrystone).  Not changed, with the
+measured reason: the DMU tag RAMs' bypass logic (the engine reads a set
+in the cycle another port writes it thousands of times in t_snstress),
+the bus-out line copy (the push buffer refills while its line is on the
+bus), and the serial FPU (PIPE=0 saves 1,517 ALMs for +20-82 % on FP
+workloads).  Left: the bit field unit's six shifters shared over a third
+cycle (~300 ALMs), D1's adders.
+
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
 ODD_EXC CHK/DIV*/TRAPV and ODD_IRQ EXT/SWAP slices (21).  Any other
