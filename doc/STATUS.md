@@ -175,6 +175,7 @@ after every step, which caught two changes that saved nothing):
 | 33ec2d8 | 25,118 | the predecode ring as two MLAB banks by slot parity; one right and one left funnel for every slow-ALU shift (833 -> 628 ALMs) |
 | 035e51d | 24,935 | the ring banks with one write statement each (two read as two ports and stayed logic) |
 | ab9f58f | 24,831 | D1's PC-relative adds one adder per EA (PC16/PCX exclusive), the slow path's two phases one mk_ea; this seed meets 60 MHz at both corners (+0.29/+0.40 ns) |
+| f58cc0b | 24,787 | the FPU's memory operand unpacked on one bus (ten a_m sources fewer): -8 ALMs in the FPU -- its register-input muxes are not reducible this way |
 
 Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
 the only change from 1,786,890); bench_fpu unchanged.  Kept at 8 entries:
