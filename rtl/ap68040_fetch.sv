@@ -141,7 +141,15 @@ endfunction
 // queue
 //--------------------------------------------------------------------------
 logic [15:0]   qw [QN];
-pd_t           qp [QN];
+// the words' predecode: D1 reads only the head's, so it is a ring (no
+// shift) with the head in a register (qp0) -- loaded as D1 consumes from
+// the ring, or from F3 when the queue empties into it
+pd_t           qpr [QN];
+logic  [3:0]   qh;             // the ring's head
+pd_t           qp0;
+// synthesis translate_off
+pd_t           qps [QN];       // (simulation: the shifting model, checked)
+// synthesis translate_on
 logic [QN-1:0] qf, qd, qa;     // faulted, demand fetch, ATC fault
 logic [QN-1:0] qb;             // ends a branch the BTB took
 logic [30:0]   tq [4];         // their targets, in queue order
@@ -153,7 +161,10 @@ logic          odd;
 assign qcnt  = (cnt > 5'd8) ? 4'd8 : cnt[3:0];
 assign qpc   = qpc_r;
 assign q_odd = odd;
-assign pd0   = qp[0];
+assign pd0   = qp0;
+function automatic logic [3:0] qwrap(input logic [4:0] x);   // x mod QN, x < 2*QN
+	qwrap = (x >= 5'(QN)) ? 4'(x - 5'(QN)) : x[3:0];
+endfunction
 
 always_comb begin
 	for (int i = 0; i < 8; i++) begin
@@ -476,7 +487,9 @@ always_ff @(posedge clk) begin
 		// synthesis translate_off
 		for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
 		// synthesis translate_on
-		for (int i = 0; i < QN; i++) begin qw[i] <= '0; qp[i] <= '0; end
+		for (int i = 0; i < QN; i++) qw[i] <= '0;
+		qh  <= '0;
+		qp0 <= '0;
 	end
 	else begin
 		logic [4:0] keep;
@@ -496,16 +509,20 @@ always_ff @(posedge clk) begin
 			src = 6'(i) + {3'b000, consume};
 			k   = 5'(i) - keep;
 			if (5'(i) < keep) begin
+				// synthesis translate_off
+				qps[i] <= qps[src[4:0]];
+				// synthesis translate_on
 				qw[i] <= qw[src[4:0]];
-				qp[i] <= qp[src[4:0]];
 				qf[i] <= qf[src[4:0]];
 				qd[i] <= qd[src[4:0]];
 				qa[i] <= qa[src[4:0]];
 				qb[i] <= qb[src[4:0]];
 			end
 			else if (k < {3'b000, f3_n}) begin
+				// synthesis translate_off
+				qps[i] <= f3_p[k[0]];
+				// synthesis translate_on
 				qw[i] <= f3_w[k[0]];
-				qp[i] <= f3_p[k[0]];
 				qf[i] <= f3_f;
 				qd[i] <= f3_d;
 				qa[i] <= f3_a;
@@ -513,6 +530,12 @@ always_ff @(posedge clk) begin
 			end
 		end
 		cnt   <= keep + {3'b000, f3_n};
+		// the predecode ring: appended at head + count (wherever D1's
+		// consume puts the head), the head moved by consume
+		for (int k = 0; k < 2; k++)
+			if (2'(k) < f3_n) qpr[qwrap(5'(qh) + cnt + 5'(k))] <= f3_p[k];
+		qh  <= qwrap(5'(qh) + {2'b00, consume});
+		qp0 <= (keep == 5'd0) ? f3_p[0] : qpr[qwrap(5'(qh) + {2'b00, consume})];
 		// D1 consumed the end of a BTB-taken branch: the stream continues
 		// at its target (the words after it in the queue came from there)
 		begin
@@ -855,6 +878,14 @@ end
 always_ff @(posedge clk)
 	if (nreset && !inv_rst && (ivf_q != iv[f1_pc[9:4]] || ivo_q != iv[ivo_ra])) begin
 		$display("FAIL: fetch: valid RAM %b/%b, model %b/%b", ivf_q, ivo_q, iv[f1_pc[9:4]], iv[ivo_ra]);
+		$finish;
+	end
+// synthesis translate_on
+
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && cnt != 5'd0 && qp0 != qps[0]) begin
+		$display("FAIL: fetch: the predecode ring's head %h, the queue's %h", qp0, qps[0]);
 		$finish;
 	end
 // synthesis translate_on
