@@ -149,7 +149,15 @@ t66 met all corners on seeds 2 and 4 (seeds 1 and 3 -0.31 and -0.29 ns at
 seed either.  The failing paths are now spread over the core (the stall
 chain from EX's holds to AG and the sequencer, the FPU normalizer, the
 slow ALU's memory operand) at 0.2-0.9 ns, and a seed moves them by about
-that much.
+that much.  A skid between DC2 and EX (one uop, the DMU's m2s beside it)
+then took EX's holds off the stall chain: DC2 stalls on the skid's
+register.  No failing path goes through EX's hold since, but four seeds
+still miss (t69: -0.14 to -1.50 ns; DC2's store-hazard hold, D1, the
+slow ALU).  It brought two ordering rules with it: a DC2 bus job (a miss)
+waits while an older store is in the skid or EX (WB's has the engine
+first), and every cache-inhibited read -- not only a serialized one --
+waits until no older instruction is in flight, so a device is never read
+on a path an older instruction discards (t_cmodes and t_snoop found both).
 
 Known corpus failures (WinUAE generator defects, a real 68040 fails them
 too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;

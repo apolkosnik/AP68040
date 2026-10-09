@@ -98,7 +98,9 @@ module ap68040_backend
 	input  logic        mt_done,
 	input  logic [31:0] mt_mmusr,
 	output logic        adv_dc1,        // DC1 -> DC2
-	output logic        adv_dc2,        // DC2 -> EX
+	output logic        adv_dc2,        // DC2 -> EX, or the skid while EX holds
+	output logic        sk_ld,          // DC2 -> the skid (EX holds)
+	output logic        sk_go,          // the skid -> EX
 	output logic        adv_ex,         // EX -> WB
 	output logic        adv_wb,         // WB completes
 	input  logic        dm_dc2_rdy,     // DC2 memory op has its result
@@ -164,6 +166,18 @@ logic [31:0] dc1_er, dc2_er, ex_er;
 logic        erb, erx;         // agb_q / agx_q hold the youngest writer's early result
 logic [31:0] dc2_a, dc2_b, dc2_ea;
 logic [31:0] ex_a,  ex_b,  ex_ea,  ex_ld;
+// the skid between DC2 and EX: a uop that leaves DC2 while EX holds waits
+// here, so DC2 (and everything before it) stalls on a register (sk_v), not
+// on EX's hold -- that hold (the FPU's dispatch, the multiplier, WB's
+// stores) no longer reaches AG, the register file and the sequencer in
+// the same cycle.  It is older than DC2 and younger than EX; it enters EX
+// before DC2's next uop.
+logic        sk_v;
+uop_t        sk_u;
+logic [31:0] sk_a, sk_b, sk_ea, sk_ldv, sk_upd, sk_upd2, sk_er, sk_faddr;
+logic        sk_ee, sk_fault;
+logic  [7:0] sk_fvec;
+logic [15:0] sk_fssw;
 logic        ex_fault;
 logic  [7:0] ex_fvec;
 logic [31:0] ex_faddr;
@@ -266,7 +280,7 @@ logic ex_md_start;
 assign dc2_hold  = dc2_v && (dc2_u.mem != M_NONE) && (dc2_u.exc == 8'd0) && !dm_dc2_rdy;
 assign stall_wb  = wb_v  && wb_hold;
 assign stall_ex  = ex_v  && (ex_hold  || stall_wb);
-assign stall_dc2 = dc2_v && (dc2_hold || stall_ex);
+assign stall_dc2 = dc2_v && (dc2_hold || sk_v);
 assign stall_dc1 = dc1_v && (stall_dc2 || dm_hold1);
 assign stall_ag  = ag_v  && (ag_hold  || stall_dc1);
 
@@ -275,6 +289,10 @@ assign adv_ex  = ex_v  && !stall_ex;
 assign adv_dc2 = dc2_v && !stall_dc2;
 assign adv_dc1 = dc1_v && !stall_dc1;
 assign adv_ag  = ag_v  && !stall_ag;
+// DC2's uop goes to EX, or to the skid while EX holds; the skid's to EX
+assign sk_ld   = adv_dc2 && stall_ex;
+assign sk_go   = sk_v && !stall_ex;
+wire   ex_load = !stall_ex && (sk_v || adv_dc2);
 
 assign in_rdy  = !stall_ag && !flush && !stopped && !eredir_pend;
 
@@ -286,6 +304,7 @@ assign in_rdy  = !stall_ag && !flush && !stopped && !eredir_pend;
 function automatic logic pend_w(input logic [4:0] r);
 	pend_w = (dc1_v && dc1_u.d_v && dc1_u.d_reg == r) ||
 	         (dc2_v && dc2_u.d_v && dc2_u.d_reg == r) ||
+	         (sk_v  && sk_u.d_v  && sk_u.d_reg  == r) ||
 	         (ex_v  && ex_u.d_v  && ex_u.d_reg  == r);
 endfunction
 
@@ -296,18 +315,22 @@ function automatic logic pend_dc(input logic [4:0] r);
 	pend_dc = (dc1_v && dc1_u.d_v && dc1_u.d_reg == r) ||
 	          (dc2_v && dc2_u.d_v && dc2_u.d_reg == r);
 endfunction
-wire ex_wr_b = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.base;
-wire ex_wr_x = ex_v && ex_u.d_v && ex_u.d_reg == ag_u.idx;
+// (a writer in the skid is waited for as one in EX: its value comes from EX)
+wire ex_wr_b = (ex_v && ex_u.d_v && ex_u.d_reg == ag_u.base) ||
+               (sk_v && sk_u.d_v && sk_u.d_reg == ag_u.base);
+wire ex_wr_x = (ex_v && ex_u.d_v && ex_u.d_reg == ag_u.idx) ||
+               (sk_v && sk_u.d_v && sk_u.d_reg == ag_u.idx);
 // the youngest older writer of a register, and whether it is early:
-// {found, early, stage (1 DC1, 2 DC2, 3 EX)}
+// {found, early, stage (1 DC1, 2 DC2, 0 the skid, 3 EX)}
 function automatic logic [3:0] yw(input logic [4:0] r);
 	if (dc1_v && dc1_u.d_v && dc1_u.d_reg == r)      yw = {1'b1, dc1_ee, 2'd1};
 	else if (dc2_v && dc2_u.d_v && dc2_u.d_reg == r) yw = {1'b1, dc2_ee, 2'd2};
+	else if (sk_v && sk_u.d_v && sk_u.d_reg == r)    yw = {1'b1, sk_ee,  2'd0};
 	else if (ex_v && ex_u.d_v && ex_u.d_reg == r)    yw = {1'b1, ex_ee,  2'd3};
 	else                                             yw = 4'd0;
 endfunction
 function automatic logic [31:0] ywv(input logic [1:0] st);
-	ywv = (st == 2'd1) ? dc1_er : (st == 2'd2) ? dc2_er : ex_er;
+	ywv = (st == 2'd1) ? dc1_er : (st == 2'd2) ? dc2_er : (st == 2'd0) ? sk_er : ex_er;
 endfunction
 wire [3:0] yw_b = yw(ag_u.base);
 wire [3:0] yw_x = yw(ag_u.idx);
@@ -485,7 +508,7 @@ assign dm_locke   = ag_u.mlocke;
 // FC2 of the access selects the root and the supervisor checks: MOVES
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
-assign dm_older   = ex_v || wb_v;
+assign dm_older   = sk_v || ex_v || wb_v;
 
 
 
@@ -582,7 +605,7 @@ ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
 	.fuse(ex_u.sz == SZ_W), .eal(ex_u.sz == SZ_B),
 	.imm(ex_u.imm[7:0]), .immb(ex_u.imm_b[7:0]),
 	.av(ex_av), .bv(ex_bv), .aw(ex_a[15:0]), .bw(ex_b[15:0]),
-	.dw_a(dc2_a[15:0]), .dw_b(dc2_b[15:0]), .dw_ld(!stall_ex), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
+	.dw_a(sk_v ? sk_a[15:0] : dc2_a[15:0]), .dw_b(sk_v ? sk_b[15:0] : dc2_b[15:0]), .dw_ld(!stall_ex), .latch(ex_latch), .ea(ex_ea), .pc(ex_u.pc),
 	.safe(!wb_v || wb_fpchk), .adv(adv_ex), .kill(kill_now),
 	.hold(fp_hold), .res(fp_res), .dkill(fp_dkill), .taken(fp_taken),
 	.xvec(fp_xvec), .xfmt(fp_xfmt), .xnext(fp_xnext), .xaddr(fp_xaddr),
@@ -1395,6 +1418,7 @@ always_ff @(posedge clk) begin
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		sk_v  <= 1'b0;
 		eredir_pend <= 1'b0;
 		wb_eredir   <= 1'b0;
 		fv <= 32'd0;
@@ -1541,7 +1565,24 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		// DC2 -> EX
 		//------------------------------------------------------------------
-		if (adv_dc2) begin
+		if (sk_go) begin
+			ex_u     <= sk_u;
+			ex_ee    <= sk_ee;
+			ex_er    <= sk_er;
+			ex_a     <= (exw_v && sk_u.a_src == OS_REG && sk_u.a_reg == exw_reg) ? exw_val : sk_a;
+			ex_b     <= (exw_v && sk_u.b_src == OS_REG && sk_u.b_reg == exw_reg) ? exw_val : sk_b;
+			ex_ea    <= sk_ea;
+			ex_ld    <= sk_ldv;
+			ex_upd   <= sk_upd;
+			ex_upd2  <= sk_upd2;
+			ex_fault <= sk_fault;
+			ex_fvec  <= sk_fvec;
+			ex_faddr <= sk_faddr;
+			ex_fssw  <= sk_fssw;
+			md_go    <= 1'b0;
+			md_z     <= 1'b0;
+		end
+		else if (adv_dc2 && !stall_ex) begin
 			ex_u     <= dc2_u;
 			ex_ee    <= dc2_ee;
 			ex_er    <= dc2_er;
@@ -1558,9 +1599,32 @@ always_ff @(posedge clk) begin
 			md_go    <= 1'b0;
 			md_z     <= 1'b0;
 		end
-		if (!stall_ex) ex_v <= adv_dc2;
+		if (!stall_ex) ex_v <= sk_v || adv_dc2;
+		// DC2 -> skid (EX holds), and EX's broadcast into the waiting uop
+		if (sk_ld) begin
+			sk_u     <= dc2_u;
+			sk_ee    <= dc2_ee;
+			sk_er    <= dc2_er;
+			sk_a     <= (exw_v && dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) ? exw_val : dc2_a;
+			sk_b     <= (exw_v && dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) ? exw_val : dc2_b;
+			sk_ea    <= dc2_ea;
+			sk_ldv   <= dm_ldata;
+			sk_upd   <= dc2_upd;
+			sk_upd2  <= dc2_upd2;
+			sk_fault <= (dc2_u.mem != M_NONE) && dm_fault;
+			sk_fvec  <= dm_fvec;
+			sk_faddr <= dm_faddr;
+			sk_fssw  <= dm_fssw;
+		end
+		else if (sk_v && exw_v) begin
+			if (sk_u.a_src == OS_REG && sk_u.a_reg == exw_reg) sk_a <= exw_val;
+			if (sk_u.b_src == OS_REG && sk_u.b_reg == exw_reg) sk_b <= exw_val;
+		end
+		if (sk_ld) sk_v <= 1'b1;
+		else if (sk_go) sk_v <= 1'b0;
 		// EX's next uop against WB's next: EX's own when it moves on
-		if (adv_dc2) ew_same <= adv_ex ? (dc2_u.pc == ex_u.pc) : (dc2_u.pc == wb_u.pc);
+		if (ex_load) ew_same <= sk_v ? (adv_ex ? (sk_u.pc == ex_u.pc) : (sk_u.pc == wb_u.pc))
+		                             : (adv_ex ? (dc2_u.pc == ex_u.pc) : (dc2_u.pc == wb_u.pc));
 		else if (adv_ex) ew_same <= 1'b1;
 		if (ex_md_start) md_go <= 1'b1;
 		if (ex_v && ex_div0) md_z <= 1'b1;
@@ -1873,6 +1937,7 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (flush) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+			sk_v <= 1'b0;
 			eredir_pend <= 1'b0;
 		end
 		else begin
@@ -1885,6 +1950,7 @@ always_ff @(posedge clk) begin
 		end
 		if (kill_now) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+			sk_v <= 1'b0;
 		end
 	end
 end
@@ -1958,7 +2024,8 @@ always_ff @(posedge clk) begin
 		// (the early results are scaled beside the writer search)
 		agx_q <= !ex ? ixf(x, in_u) :
 		         (wx[1:0] == 2'd1) ? ixf(dc1_er, in_u) :
-		         (wx[1:0] == 2'd2) ? ixf(dc2_er, in_u) : ixf(ex_er, in_u);
+		         (wx[1:0] == 2'd2) ? ixf(dc2_er, in_u) :
+		         (wx[1:0] == 2'd0) ? ixf(sk_er, in_u) : ixf(ex_er, in_u);
 		cap_b <= cb;
 		cap_x <= cx;
 		erb   <= eb;
@@ -1983,7 +2050,8 @@ always_ff @(posedge clk) begin
 		if (yw_x[2]) begin
 			stale_x <= 1'b0;
 			agx_q <= (yw_x[1:0] == 2'd1) ? ixf(dc1_er, ag_u) :
-			         (yw_x[1:0] == 2'd2) ? ixf(dc2_er, ag_u) : ixf(ex_er, ag_u);
+			         (yw_x[1:0] == 2'd2) ? ixf(dc2_er, ag_u) :
+			         (yw_x[1:0] == 2'd0) ? ixf(sk_er, ag_u) : ixf(ex_er, ag_u);
 			erx <= 1'b1;
 		end
 		else begin

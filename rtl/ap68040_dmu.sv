@@ -70,6 +70,8 @@ module ap68040_dmu
 	input  logic        dm_older,       // uops older than DC2 still in EX or WB
 	input  logic        adv_dc1,
 	input  logic        adv_dc2,
+	input  logic        sk_ld,          // DC2's uop goes to the skid (EX holds)
+	input  logic        sk_go,          // the skid's uop goes to EX
 	input  logic        adv_ex,
 	input  logic        adv_wb,
 	input  logic        kill_now,
@@ -206,6 +208,7 @@ typedef struct packed {
 
 req_t  m1;
 mrec_t m2, m3, m4;
+mrec_t m2s;            // the skid between DC2 and EX: older than m2, younger than m3
 
 function automatic logic [2:0] nbytes(input logic [1:0] msz);
 	case (msz)
@@ -490,7 +493,7 @@ function automatic logic st_line(input mrec_t m, input logic [27:0] l);
 	st_line = m.r.v && (m.r.mem == M_ST || m.r.mem == M_RMW) &&
 	          (m.x.pa[31:4] == l || (m.split && m.x1.pa[31:4] == l));
 endfunction
-wire hz = st_line(m3, m2_line) || st_line(m4, m2_line);
+wire hz = st_line(m2s, m2_line) || st_line(m3, m2_line) || st_line(m4, m2_line);
 // the fast load (never split) waits only for a store whose bytes it reads:
 // a plain store within one line is compared by bytes, anything else (RMW,
 // split, MOVE16) by the line
@@ -500,10 +503,11 @@ function automatic logic st_byte(input mrec_t m);
 	          (m.r.mem == M_RMW || m.split || m.r.msz == SZ_Q ||
 	           (bmask(m.x.pa[3:0], nbytes(m.r.msz)) & m2_bm) != 16'd0);
 endfunction
-wire hzf = st_byte(m3) || st_byte(m4);
+wire hzf = st_byte(m2s) || st_byte(m3) || st_byte(m4);
 // any store older than the DC2 uop not yet performed: a table walk for the
 // DC2 uop must see it (the program may just have written a descriptor)
-wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
+wire st_older = (m2s.r.v && (m2s.r.mem == M_ST || m2s.r.mem == M_RMW)) ||
+                (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
                 (m4.r.v && (m4.r.mem == M_ST || m4.r.mem == M_RMW));
 // a RAM write to the load's set, or any engine activity, after its lookup
 // read the RAM makes the captured line stale: the engine reads it again
@@ -697,7 +701,13 @@ wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
 // a fast load behind an older store to its line waits for it (merged into
 // its copy) instead of taking the engine
 wire fast_wait = m2.r.v && m2.fast && (hzf || (dw && !dwp && dw_set == m2.r.a[9:4]));
-wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job;
+// (not while an older store is in the skid or EX: it reaches WB, which
+// has the engine first, before DC2's job -- the bus sees a store before
+// a younger load's access, whatever the timing; the skid made a load in
+// DC2 with stores still ahead of WB frequent)
+wire sk_st    = (m2s.r.v && (m2s.r.mem != M_LD)) || (m3.r.v && (m3.r.mem != M_LD));
+wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job &&
+                !sk_st;
 wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
 
 // store ready: the fast store answers in its own WB cycle (the engine's
@@ -747,7 +757,7 @@ always_ff @(posedge clk) begin
 	steal_q   <= steal;
 
 	if (!nreset) begin
-		m1 <= '0; m2 <= '0; m3 <= '0; m4 <= '0;
+		m1 <= '0; m2 <= '0; m3 <= '0; m4 <= '0; m2s <= '0;
 		e_st <= E_IDLE; e_ret <= E_IDLE; e_sret <= E_IDLE; e_wret <= E_IDLE;
 		e_dc2_done <= 1'b0; e_wst_done <= 1'b0;
 		e_ldata <= '0; e_flt <= 1'b0; e_faddr <= '0; e_fssw <= '0;
@@ -841,11 +851,12 @@ always_ff @(posedge clk) begin
 				m2.sfast <= 1'b0;
 		end
 
-		if (adv_dc2) begin
-			m3 <= m2;
-			e_dc2_done <= 1'b0;
-		end
+		if (adv_dc2) e_dc2_done <= 1'b0;
+		if (sk_go) m3 <= m2s;
+		else if (adv_dc2 && !sk_ld) m3 <= m2;
 		else if (adv_ex) m3.r.v <= 1'b0;
+		if (sk_ld) m2s <= m2;
+		else if (sk_go) m2s.r.v <= 1'b0;
 
 		if (adv_ex) m4 <= m3;
 		else if (adv_wb) m4.r.v <= 1'b0;
@@ -968,7 +979,8 @@ always_ff @(posedge clk) begin
 			end
 			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && e_x.ok && !e_x.flt && !e_x.walk &&
 			    e_x.hit && !e_x.cm[1] &&
-			    !hz && !st_line(m3, e_x.pa[31:4]) && !st_line(m4, e_x.pa[31:4]) &&
+			    !hz && !st_line(m2s, e_x.pa[31:4]) && !st_line(m3, e_x.pa[31:4]) &&
+			    !st_line(m4, e_x.pa[31:4]) &&
 			    !sp_dw && !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
 				// the first part from DC2's copy, the rest from the stolen read
 				e_acc <= (take(dq_r[m2.x.way], m2.r.a[3:0], n0) << (8 * (nbytes(m2.r.msz) - n0))) |
@@ -1058,12 +1070,16 @@ always_ff @(posedge clk) begin
 				e_x.cm  <= 2'b11;
 				e_st    <= E_S_NEXT;
 			end
-			else if (rd && !e_part && !m2.r.iack && (e_x.cm == 2'b10 || m2.r.lock) && dm_older) begin
+			else if (rd && !e_part && !m2.r.iack && (e_x.cm[1] || m2.r.lock) && dm_older) begin
 				// a serialized read (a noncachable serialized page, or a
 				// locked access) waits until every earlier instruction has
 				// completed: pending writes are on the bus first, and
 				// nothing older can abort the instruction after the read
-				// (MC68040UM 4.3.2, 7.7).  Retry from the start.
+				// (MC68040UM 4.3.2, 7.7).  So does any cache-inhibited
+				// read: the 68040 never reads a device on a path an older
+				// instruction then discards (a mispredicted branch, a
+				// serializing MOVEC) -- such a read cannot be taken back.
+				// Retry from the start.
 				steal <= 1'b0;
 				e_st  <= E_IDLE;
 			end
@@ -1095,12 +1111,14 @@ always_ff @(posedge clk) begin
 				// older stores to this line must reach the RAM first: give
 				// the engine back to them and retry (the line of the part
 				// being read: a split's second part has its own)
-				if (!(e_part ? (st_line(m3, e_x.pa[31:4]) || st_line(m4, e_x.pa[31:4])) : hz))
+				if (!(e_part ? (st_line(m2s, e_x.pa[31:4]) || st_line(m3, e_x.pa[31:4]) ||
+				                st_line(m4, e_x.pa[31:4])) : hz))
 					e_st <= E_S_RD;
 				else begin steal <= 1'b0; e_st <= E_IDLE; end
 			end
 			else if (alloc && rd && !e_x.hit &&
-			         (e_part ? (st_line(m3, e_x.pa[31:4]) || st_line(m4, e_x.pa[31:4])) : hz)) begin
+			         (e_part ? (st_line(m2s, e_x.pa[31:4]) || st_line(m3, e_x.pa[31:4]) ||
+			                    st_line(m4, e_x.pa[31:4])) : hz)) begin
 				// an older store to this line has not reached memory yet
 				steal <= 1'b0;
 				e_st  <= E_IDLE;
@@ -1123,7 +1141,8 @@ always_ff @(posedge clk) begin
 					e_x.hit <= 1'b0;
 					e_st   <= E_PUSHV;
 				end
-				else if ((m3.r.v && m3.r.mem != M_LD) || (m4.r.v && m4.r.mem != M_LD)) begin
+				else if ((m2s.r.v && m2s.r.mem != M_LD) || (m3.r.v && m3.r.mem != M_LD) ||
+				         (m4.r.v && m4.r.mem != M_LD)) begin
 					// older stores go to the bus first (program order): the
 					// engine is theirs until they are done, then retry
 					steal <= 1'b0;
@@ -1408,7 +1427,7 @@ always_ff @(posedge clk) begin
 		// and is pushed after the fill (4.6.2).  Returns to e_sret.
 		//==============================================================
 		E_FILL: begin
-			if (store_holds(f_set, f_way, m3, m4))
+			if (store_holds(f_set, f_way, m3, m4) || store_holds(f_set, f_way, m2s, m2s))
 				f_way <= f_way + 2'd1;      // that line belongs to a store
 			else begin
 				steal  <= 1'b1;
@@ -1786,6 +1805,7 @@ always_ff @(posedge clk) begin
 			m2.r.v <= 1'b0;
 			m3.r.v <= 1'b0;
 			m4.r.v <= 1'b0;
+			m2s.r.v <= 1'b0;
 			e_dc2_done <= 1'b0;
 			if (e_st != E_IDLE) e_kill <= 1'b1;
 			if (e_st == E_IDLE) e_job <= 1'b0;
@@ -1845,7 +1865,20 @@ always_ff @(posedge clk) begin
 					// no record keeps a hit on the line that left
 					if (m2.x.hit && m2.x.pa[9:4] == s && m2.x.way == sn_way) m2.x.hit <= 1'b0;
 					if (m2.x1.hit && m2.x1.pa[9:4] == s && m2.x1.way == sn_way) m2.x1.hit <= 1'b0;
-					if (adv_dc2) begin
+					// (the skid: DC2's record entering it, or its own)
+					if (sk_ld) begin
+						if (m2.x.hit && m2.x.pa[9:4] == s && m2.x.way == sn_way) m2s.x.hit <= 1'b0;
+						if (m2.x1.hit && m2.x1.pa[9:4] == s && m2.x1.way == sn_way) m2s.x1.hit <= 1'b0;
+					end
+					else begin
+						if (m2s.x.hit && m2s.x.pa[9:4] == s && m2s.x.way == sn_way) m2s.x.hit <= 1'b0;
+						if (m2s.x1.hit && m2s.x1.pa[9:4] == s && m2s.x1.way == sn_way) m2s.x1.hit <= 1'b0;
+					end
+					if (sk_go) begin
+						if (m2s.x.hit && m2s.x.pa[9:4] == s && m2s.x.way == sn_way) m3.x.hit <= 1'b0;
+						if (m2s.x1.hit && m2s.x1.pa[9:4] == s && m2s.x1.way == sn_way) m3.x1.hit <= 1'b0;
+					end
+					else if (adv_dc2 && !sk_ld) begin
 						if (m2.x.hit && m2.x.pa[9:4] == s && m2.x.way == sn_way) m3.x.hit <= 1'b0;
 						if (m2.x1.hit && m2.x1.pa[9:4] == s && m2.x1.way == sn_way) m3.x1.hit <= 1'b0;
 					end
