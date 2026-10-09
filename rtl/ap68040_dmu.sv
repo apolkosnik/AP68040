@@ -275,7 +275,26 @@ endfunction
 //--------------------------------------------------------------------------
 // storage
 //--------------------------------------------------------------------------
-logic [3:0]  lv  [64];             // line valid, per set and way
+// line valid, per set and way: LUT RAMs, written as flip-flops were (at the
+// edge) and read without a clock -- one copy at DC1's set, one at the
+// engine's (or the snoop's: a snoop freezes the engine).  A clear of every
+// line (CINVA, reset) sweeps the 64 sets (E_M_CLR)
+(* ramstyle = "MLAB, no_rw_check" *) logic lvd0 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lvd1 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lvd2 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lvd3 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lve0 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lve1 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lve2 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic lve3 [64];
+logic  [5:0] lv_ra;                // the engine copy's read: see below
+wire   [3:0] lvd_q;                // DC1's set (m1)
+wire   [3:0] lve_q;                // the engine's (or the snoop's) set
+logic  [5:0] clr_i;                // the clear sweep's set
+logic        clr_rst;              // ... after reset (else CINVA: then E_M_IC)
+// synthesis translate_off
+logic [3:0]  lv  [64];             // (simulation: the flip-flop model, checked)
+// synthesis translate_on
 // dirty [set][way] (the push writes the whole line): four 64x1 LUT RAMs,
 // one read address -- the scan's set, the snooped set, else the fill/push
 // set (they never read at once: a snoop freezes the engine).  No clear:
@@ -476,7 +495,7 @@ endfunction
 wire        m1_wr  = (m1.mem == M_ST) || (m1.mem == M_RMW);
 always_comb begin
 	x_dc1 = xlate(m1.a, m1.smode, m1_wr, atc_hit, atc_e,
-	              tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m1.a[9:4]]);
+	              tq_a[0], tq_a[1], tq_a[2], tq_a[3], lvd_q);
 	if (m1.iack) begin
 		// CPU space (interrupt acknowledge) is never translated nor cached
 		x_dc1     = '0;
@@ -541,7 +560,7 @@ typedef enum logic [5:0] {
 	E_S_START, E_S_XL, E_S_XLW, E_S_XL2, E_S_ACT, E_S_RD, E_S_RDW, E_S_RD2, E_S_BUSD,
 	E_S_NEXT, E_S_DONE, E_SP_W, E_SP_2, E_SP_3,
 	E_W_START, E_W_PART, E_W_DONE,
-	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE,
+	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE, E_M_CLR,
 	E_FILL, E_FILLW, E_FILL_W, E_FILL_INS, E_PUSHV, E_PUSHVW, E_PUSHV_W, E_PUSHV_B,
 	E_BUS, E_BUS_W,
 	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
@@ -771,7 +790,7 @@ always_ff @(posedge clk) begin
 
 	if (!nreset) begin
 		m1 <= '0; m2 <= '0; m3 <= '0; m4 <= '0;
-		e_st <= E_IDLE; e_ret <= E_IDLE; e_sret <= E_IDLE; e_wret <= E_IDLE;
+		e_st <= E_M_CLR; e_ret <= E_IDLE; e_sret <= E_IDLE; e_wret <= E_IDLE;
 		e_dc2_done <= 1'b0; e_wst_done <= 1'b0;
 		e_ldata <= '0; e_flt <= 1'b0; e_faddr <= '0; e_fssw <= '0;
 		e_part <= 1'b0; e_x <= '0; e_va <= '0; e_n <= '0; e_acc <= '0; e_fromline <= 1'b0;
@@ -805,9 +824,11 @@ always_ff @(posedge clk) begin
 		m1_stale <= 1'b0;
 		sn_ph <= SN_IDLE; sn_src <= '0; sn_way <= '0; bo_cancel <= 1'b0;
 		sn_look <= 1'b0; sn_hit <= 1'b0; sn_dirty <= 1'b0;
-		for (int i = 0; i < 64; i++) begin
-			lv[i] <= 4'd0;
-		end
+		// synthesis translate_off
+		for (int i = 0; i < 64; i++) lv[i] <= 4'd0;
+		// synthesis translate_on
+		clr_i   <= '0;
+		clr_rst <= 1'b1;
 	end
 	else begin
 		// the valid/dirty write port: at most one writer per cycle (the
@@ -817,9 +838,8 @@ always_ff @(posedge clk) begin
 		logic [3:0] vp_wm;               // ways written
 		logic       vp_lwe, vp_lv;       // valid: write, value
 		logic       vp_dwe, vp_dv;       // dirty: write, value
-		logic       vp_all;              // invalidate everything
 		vp_set = '0; vp_wm = '0; vp_lwe = 1'b0; vp_lv = 1'b0;
-		vp_dwe = 1'b0; vp_dv = 1'b0; vp_all = 1'b0;
+		vp_dwe = 1'b0; vp_dv = 1'b0;
 
 		//--------------------------------------------------------------
 		// stage records
@@ -1008,7 +1028,7 @@ always_ff @(posedge clk) begin
 		E_SP_2: begin
 			xres_t x;
 			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
-			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[m2.r.a[9:4] + 6'd1]);
+			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lve_q);
 			// the second part's translation and lookup, registered (the
 			// decision and the data next cycle; the RAM keeps reading the
 			// stolen set)
@@ -1028,7 +1048,7 @@ always_ff @(posedge clk) begin
 		E_S_XL2: begin
 			xres_t x;
 			x = xlate(e_va, m2.r.smode, (m2.r.mem != M_LD), atc_hit, atc_e,
-			          tq_a[0], tq_a[1], tq_a[2], tq_a[3], lv[e_va[9:4]]);
+			          tq_a[0], tq_a[1], tq_a[2], tq_a[3], lve_q);
 			if (m2.r.iack) begin
 				x    = '0;
 				x.ok = 1'b1;
@@ -1111,7 +1131,7 @@ always_ff @(posedge clk) begin
 				if (alloc && e_x.cm == 2'b01 && !e_x.hit) begin
 					f_set  <= e_va[9:4];
 					f_tag  <= e_x.pa[31:10];
-					f_way  <= victim(lv[e_va[9:4]], rrc);
+					f_way  <= victim(lve_q, rrc);
 					e_sret <= E_S_XL;
 					e_st   <= E_FILL;
 				end
@@ -1134,7 +1154,7 @@ always_ff @(posedge clk) begin
 			else if (alloc && rd && !e_x.hit) begin
 				f_set  <= e_va[9:4];
 				f_tag  <= e_x.pa[31:10];
-				f_way  <= victim(lv[e_va[9:4]], rrc);
+				f_way  <= victim(lve_q, rrc);
 				e_sret <= E_S_XL;
 				e_st   <= E_FILL;
 			end
@@ -1330,8 +1350,8 @@ always_ff @(posedge clk) begin
 					// CINV / CPUSH
 					if (!mt_caches[0]) e_st <= E_M_IC;
 					else if (mt_op == MT_CINV && mt_scope == 2'd3) begin
-						vp_all = 1'b1;
-						e_st <= E_M_IC;
+						clr_i <= '0;
+						e_st  <= E_M_CLR;
 					end
 					else begin
 						// scan one set (line), or every set (page, all)
@@ -1340,6 +1360,16 @@ always_ff @(posedge clk) begin
 					end
 				end
 			endcase
+		end
+		E_M_CLR: begin
+			// every line invalid, a set a cycle (CINVA; and after reset)
+			vp_set = clr_i; vp_wm = 4'hF;
+			vp_lwe = 1'b1; vp_lv = 1'b0;
+			clr_i <= clr_i + 6'd1;
+			if (clr_i == 6'd63) begin
+				clr_rst <= 1'b0;
+				e_st    <= clr_rst ? E_IDLE : E_M_IC;
+			end
 		end
 		E_M_PG: begin
 			// the stolen ATC read of the page is valid now: flush it.  The
@@ -1379,7 +1409,7 @@ always_ff @(posedge clk) begin
 		end
 		E_M_SCANW: begin
 			// (a write this cycle reaches the copy at the write port)
-			sc_lv <= lv[sc_set];
+			sc_lv <= lve_q;
 			sc_ld <= ld_q;                 // (ld_ra: sc_set)
 			e_st <= E_M_SCAN2;
 		end
@@ -1445,7 +1475,7 @@ always_ff @(posedge clk) begin
 		end
 		E_FILLW: e_st <= E_FILL_W;
 		E_FILL_W: begin
-			if (lv[f_set][f_way] && ld_q[f_way]) begin     // (ld_ra: f_set)
+			if (lve_q[f_way] && ld_q[f_way]) begin     // (ld_ra, lv_ra: f_set)
 				pv_v     <= 1'b1;
 				pv_line  <= dq_rn[f_way];
 				pv_lpa   <= {tq_b[f_way], f_set};
@@ -1520,7 +1550,7 @@ always_ff @(posedge clk) begin
 		end
 		E_PUSHVW: e_st <= E_PUSHV_W;
 		E_PUSHV_W: begin
-			if (lv[f_set][f_way] && ld_q[f_way]) begin     // (ld_ra: f_set)
+			if (lve_q[f_way] && ld_q[f_way]) begin     // (ld_ra, lv_ra: f_set)
 				pv_v     <= 1'b1;
 				pv_line  <= dq_rn[f_way];
 				pv_lpa   <= {tq_b[f_way], f_set};
@@ -1624,7 +1654,7 @@ always_ff @(posedge clk) begin
 			logic h; logic [1:0] w;
 			h = 1'b0; w = 2'd0;
 			for (int i = 0; i < 4; i++)
-				if (lv[tw_da[9:4]][i] && tq_b[i] == tw_da[31:10]) begin h = 1'b1; w = 2'(i); end
+				if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin h = 1'b1; w = 2'(i); end
 			if (h && dc_en) begin
 				tw_d <= take(dq_rn[w], tw_da[3:0], 3'd4);
 				e_st <= E_TW_EVAL;
@@ -1729,7 +1759,7 @@ always_ff @(posedge clk) begin
 			vp_set = tw_da[9:4];
 			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 			for (int i = 0; i < 4; i++)
-				if (lv[tw_da[9:4]][i] && tq_b[i] == tw_da[31:10]) vp_wm[i] = 1'b1;
+				if (lve_q[i] && tq_b[i] == tw_da[31:10]) vp_wm[i] = 1'b1;
 			e_wret <= e_ret;
 			e_ret  <= E_TW_UPD_W;
 			e_st   <= E_BUS;
@@ -1833,7 +1863,7 @@ always_ff @(posedge clk) begin
 			s = sn_pa[9:4];
 			h = 1'b0; w = 2'd0;
 			for (int i = 0; i < 4; i++)
-				if (lv[s][i] && tq_a[i] == sn_pa[31:10]) begin h = 1'b1; w = 2'(i); end
+				if (lve_q[i] && tq_a[i] == sn_pa[31:10]) begin h = 1'b1; w = 2'(i); end
 			sn_way <= w;
 			sn_look <= 1'b1;
 			if (h) begin
@@ -1918,21 +1948,20 @@ always_ff @(posedge clk) begin
 		//--------------------------------------------------------------
 		// the valid/dirty write port
 		//--------------------------------------------------------------
-		if (vp_all) begin
-			for (int i = 0; i < 64; i++) begin
-				lv[i] <= 4'd0;
-			end
-			sc_lv <= 4'd0;
-			sc_ld <= 4'd0;
-		end
-		else begin
+		begin
 			if (vp_dwe && vp_wm[0]) ldm0[vp_set] <= vp_dv;
 			if (vp_dwe && vp_wm[1]) ldm1[vp_set] <= vp_dv;
 			if (vp_dwe && vp_wm[2]) ldm2[vp_set] <= vp_dv;
 			if (vp_dwe && vp_wm[3]) ldm3[vp_set] <= vp_dv;
+			if (vp_lwe && vp_wm[0]) begin lvd0[vp_set] <= vp_lv; lve0[vp_set] <= vp_lv; end
+			if (vp_lwe && vp_wm[1]) begin lvd1[vp_set] <= vp_lv; lve1[vp_set] <= vp_lv; end
+			if (vp_lwe && vp_wm[2]) begin lvd2[vp_set] <= vp_lv; lve2[vp_set] <= vp_lv; end
+			if (vp_lwe && vp_wm[3]) begin lvd3[vp_set] <= vp_lv; lve3[vp_set] <= vp_lv; end
 			for (int j = 0; j < 4; j++)
 				if (vp_wm[j]) begin
+					// synthesis translate_off
 					if (vp_lwe) lv[vp_set][j] <= vp_lv;
+					// synthesis translate_on
 					if (vp_lwe && vp_set == sc_set) sc_lv[j] <= vp_lv;
 					if (vp_dwe && vp_set == sc_set) sc_ld[j] <= vp_dv;
 				end
@@ -1974,5 +2003,30 @@ assign fault   = e_dc2_done && e_flt;
 assign fvec    = 8'd2;
 assign faddr   = e_faddr;
 assign fssw    = e_fssw;
+
+// the valid copies' reads: DC1's lookup; the engine state's set (a
+// split's next line, the slow path's, the scan's, the walk's descriptor,
+// else the fill/push set), or the snooped set while the engine is frozen
+assign lvd_q = {lvd3[m1.a[9:4]], lvd2[m1.a[9:4]], lvd1[m1.a[9:4]], lvd0[m1.a[9:4]]};
+assign lve_q = {lve3[lv_ra], lve2[lv_ra], lve1[lv_ra], lve0[lv_ra]};
+always_comb
+	lv_ra = (sn_ph == SN_B)                            ? sn_pa[9:4] :
+	        (e_st == E_SP_2)                           ? m2.r.a[9:4] + 6'd1 :
+	        (e_st == E_S_XL2 || e_st == E_S_ACT)       ? e_va[9:4] :
+	        (e_st == E_M_SCANW || e_st == E_M_SCAN2)   ? sc_set :
+	        (e_st == E_TW_DLK || e_st == E_TW_UPD)     ? tw_da[9:4] : f_set;
+initial for (int i = 0; i < 64; i++) begin
+	lvd0[i] = 1'b0; lvd1[i] = 1'b0; lvd2[i] = 1'b0; lvd3[i] = 1'b0;
+	lve0[i] = 1'b0; lve1[i] = 1'b0; lve2[i] = 1'b0; lve3[i] = 1'b0;
+end
+// synthesis translate_off
+// the copies against the flip-flop model (after reset's sweep)
+always_ff @(posedge clk)
+	if (nreset && !clr_rst && (lvd_q != lv[m1.a[9:4]] || lve_q != lv[lv_ra])) begin
+		$display("FAIL: dmu: valid RAM %b/%b, model %b/%b (sets %0d %0d)",
+		         lvd_q, lve_q, lv[m1.a[9:4]], lv[lv_ra], m1.a[9:4], lv_ra);
+		$finish;
+	end
+// synthesis translate_on
 
 endmodule

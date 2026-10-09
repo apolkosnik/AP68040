@@ -238,7 +238,24 @@ ap68040_atc iatc (
 // cache arrays: tags and data in block RAM (read address registered in
 // F0), valid bits in flip-flops
 //--------------------------------------------------------------------------
-logic  [3:0]   iv [64];
+// line valid, per set and way: LUT RAMs written at the edge and read
+// without a clock -- one copy at F1's set, one at the fill's set or the
+// invalidation's (they never run at once).  Clearing every line (CINVA,
+// a snooped clear, reset) runs the invalidation over the 64 sets
+(* ramstyle = "MLAB, no_rw_check" *) logic ivf0 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivf1 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivf2 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivf3 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivo0 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivo1 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivo2 [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic ivo3 [64];
+wire   [3:0]   ivf_q, ivo_q;
+logic  [5:0]   ivo_ra;
+logic          inv_rst;         // the invalidation is reset's clear
+// synthesis translate_off
+logic  [3:0]   iv [64];         // (simulation: the flip-flop model, checked)
+// synthesis translate_on
 logic  [1:0]   rr;
 logic  [5:0]   c_raddr;
 logic          c_we;
@@ -354,7 +371,7 @@ always_comb begin
 	x_hit  = 1'b0;
 	x_way  = 2'd0;
 	for (int i = 3; i >= 0; i--)
-		if (iv[f1_pc[9:4]][i] && (use_t ? (ct[i][21:0] == tg) : (ct[i][21:0] == f1_pc[31:10]))) begin
+		if (ivf_q[i] && (use_t ? (ct[i][21:0] == tg) : (ct[i][21:0] == f1_pc[31:10]))) begin
 			x_hit = 1'b1; x_way = 2'(i);
 		end
 	x_hit  = x_hit && x_cach;
@@ -412,7 +429,11 @@ always_ff @(posedge clk) begin
 	logic        frw;              // the return stack's write (below)
 	logic  [2:0] frwa;
 	logic [30:0] frwd;
+	logic  [5:0] iw_set;           // the valid RAMs' write (below)
+	logic  [3:0] iw_m;
+	logic        iw_v;
 	frw = 1'b0; frwa = '0; frwd = '0;
+	iw_set = '0; iw_m = '0; iw_v = 1'b0;
 	if (!nreset) begin
 		cnt   <= '0;
 		qf    <= '0; qd <= '0; qa <= '0;
@@ -439,12 +460,16 @@ always_ff @(posedge clk) begin
 		iw_req <= 1'b0;
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
-		inv_busy <= 1'b0; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
-		inv_sn <= 1'b0; inv_scope <= '0; inv_pa <= '0; inv_lbh <= 1'b0;
+		// (reset clears every line: the invalidation runs over the sets)
+		inv_busy <= 1'b1; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
+		inv_sn <= 1'b0; inv_scope <= 2'd3; inv_pa <= '0; inv_lbh <= 1'b0;
+		inv_rst <= 1'b1;
 		sn_ihit <= 1'b0;
 		ic_inv_done <= 1'b0;
 		sn_inv_done <= 1'b0;
+		// synthesis translate_off
 		for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
+		// synthesis translate_on
 		for (int i = 0; i < QN; i++) begin qw[i] <= '0; qp[i] <= '0; end
 	end
 	else begin
@@ -596,7 +621,7 @@ always_ff @(posedge clk) begin
 			end
 			else if (x_cach) begin
 				logic [3:0] vv;
-				vv = iv[f1_pc[9:4]];
+				vv = ivf_q;
 				st      <= S_FILL;
 				lb_v    <= 1'b0;          // its beats go into m_line
 				m_alloc <= 1'b1;
@@ -638,8 +663,8 @@ always_ff @(posedge clk) begin
 					c_waddr <= m_pa[9:4];
 					c_wway  <= m_way;
 					c_wtag  <= m_pa[31:10];
-					iv[m_pa[9:4]][m_way] <= 1'b1;
-					if (iv[m_pa[9:4]] == 4'hF) rr <= rr + 2'd1;
+					iw_set = m_pa[9:4]; iw_m[m_way] = 1'b1; iw_v = 1'b1;
+					if (ivo_q == 4'hF) rr <= rr + 2'd1;     // (ivo_ra: m_pa's set)
 				end
 				lb_v  <= 1'b1;
 				lb_pa <= m_pa[31:4];
@@ -745,11 +770,12 @@ always_ff @(posedge clk) begin
 			inv_pa    <= ic_inv ? ic_inv_pa : sn_inv_pa;
 			inv_lbh   <= !ic_inv && lb_v && lb_pa == sn_inv_pa[31:4];
 			if (ic_inv ? (ic_inv_scope == 2'd3) : sn_inv_all) begin
-				for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
-				ic_inv_done <= ic_inv;
-				sn_inv_done <= !ic_inv;
-				sn_ihit     <= !ic_inv;
-				inv_hold    <= 1'b1;
+				// every line: the sweep below (scope 3 matches every way)
+				inv_scope <= 2'd3;
+				sn_ihit   <= !ic_inv;
+				inv_busy  <= 1'b1;
+				inv_ph    <= 1'b0;
+				inv_i     <= 7'd0;
 			end
 			else begin
 				inv_busy <= 1'b1;
@@ -765,14 +791,16 @@ always_ff @(posedge clk) begin
 				s = (inv_scope == 2'd1) ? inv_pa[9:4] : 6'(inv_i - 7'd1);
 				for (int w = 0; w < 4; w++) begin
 					logic m;
-					if (inv_scope == 2'd1)
+					if (inv_scope == 2'd3)
+						m = 1'b1;
+					else if (inv_scope == 2'd1)
 						m = ct[w][21:0] == inv_pa[31:10];
 					else if (tc_p)
 						m = ct[w][21:3] == inv_pa[31:13];
 					else
 						m = ct[w][21:2] == inv_pa[31:12];
-					if (m) iv[s][w] <= 1'b0;
-					if (m && iv[s][w] && inv_sn) sn_ihit <= 1'b1;
+					if (m) begin iw_set = s; iw_m[w] = 1'b1; iw_v = 1'b0; end
+					if (m && ivo_q[w] && inv_sn) sn_ihit <= 1'b1;   // (ivo_ra: s)
 				end
 				if (inv_sn && inv_lbh) sn_ihit <= 1'b1;
 			end
@@ -789,14 +817,43 @@ always_ff @(posedge clk) begin
 				inv_i <= inv_i + 7'd1;
 				if (inv_i == 7'd64) begin
 					inv_busy    <= 1'b0;
-					ic_inv_done <= 1'b1;
+					ic_inv_done <= !inv_sn && !inv_rst;
+					sn_inv_done <= inv_sn;
 					inv_hold    <= 1'b1;
+					inv_rst     <= 1'b0;
 				end
 			end
 		end
 	end
 	// the return stack's one write port
 	if (nreset && frw) fras[frwa] <= frwd;
+	// the valid RAMs' one write (both copies)
+	if (nreset) begin
+		if (iw_m[0]) begin ivf0[iw_set] <= iw_v; ivo0[iw_set] <= iw_v; end
+		if (iw_m[1]) begin ivf1[iw_set] <= iw_v; ivo1[iw_set] <= iw_v; end
+		if (iw_m[2]) begin ivf2[iw_set] <= iw_v; ivo2[iw_set] <= iw_v; end
+		if (iw_m[3]) begin ivf3[iw_set] <= iw_v; ivo3[iw_set] <= iw_v; end
+		// synthesis translate_off
+		for (int j = 0; j < 4; j++) if (iw_m[j]) iv[iw_set][j] <= iw_v;
+		// synthesis translate_on
+	end
 end
+
+// the valid copies' reads: F1's set; the invalidation's, else the fill's
+wire [5:0] inv_s = (inv_scope == 2'd1) ? inv_pa[9:4] : 6'(inv_i - 7'd1);
+always_comb ivo_ra = inv_busy ? inv_s : m_pa[9:4];
+assign ivf_q = {ivf3[f1_pc[9:4]], ivf2[f1_pc[9:4]], ivf1[f1_pc[9:4]], ivf0[f1_pc[9:4]]};
+assign ivo_q = {ivo3[ivo_ra], ivo2[ivo_ra], ivo1[ivo_ra], ivo0[ivo_ra]};
+initial for (int i = 0; i < 64; i++) begin
+	ivf0[i] = 1'b0; ivf1[i] = 1'b0; ivf2[i] = 1'b0; ivf3[i] = 1'b0;
+	ivo0[i] = 1'b0; ivo1[i] = 1'b0; ivo2[i] = 1'b0; ivo3[i] = 1'b0;
+end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && !inv_rst && (ivf_q != iv[f1_pc[9:4]] || ivo_q != iv[ivo_ra])) begin
+		$display("FAIL: fetch: valid RAM %b/%b, model %b/%b", ivf_q, ivo_q, iv[f1_pc[9:4]], iv[ivo_ra]);
+		$finish;
+	end
+// synthesis translate_on
 
 endmodule
