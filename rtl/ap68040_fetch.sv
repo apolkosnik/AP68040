@@ -145,7 +145,10 @@ logic [15:0]   qw [QN];
 // the words' predecode: D1 reads only the head's, so it is a ring (no
 // shift) with the head in a register (qp0) -- loaded as D1 consumes from
 // the ring, or from F3 when the queue empties into it
-pd_t           qpr [QN];
+// (two LUT RAM banks by slot parity: F3's two words land in consecutive
+// slots, one per bank, so each bank has one write a cycle)
+(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_e [QN/2];
+(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_o [QN/2];
 logic  [3:0]   qh;             // the ring's head
 pd_t           qp0;
 // synthesis translate_off
@@ -165,7 +168,10 @@ assign q_odd = odd;
 assign pd0   = qp0;
 // the head's predecode as it will be next cycle (qp0's load): D1's
 // attribute ROM reads it a cycle ahead
-assign pd0_n = (cnt == {2'b00, consume}) ? f3_p[0] : qpr[qwrap(5'(qh) + {2'b00, consume})];
+wire [3:0] qh_n = qwrap(5'(qh) + {2'b00, consume});        // the head next cycle
+pd_t       qpr_rd;
+assign qpr_rd = pd_t'(qh_n[0] ? qpr_o[qh_n[3:1]] : qpr_e[qh_n[3:1]]);
+assign pd0_n = (cnt == {2'b00, consume}) ? f3_p[0] : qpr_rd;
 function automatic logic [3:0] qwrap(input logic [4:0] x);   // x mod QN, x < 2*QN
 	qwrap = (x >= 5'(QN)) ? 4'(x - 5'(QN)) : x[3:0];
 endfunction
@@ -536,10 +542,19 @@ always_ff @(posedge clk) begin
 		cnt   <= keep + {3'b000, f3_n};
 		// the predecode ring: appended at head + count (wherever D1's
 		// consume puts the head), the head moved by consume
-		for (int k = 0; k < 2; k++)
-			if (2'(k) < f3_n) qpr[qwrap(5'(qh) + cnt + 5'(k))] <= f3_p[k];
-		qh  <= qwrap(5'(qh) + {2'b00, consume});
-		qp0 <= (keep == 5'd0) ? f3_p[0] : qpr[qwrap(5'(qh) + {2'b00, consume})];
+		begin
+			logic [3:0] w0, w1;
+			w0 = qwrap(5'(qh) + cnt);
+			w1 = qwrap(5'(qh) + cnt + 5'd1);
+			if (f3_n != 2'd0) begin
+				if (w0[0]) qpr_o[w0[3:1]] <= f3_p[0]; else qpr_e[w0[3:1]] <= f3_p[0];
+			end
+			if (f3_n == 2'd2) begin
+				if (w1[0]) qpr_o[w1[3:1]] <= f3_p[1]; else qpr_e[w1[3:1]] <= f3_p[1];
+			end
+			qh  <= qh_n;
+			qp0 <= pd0_n;
+		end
 		// D1 consumed the end of a BTB-taken branch: the stream continues
 		// at its target (the words after it in the queue came from there)
 		begin

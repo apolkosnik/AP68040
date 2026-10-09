@@ -87,82 +87,105 @@ wire [15:0] unpk_r  = {4'd0, b[7:4], 4'd0, b[3:0]} + a[15:0];
 //--------------------------------------------------------------------------
 logic [31:0] sh_r;
 logic        sh_c, sh_x, sh_v;
-// The rotates use two funnels instead of a pair of shifters each: the
-// operand repeated with the rotate's period from bit 0 ({P, P}) shifted
-// right by k (< the period) has P rotated right by k at the bottom; a left
-// rotate is a right rotate by the period less the count.
-logic [65:0] rot_v, rox_v;      // the operand, and {X, operand}, repeated
-logic  [5:0] rot_k, rox_k;
-logic [65:0] rot_o, rox_o;
+// One right funnel (66 bits) does LSR, ASR, ROR, ROL, ROXR and ROXL; one
+// left funnel does LSL and ASL.  The right funnel's input is the operand
+// zero- or sign-extended (with a 0 below it: the bit just below the
+// result is the last bit shifted out, the carry), or repeated with the
+// rotate's period (the size, or the size + 1 with X for ROXR/ROXL), so a
+// right shift by the rotate count leaves the rotated value at the bottom.
+// A left rotate is a right rotate by the period less the count.
+logic  [5:0] sh_n, sh_nm, sh_nx;
+logic [65:0] rv, ro;
+logic  [6:0] ra;
+logic [65:0] lo;
 always_comb begin
-	logic  [5:0] n, nm, nx, ne;
-	logic [31:0] win;
-	n  = cnt;
-	nm = n & (nbits - 6'd1);
+	logic [33:0] seg;
+	logic [33:0] therm;
+	sh_n  = cnt;
+	sh_nm = sh_n & (nbits - 6'd1);
 	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider)
-	nx = n;
+	sh_nx = sh_n;
 	case (nbits)
 		6'd8: begin
-			if (nx >= 6'd36) nx = nx - 6'd36;
-			if (nx >= 6'd18) nx = nx - 6'd18;
-			if (nx >= 6'd9)  nx = nx - 6'd9;
+			if (sh_nx >= 6'd36) sh_nx = sh_nx - 6'd36;
+			if (sh_nx >= 6'd18) sh_nx = sh_nx - 6'd18;
+			if (sh_nx >= 6'd9)  sh_nx = sh_nx - 6'd9;
 		end
 		6'd16: begin
-			if (nx >= 6'd34) nx = nx - 6'd34;
-			if (nx >= 6'd17) nx = nx - 6'd17;
+			if (sh_nx >= 6'd34) sh_nx = sh_nx - 6'd34;
+			if (sh_nx >= 6'd17) sh_nx = sh_nx - 6'd17;
 		end
-		default: if (nx >= 6'd33) nx = nx - 6'd33;
+		default: if (sh_nx >= 6'd33) sh_nx = sh_nx - 6'd33;
 	endcase
-	ne = (n > nbits) ? nbits : n;
+	// the right funnel's input and count.  A rotate's input repeats its
+	// period P from bit 0 ({P, P}): shifted right by k (< the period), its
+	// low bits are P rotated right by k
+	case (op)
+		OP_ASR:  begin
+			rv = {{34{b_msb}}, bm, 1'b0};
+			case (sz)
+				SZ_B:    rv[65:9]  = {57{b_msb}};
+				SZ_W:    rv[65:17] = {49{b_msb}};
+				default: ;
+			endcase
+			ra = {1'b0, sh_n};
+		end
+		OP_ROL, OP_ROR: begin
+			case (sz)
+				SZ_B:    rv = {50'd0, bm[7:0], bm[7:0]};
+				SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
+				default: rv = {2'd0, bm, bm};
+			endcase
+			ra = (op == OP_ROR) ? {1'b0, sh_nm} : {1'b0, (nbits - sh_nm) & (nbits - 6'd1)};
+		end
+		OP_ROXL, OP_ROXR: begin
+			case (sz)
+				SZ_B:    rv = {48'd0, f_x, bm[7:0], f_x, bm[7:0]};
+				SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
+				default: rv = {f_x, bm, f_x, bm};
+			endcase
+			ra = (op == OP_ROXR) ? {1'b0, sh_nx}
+			                     : ((sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx}));
+		end
+		default: begin   // LSR
+			rv = {33'd0, bm, 1'b0};
+			ra = {1'b0, sh_n};
+		end
+	endcase
+	ro = (op == OP_ASR) ? 66'($signed(rv) >>> ra) : (rv >> ra);
+	lo = {34'd0, bm} << sh_n;
+	// ASL: the bits shifted out and the new sign bit must all be equal
 	case (sz)
-		SZ_B:    begin rot_v = {50'd0, bm[7:0], bm[7:0]};   rox_v = {48'd0, f_x, bm[7:0], f_x, bm[7:0]}; end
-		SZ_W:    begin rot_v = {34'd0, bm[15:0], bm[15:0]}; rox_v = {32'd0, f_x, bm[15:0], f_x, bm[15:0]}; end
-		default: begin rot_v = {2'd0, bm, bm};              rox_v = {f_x, bm, f_x, bm}; end
+		SZ_B:    seg = lo[40:7];
+		SZ_W:    seg = lo[48:15];
+		default: seg = lo[64:31];
 	endcase
-	rot_k = (op == OP_ROR) ? nm : ((nbits - nm) & (nbits - 6'd1));
-	rox_k = (op == OP_ROXR) ? nx : ((nx == 6'd0) ? 6'd0 : (nbits + 6'd1 - nx));
-	rot_o = rot_v >> rot_k;
-	rox_o = rox_v >> rox_k;
+	therm = (34'd2 << sh_n) - 34'd1;
 	sh_r = bm;
 	sh_c = 1'b0;
 	sh_x = f_x;
 	sh_v = 1'b0;
-	win  = '0;
-	if (n != 6'd0) begin
+	if (sh_n != 6'd0) begin
 		case (op)
 			OP_ASL, OP_LSL: begin
-				sh_r = (bm << n) & szmask;
-				sh_c = (n <= nbits) && (((bm >> (nbits - n)) & 32'd1) != 0);
+				sh_r = lo[31:0] & szmask;
+				sh_c = (sh_n <= nbits) && lo[nbits];
 				sh_x = sh_c;
-				if (op == OP_ASL) begin
-					if (n >= nbits) sh_v = (bm != 0);
-					else begin
-						win  = bm >> (nbits - 6'd1 - n);
-						sh_v = !((win == 0) || (win == ((32'd2 << n) - 32'd1)));
-					end
-				end
+				if (op == OP_ASL)
+					sh_v = (sh_n >= nbits) ? (bm != 0) : !((seg == 0) || (seg == therm));
 			end
-			OP_LSR: begin
-				sh_r = bm >> n;
-				sh_c = (n <= nbits) && (((bm >> (n - 6'd1)) & 32'd1) != 0);
+			OP_LSR, OP_ASR: begin
+				sh_r = ro[32:1] & szmask;
+				sh_c = ro[0];
 				sh_x = sh_c;
 			end
-			OP_ASR: begin
-				sh_r = (bm >> ne) | (b_msb ? ((~(szmask >> ne)) & szmask) : 32'd0);
-				sh_c = (n >= nbits) ? b_msb : (((bm >> (n - 6'd1)) & 32'd1) != 0);
-				sh_x = sh_c;
+			OP_ROL, OP_ROR: begin
+				sh_r = ro[31:0] & szmask;
+				sh_c = (op == OP_ROL) ? sh_r[0] : sh_r[nbits - 6'd1];
 			end
-			OP_ROL: begin
-				sh_r = rot_o[31:0] & szmask;
-				sh_c = sh_r[0];
-			end
-			OP_ROR: begin
-				sh_r = rot_o[31:0] & szmask;
-				sh_c = sh_r[nbits - 6'd1];
-			end
-			default: begin // OP_ROXL, OP_ROXR
-				sh_x = rox_o[nbits];
-				sh_r = rox_o[31:0] & szmask;
+			default: begin   // ROXL, ROXR
+				sh_x = ro[nbits];
+				sh_r = ro[31:0] & szmask;
 				sh_c = sh_x;
 			end
 		endcase
