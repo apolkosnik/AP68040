@@ -147,8 +147,8 @@ logic [15:0]   qw [QN];
 // the ring, or from F3 when the queue empties into it
 // (two LUT RAM banks by slot parity: F3's two words land in consecutive
 // slots, one per bank, so each bank has one write a cycle)
-(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_e [QN/2];
-(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_o [QN/2];
+(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_e [8];
+(* ramstyle = "MLAB, no_rw_check" *) logic [$bits(pd_t)-1:0] qpr_o [8];
 logic  [3:0]   qh;             // the ring's head
 pd_t           qp0;
 // synthesis translate_off
@@ -543,15 +543,16 @@ always_ff @(posedge clk) begin
 		// the predecode ring: appended at head + count (wherever D1's
 		// consume puts the head), the head moved by consume
 		begin
+			// (one write statement per bank, the word by the slot's parity:
+			// two statements read as two write ports and keep it in logic)
 			logic [3:0] w0, w1;
+			logic       we_e, we_o;
 			w0 = qwrap(5'(qh) + cnt);
 			w1 = qwrap(5'(qh) + cnt + 5'd1);
-			if (f3_n != 2'd0) begin
-				if (w0[0]) qpr_o[w0[3:1]] <= f3_p[0]; else qpr_e[w0[3:1]] <= f3_p[0];
-			end
-			if (f3_n == 2'd2) begin
-				if (w1[0]) qpr_o[w1[3:1]] <= f3_p[1]; else qpr_e[w1[3:1]] <= f3_p[1];
-			end
+			we_e = (f3_n != 2'd0 && !w0[0]) || (f3_n == 2'd2 && !w1[0]);
+			we_o = (f3_n != 2'd0 &&  w0[0]) || (f3_n == 2'd2 &&  w1[0]);
+			if (we_e) qpr_e[w0[0] ? w1[3:1] : w0[3:1]] <= w0[0] ? f3_p[1] : f3_p[0];
+			if (we_o) qpr_o[w0[0] ? w0[3:1] : w1[3:1]] <= w0[0] ? f3_p[0] : f3_p[1];
 			qh  <= qh_n;
 			qp0 <= pd0_n;
 		end
