@@ -617,8 +617,10 @@ always @(posedge clk) if (ce) begin
 	mul_lh <= mul_x[31:0]  * mul_y[63:32];
 	mul_ll <= mul_x[31:0]  * mul_y[31:0];
 end
-wire [127:0] mul_out = {mul_hh, 64'd0} + {32'd0, mul_hl, 32'd0} +
-                       {32'd0, mul_lh, 32'd0} + {64'd0, mul_ll};
+// ({hh, ll} is a concatenation; the cross products sum in 65 bits and
+// land on bits 96:32: one 65-bit and one 96-bit adder, not three of 128)
+wire  [64:0] mul_cross = {1'b0, mul_hl} + {1'b0, mul_lh};
+wire [127:0] mul_out = {mul_hh, mul_ll} + {31'd0, mul_cross, 32'd0};
 
 // FDIV and FSQRT: one restoring datapath, two steps a cycle.  Divide:
 // the remainder shifts one bit (zeros enter; the first, integer step does

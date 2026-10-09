@@ -378,7 +378,11 @@ end
 // (a LUT RAM: one push, one read at the top and one at the pointer the
 // fetch resynchronizes to; never cleared -- an entry is read only below
 // the count of entries pushed)
+// (one read, at the pointer the fetch resynchronizes to: the prediction's
+// read at ras_tp is the same unless a redirect restored the pointer, and
+// the redirect flushes D1 -- two read addresses kept the stack in logic)
 (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] ras [8];
+wire [31:0] ras_top = ras[ras_tp_o];
 logic  [2:0] ras_tp;           // the top entry
 logic  [3:0] ras_n;            // entries held (0..8)
 
@@ -615,8 +619,8 @@ always_comb begin
 			jsr_k = (a0.rt == UA_JSR);
 		end
 		else if (a0.rt == UA_RTS && ras_n != 4'd0) begin
-			ntarget = ras[ras_tp];
-			teq     = (ras[ras_tp] == bt_tgt);
+			ntarget = ras_top;
+			teq     = (ras_top == bt_tgt);
 			nredir  = 1'b1;
 		end
 		else if (a0.rt == UA_DBCC) begin
@@ -705,7 +709,7 @@ always_comb begin
 	// restored pointer (its pointer and the top entry)
 	ras_tp_o = ras_rv ? ras_rtp : ras_tp;
 	ras_n_o  = ras_rv ? ras_rn  : ras_n;
-	ras_o    = ras[ras_tp_o][31:1];
+	ras_o    = ras_top[31:1];
 end
 
 wire room  = (rq_n != 2'd3);

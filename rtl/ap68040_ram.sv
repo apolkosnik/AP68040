@@ -153,12 +153,12 @@ module ap68040_sdpr #(
 	input  logic [AW-1:0] raddr,
 	output logic [DW-1:0] q
 );
+	// (the output registered, not the address: that read has the block
+	// RAM's own read-during-write semantics, so no bypass logic is built)
 	(* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
-	logic [AW-1:0] ra;
 	initial for (int i = 0; i < (1 << AW); i++) mem[i] = '0;
 	always_ff @(posedge clk) begin
 		if (we) mem[waddr] <= wdata;
-		ra <= raddr;
+		q <= mem[raddr];
 	end
-	assign q = mem[ra];
 endmodule
