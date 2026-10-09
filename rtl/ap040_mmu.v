@@ -44,6 +44,8 @@ module ap040_mmu
 	input             c_instr,
 	input       [1:0] c_size,
 	input      [31:0] c_addr,
+	input      [31:0] c_hint_addr,  // next access, one cycle early (logical)
+	input             c_hint_instr,
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
 	output            c_ack,
@@ -73,6 +75,10 @@ module ap040_mmu
 	output            m_instr,
 	output      [1:0] m_size,
 	output     [31:0] m_addr,
+	output     [31:0] m_hint_addr,  // hint bus, passed down (page offset only matters)
+	output            m_hint_instr,
+	output     [21:0] m_hint_ptag,  // the hint's physical tag, registered
+	output            m_hint_match, // the request is the registered hint
 	output     [31:0] m_wdata,
 	output      [2:0] m_fc,
 	input             m_ack,
@@ -779,4 +785,72 @@ always @(posedge clk) begin
 	end
 end
 
+//---------------------------------------------------------------------------
+// hint-side translation
+//---------------------------------------------------------------------------
+// The core's address hint (one cycle ahead of the request) is translated
+// here through the same hit copy and TTRs and registered, so that the
+// cache can qualify a one-clock hit in the request cycle against a
+// registered physical tag instead of the live translation.  Registered
+// every clock from the live hint bus; m_hint_match asserts when the
+// request now presented is the address, space and supervisor state the
+// copy was made from and nothing that decides a translation has moved
+// since (the copy itself, TC, the TTRs, a walk, sweep or fill).
+wire [3:0]    hn_set = tc_p ? c_hint_addr[16:13] : c_hint_addr[15:12];
+wire [4:0]    hn_row = {c_hint_instr, hn_set};
+wire [16:0]   hn_tag = tc_p ? {a_super, c_hint_addr[31:17], 1'b0}
+                           : {a_super, c_hint_addr[31:16]};
+wire          uh_hit = u_valid[c_hint_instr] && (u_row[c_hint_instr] == hn_row) &&
+                       (u_tag[c_hint_instr] == hn_tag);
+// A held request repeats itself on the hint bus, so when the lookup pipe
+// resolves the request this cycle (the copy is being refilled from it)
+// the same entry translates the hint: without this every first access
+// to a page after a copy miss lost the one-clock hit (3 % of boot
+// dispatches).
+wire          hn_pipe = pipe_hit && (c_hint_addr == c_addr) && (c_hint_instr == c_instr);
+wire [EW-1:0] uh_ent = uh_hit ? u_ent[c_hint_instr] : pipe_ent;
+wire [19:0]   uh_pa  = uh_ent[27:8];
+wire [31:0]   hn_ttra = c_hint_instr ? itt0 : dtt0;
+wire [31:0]   hn_ttrb = c_hint_instr ? itt1 : dtt1;
+wire          hn_ttr_a = ttr_match(hn_ttra, c_hint_addr, a_super);
+wire          hn_ttr_b = ttr_match(hn_ttrb, c_hint_addr, a_super);
+wire          hn_ttr  = hn_ttr_a | hn_ttr_b;
+// The hint's cacheability and read protection, registered with its
+// translation, so the cache's one-clock acknowledge needs nothing from
+// the request's live translation (the ATC read, hit compare and pa mux
+// were 7 ns in front of the acknowledge, 2026-09-15): a cache-inhibited
+// or supervisor-only page never vouches, and the request then takes the
+// ordinary path (bypass, or the access error).
+wire  [1:0]   hn_ttr_cm = hn_ttr_a ? hn_ttra[6:5] : hn_ttrb[6:5];
+wire          hn_ci    = hn_ttr ? hn_ttr_cm[1] :
+                         (tc_e && (uh_hit || hn_pipe)) ? uh_ent[3] : 1'b0;
+wire          hn_sprot = tc_e && !hn_ttr && (uh_hit || hn_pipe) && !a_super && uh_ent[4];
+wire [31:0]   hn_pa   = hn_ttr ? c_hint_addr :
+                        (tc_e && (uh_hit || hn_pipe)) ? (tc_p ? {uh_pa[19:1], c_hint_addr[12], c_hint_addr[11:0]}
+                                                 : {uh_pa, c_hint_addr[11:0]})
+                        : c_hint_addr;
+wire          mmu_quiet = (wst == W_IDLE) && !w_active && !pf_req && !pt_req &&
+                          !sweep_on && !fill_we;
+wire          hn_ok    = (hn_ttr || !tc_e || uh_hit || hn_pipe) && mmu_quiet &&
+                         !hn_ci && !hn_sprot;
+reg  [31:0]   hq_addr;
+reg           hq_instr, hq_super, hq_ok;
+reg  [21:0]   hq_ptag;
+reg [127:0]   ttr_q;
+always @(posedge clk) begin
+	hq_addr  <= c_hint_addr;
+	hq_instr <= c_hint_instr;
+	hq_super <= a_super;
+	hq_ptag  <= hn_pa[31:10];
+	hq_ok    <= nreset && hn_ok;
+	ttr_q    <= {itt0, itt1, dtt0, dtt1};
+end
+assign m_hint_addr  = c_hint_addr;
+assign m_hint_instr = c_hint_instr;
+assign m_hint_ptag  = hq_ptag;
+assign m_hint_match = c_req && hq_ok && (hq_addr == c_addr) && (hq_instr == c_instr) &&
+                      (hq_super == a_super) && (tc == u_tc) &&
+                      (ttr_q == {itt0, itt1, dtt0, dtt1}) && mmu_quiet;
+
 endmodule
+

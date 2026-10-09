@@ -26,7 +26,15 @@ module ap040_alu
 	input      [31:0] b,
 	input       [4:0] flags_in,   // {X,N,Z,V,C}
 	output reg [31:0] result,
-	output reg  [4:0] flags_out
+	output reg  [4:0] flags_out,
+	// The compare-class flags without the result mux: ADD, SUB, CMP, MOVE,
+	// TST, AND, OR, EOR straight from the shared adder and the masked
+	// operands.  Identical to flags_out for those operations; the core's
+	// branch lookahead judges a following Bcc on them within the retire
+	// cycle (the full flags_out came 8 ns later through the shifter and
+	// result select).  fast_ok says the operation is one of them.
+	output reg  [4:0] fast_flags,
+	output reg        fast_ok
 );
 
 wire f_x = flags_in[4];
@@ -60,6 +68,21 @@ wire [32:0] add_full  = {1'b0, bm} + {1'b0, am};
 wire [32:0] addx_full = {1'b0, bm} + {1'b0, am} + {32'd0, f_x};
 wire [32:0] sub_full  = {1'b0, bm} - {1'b0, am};
 wire [32:0] subx_full = {1'b0, bm} - {1'b0, am} - {32'd0, f_x};
+
+always @* begin
+	fast_ok = 1'b1;
+	case (op)
+		`AP040_ALU_ADD: fast_flags = {add_c, add_r_msb, res_zero(add_full[31:0]), add_v, add_c};
+		`AP040_ALU_SUB: fast_flags = {sub_c, sub_r_msb, res_zero(sub_full[31:0]), sub_v, sub_c};
+		`AP040_ALU_CMP: fast_flags = {f_x, sub_r_msb, res_zero(sub_full[31:0]), sub_v, sub_c};
+		`AP040_ALU_MOVE, `AP040_ALU_TST:
+		                fast_flags = {f_x, res_msb(am), res_zero(am), 1'b0, 1'b0};
+		`AP040_ALU_AND: fast_flags = {f_x, res_msb(bm & am), res_zero(bm & am), 1'b0, 1'b0};
+		`AP040_ALU_OR:  fast_flags = {f_x, res_msb(bm | am), res_zero(bm | am), 1'b0, 1'b0};
+		`AP040_ALU_EOR: fast_flags = {f_x, res_msb(bm ^ am), res_zero(bm ^ am), 1'b0, 1'b0};
+		default: begin fast_flags = flags_in; fast_ok = 1'b0; end
+	endcase
+end
 
 // carry out of the sized MSB position for byte/word needs the sized bit
 wire add_c  = (size == `AP040_SZ_B) ? add_full[8]  : (size == `AP040_SZ_W) ? add_full[16]  : add_full[32];

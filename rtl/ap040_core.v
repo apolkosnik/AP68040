@@ -48,6 +48,8 @@ module ap040_core
 	output            mem_instr,
 	output reg  [1:0] mem_size,
 	output     [31:0] mem_addr,
+	output     [31:0] mem_hint_addr,   // next access's address, one cycle early
+	output            mem_hint_instr,
 	output reg [31:0] mem_wdata,
 	output      [2:0] mem_fc,
 	input             mem_ack,
@@ -326,7 +328,13 @@ wire        regs_alu_fire = (state == S_PIPE_REGS || state == S_PIPE_SDONE ||
 wire [31:0] alu_src = (regs_alu_fire && state == S_MRD) ? mem_rdata :
                      (regs_alu_fire && state == S_PIPE_SDONE) ? m_val :
                      (regs_alu_fire && p_src == SK_REG) ? rf_capture_a : src_val;
-wire [31:0] alu_dst = regs_alu_fire ? rf_capture_b : dst_val;
+// A register shift with a nonzero count retires in S_PIPE_REGS as well:
+// the ALU composes the whole count in one call (as S_SHIFT does), so the
+// execute, shift and writeback states are skipped.
+wire        shift_fire = (state == S_PIPE_REGS) && (exec_kind == EK_SHIFT) &&
+                         (p_dst == DK_REG);
+wire  [5:0] shift_cnt  = (p_src == SK_REG) ? rf_capture_a[5:0] : src_val[5:0];
+wire [31:0] alu_dst = (regs_alu_fire || shift_fire) ? rf_capture_b : dst_val;
 wire [31:0] alu_a = alu_is_bitop ? (p_dst_mem_bit ? {29'd0, alu_src[2:0]}
                                                   : {27'd0, alu_src[4:0]}) :
                     p_sextw      ? {{16{alu_src[15]}}, alu_src[15:0]} : alu_src;
@@ -338,8 +346,9 @@ ap040_alu alu
 	.op(alu_op), .size(op_size),
 	.a(alu_a), .b(alu_b),
 	.flags_in(alu_fin),
-	.shcnt((state == S_SHIFT) ? sh_cnt : 6'd1),
-	.result(alu_res), .flags_out(alu_fl)
+	.shcnt((state == S_SHIFT) ? sh_cnt : (shift_fire ? shift_cnt : 6'd1)),
+	.result(alu_res), .flags_out(alu_fl),
+	.fast_flags(alu_fast_fl), .fast_ok(alu_fast_ok)
 );
 
 reg         md_start, md_isdiv, md_sign;
@@ -1722,6 +1731,10 @@ task mwr;
 	end
 endtask
 
+// A register write landing this cycle is the base register's (port A
+// shows the old value): see hint_ext_ok and ea_start's inline paths.
+wire        base_landing  = rf_we && (rf_waddr == rr_a);
+
 task ea_start;
 	input [2:0] mode;
 	input [2:0] rn;
@@ -1766,7 +1779,7 @@ task ea_operand_start;
 		// waiting for it in S_IMMF.
 		ext_inline = (state == S_PIPE_START) && !epf_flushed &&
 		             !mem_ack && epf_ready_pc && (rr_a == {1'b1, rn}) &&
-		             !rf_we && !aux_we;
+		             !base_landing && !aux_we;
 		case (mode)
 			// (An), (An)+, -(An) destination with the base settled on port
 			// A: record the address (and the register update) here, as
@@ -1774,7 +1787,7 @@ task ea_operand_start;
 			// would have.  A pending register write keeps the old path.
 			3'b010, 3'b011, 3'b100:
 				if (ret == S_PIPE_DEA && (state == S_PIPE_START) &&
-				    (rr_a == {1'b1, rn}) && !rf_we && !aux_we) begin
+				    (rr_a == {1'b1, rn}) && !base_landing && !aux_we) begin
 					da = (mode == 3'b100) ? rf_rdata_a - an_adj(rn, size) : rf_rdata_a;
 					if (mode == 3'b011) begin
 						rfw({1'b1, rn}, rf_rdata_a + an_adj(rn, size));
@@ -2036,6 +2049,7 @@ wire [2:0] rd_mode = rd_ir[5:3];
 wire [1:0] rd_sz = rd_ir[7:6];
 reg rd_valid, rd_quick, rd_flags, rd_wbsup, rd_sextw;
 reg rd_imm;                       // immediate source from the queue (lookahead only)
+reg rd_shift;                     // register shift (lookahead only)
 reg [1:0] rd_immn;                // ... its word count
 reg [31:0] rd_qimm;               // quick/MOVEQ immediate
 reg [5:0] rd_alu;
@@ -2053,11 +2067,15 @@ wire [31:0] rd_immv = (rd_immn == 2'd2) ? {rd_w1, rd_w2} : {16'd0, rd_w1};
 wire        rd_is_bcc = (rd_ir[15:12] == 4'h6) && (rd_ir[11:8] != 4'h1) &&
                         (rd_ir[7:0] != 8'h00) && (rd_ir[7:0] != 8'hFF);
 wire [31:0] rd_bcc_t  = pc + 32'd2 + sxb(rd_ir[7:0]);
-wire  [4:0] rd_bcc_fl = (regs_alu_fire && p_flags) ? alu_fl : sr[4:0];
+wire  [4:0] alu_fast_fl;
+wire        alu_fast_ok;
+// the producer's flags from the ALU's fast path (compare class) or sr
+wire  [4:0] rd_bcc_fl = (regs_alu_fire && p_flags) ? alu_fast_fl : sr[4:0];
+wire        rd_bcc_fl_ok = !(regs_alu_fire && p_flags) || alu_fast_ok;
 wire        rd_bcc_taken = cond_true_fl(rd_ir[11:8], rd_bcc_fl);
 always @* begin
 	rd_valid = 0; rd_quick = 0; rd_flags = 1; rd_wbsup = 0; rd_sextw = 0;
-	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval};
+	rd_imm = 0; rd_immn = 2'd1; rd_qimm = {28'd0, rd_qval}; rd_shift = 0;
 	rd_alu = `AP040_ALU_MOVE;
 	rd_size = rd_sz; rd_ssize = rd_sz; rd_dsize = rd_sz;
 	rd_sa = {rd_mode[0], rd_ir[2:0]};
@@ -2083,6 +2101,25 @@ always @* begin
 					3'b101: rd_alu = `AP040_ALU_EOR;
 					default: begin rd_alu = `AP040_ALU_CMP; rd_wbsup = 1; end
 				endcase
+			end
+		end
+		4'hE: begin
+			// register shift/rotate at lookahead only: the count is
+			// immediate (SK_IMPL) or in Dn on port A; S_PIPE_REGS retires it
+			if (rd_sz != 2'b11 && (state != S_DECODE)) begin
+				rd_valid = 1; rd_shift = 1;
+				case (rd_ir[4:3])
+					2'b00: rd_alu = rd_ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1;
+					2'b01: rd_alu = rd_ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1;
+					2'b10: rd_alu = rd_ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
+					default: rd_alu = rd_ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1;
+				endcase
+				rd_da = {1'b0, rd_ir[2:0]};
+				if (rd_ir[5]) rd_sa = {1'b0, rd_ir[11:9]};
+				else begin
+					rd_quick = 1;
+					rd_qimm = {26'd0, (rd_ir[11:9] == 3'd0) ? 6'd8 : {3'd0, rd_ir[11:9]}};
+				end
 			end
 		end
 		4'h7: begin
@@ -2170,6 +2207,8 @@ task dispatch_reg_decode;
 		op_size <= rd_size; p_ssize <= rd_ssize; p_dsize <= rd_dsize;
 		p_src <= rd_quick ? SK_IMPL : (rd_imm ? SK_IMM : SK_REG);
 		if (rd_quick) src_val <= rd_qimm;
+		exec_kind <= rd_shift ? EK_SHIFT : EK_ALU;
+		if (rd_shift) sh_rox <= (rd_ir[4:3] == 2'b10);
 		if (rd_imm) begin
 			// consume the immediate word(s) along with the opcode
 			src_val <= rd_immv; imm <= rd_immv; x_ext <= rd_immv;
@@ -2180,6 +2219,162 @@ task dispatch_reg_decode;
 		p_flags <= rd_flags; p_wbsup <= rd_wbsup; p_sextw <= rd_sextw;
 		rr_a <= rd_sa; rr_b <= rd_da;
 		state <= S_PIPE_REGS;
+	end
+endtask
+
+// Step B: enter the next instruction from the decode record at a producer's
+// retire, for every class the record covers (the descriptor's classes
+// keep dispatch_reg_decode).  The immediate forms consume their words
+// here, as the descriptor's immediate class does.
+wire [31:0] n_immv = (n_immn == 2'd2) ? {rd_w1, rd_w2} : {16'd0, rd_w1};
+wire        n_words_ok = ((n_next == NX_IMMF_PSTART) || (n_next == NX_IMMREG)) ?
+                         (epf_count >= (4'd1 + {2'd0, n_immn})) : 1'b1;
+// The pipe start's source-memory paths read port A unforwarded (decode
+// selected it a cycle earlier, so any landing write had landed); a record
+// applied at a producer's retire enters the pipe start while that write
+// lands, so a producer writing the record's base register defers the
+// record to S_DECODE (the memory-source lookahead's rule).
+wire        n_base_hazard = (regs_alu_fire || shift_fire) && !p_wbsup && (p_dreg == n_rr_a);
+// A retire from a system state (SR, USP, MOVEC, MOVES, CINV, PFLUSH, RTE,
+// STOP, the exception sequences) may change the A7 bank or an auxiliary
+// register on this edge: the next opcode decodes in place after it.
+wire        sys_retire = (state == S_HALT) ||
+                          (state == S_STOPPED) ||
+                          (state == S_EXC0) ||
+                          (state == S_EXC1) ||
+                          (state == S_EXC2) ||
+                          (state == S_EXC3) ||
+                          (state == S_EXC4) ||
+                          (state == S_EXC5) ||
+                          (state == S_EXC6) ||
+                          (state == S_EXC_VEC) ||
+                          (state == S_EXC_JMP) ||
+                          (state == S_RTE_SR) ||
+                          (state == S_RTE_PC) ||
+                          (state == S_RTE_FMT) ||
+                          (state == S_RTE_FIN) ||
+                          (state == S_RTE_FIN2) ||
+                          (state == S_USP1) ||
+                          (state == S_MOVEC1) ||
+                          (state == S_MOVEC2) ||
+                          (state == S_MOVES1) ||
+                          (state == S_MOVES2) ||
+                          (state == S_MOVES_WR) ||
+                          (state == S_MOVES_RD) ||
+                          (state == S_PTEST1) ||
+                          (state == S_RESET_HOLD) ||
+                          (state == S_SROP) ||
+                          (state == S_TRAPCC) ||
+                          (state == S_STOP_LD) ||
+                          (state == S_PFLUSH1) ||
+                          (state == S_PFLUSH2) ||
+                          (state == S_PTEST2) ||
+                          (state == S_CINV2) ||
+                          (state == S_EXC4B) ||
+                          (state == S_EPF_FILL) ||
+                          (state == S_EPF_GAP) ||
+                          (state == S_EPF_READY) ||
+                          (state == S_POST_EXC) ||
+                          (state == S_EXC0_F2) ||
+                          (state == S_EXC0_F3) ||
+                          (state == S_EXC0_F4) ||
+                          (state == S_POST_EXC_F2) ||
+                          (state == S_POST_EXC_F3) ||
+                          (state == S_POST_EXC_F4);
+wire        n_apply_ok = !rd_valid && !n_inplace && (n_next != NX_NONE) && n_words_ok &&
+                        (state != S_DECODE) && !aux_we;
+// the descriptor classes dispatch at every ordinary retire as well
+// dovi: the descriptor dispatch bounded to the ALU/shift/store producers
+// again (step C); the record handover stays at every retire.
+wire        n_desc_ok  = rd_valid && (state != S_DECODE) && !aux_we &&
+                         (regs_alu_fire || shift_fire ||
+                          ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT)));
+// Step D: the record applied in the decode cycle itself.  The immediate
+// forms take the body's own inline paths (immf / immf_reg), so the queue
+// ownership rules and the deferred S_IMMF case are unchanged; rr_b for the
+// immediate-to-register form is set by immf_reg on its inline path only, as
+// the body did.
+task apply_record_decode;
+	begin
+		if (n_p_src_v) p_src <= n_p_src;
+		if (n_p_dst_v) p_dst <= n_p_dst;
+		if (n_p_rmw_v) p_rmw <= n_p_rmw;
+		if (n_p_wbsup_v) p_wbsup <= n_p_wbsup;
+		if (n_p_flags_v) p_flags <= n_p_flags;
+		if (n_p_sextw_v) p_sextw <= n_p_sextw;
+		if (n_p_dst_mem_bit_v) p_dst_mem_bit <= n_p_dst_mem_bit;
+		if (n_exec_kind_v) exec_kind <= n_exec_kind;
+		if (n_op_size_v) op_size <= n_op_size;
+		if (n_alu_op_v) alu_op <= n_alu_op;
+		if (n_p_dreg_v) p_dreg <= n_p_dreg;
+		if (n_p_dsize_v) p_dsize <= n_p_dsize;
+		if (n_p_ssize_v) p_ssize <= n_p_ssize;
+		if (n_p_sreg_v) p_sreg <= n_p_sreg;
+		if (n_dst_rn_r_v) dst_rn_r <= n_dst_rn_r;
+		if (n_dst_mode_r_v) dst_mode_r <= n_dst_mode_r;
+		if (n_src_rn_r_v) src_rn_r <= n_src_rn_r;
+		if (n_src_mode_r_v) src_mode_r <= n_src_mode_r;
+		if (n_rr_a_v) rr_a <= n_rr_a;
+		if (n_rr_b_v && n_next != NX_IMMREG) rr_b <= n_rr_b;
+		if (n_src_val_v) src_val <= n_src_val;
+		if (n_sh_rox_v) sh_rox <= n_sh_rox;
+		if (n_md_isdiv_v) md_isdiv <= n_md_isdiv;
+		if (n_md_sign_v) md_sign <= n_md_sign;
+		if (n_lk_cyc_v) lk_cyc <= n_lk_cyc;
+		case (n_next)
+			NX_PSTART: state <= S_PIPE_START;
+			NX_PREGS:  state <= S_PIPE_REGS;
+			NX_IMMF_PSTART: immf(n_immn, S_PIPE_START);
+			NX_IMMREG: immf_reg(n_immn, n_rr_b);
+			default: begin end
+		endcase
+	end
+endtask
+
+task apply_record;
+	begin
+		if (n_p_src_v) p_src <= n_p_src;
+		if (n_p_dst_v) p_dst <= n_p_dst;
+		if (n_p_rmw_v) p_rmw <= n_p_rmw;
+		if (n_p_wbsup_v) p_wbsup <= n_p_wbsup;
+		if (n_p_flags_v) p_flags <= n_p_flags;
+		if (n_p_sextw_v) p_sextw <= n_p_sextw;
+		if (n_p_dst_mem_bit_v) p_dst_mem_bit <= n_p_dst_mem_bit;
+		if (n_exec_kind_v) exec_kind <= n_exec_kind;
+		if (n_op_size_v) op_size <= n_op_size;
+		if (n_alu_op_v) alu_op <= n_alu_op;
+		if (n_p_dreg_v) p_dreg <= n_p_dreg;
+		if (n_p_dsize_v) p_dsize <= n_p_dsize;
+		if (n_p_ssize_v) p_ssize <= n_p_ssize;
+		if (n_p_sreg_v) p_sreg <= n_p_sreg;
+		if (n_dst_rn_r_v) dst_rn_r <= n_dst_rn_r;
+		if (n_dst_mode_r_v) dst_mode_r <= n_dst_mode_r;
+		if (n_src_rn_r_v) src_rn_r <= n_src_rn_r;
+		if (n_src_mode_r_v) src_mode_r <= n_src_mode_r;
+		if (n_rr_a_v) rr_a <= n_rr_a;
+		if (n_rr_b_v) rr_b <= n_rr_b;
+		if (n_src_val_v) src_val <= n_src_val;
+		if (n_sh_rox_v) sh_rox <= n_sh_rox;
+		if (n_md_isdiv_v) md_isdiv <= n_md_isdiv;
+		if (n_md_sign_v) md_sign <= n_md_sign;
+		if (n_lk_cyc_v) lk_cyc <= n_lk_cyc;
+		case (n_next)
+			NX_PSTART: state <= S_PIPE_START;
+			NX_PREGS:  state <= S_PIPE_REGS;
+			NX_IMMF_PSTART: begin
+				imm <= n_immv;
+				epf_pop = 2'd1 + n_immn;
+				pc <= pc + 32'd2 + {29'd0, n_immn, 1'b0};
+				state <= S_PIPE_START;
+			end
+			NX_IMMREG: begin
+				src_val <= n_immv; imm <= n_immv; x_ext <= n_immv;
+				epf_pop = 2'd1 + n_immn;
+				pc <= pc + 32'd2 + {29'd0, n_immn, 1'b0};
+				state <= S_PIPE_REGS;
+			end
+			default: begin end
+		endcase
 	end
 endtask
 
@@ -2471,7 +2666,11 @@ wire        hint_pipe_src = (state == S_PIPE_START) && (p_src == SK_MEM);
 // combinational loop (acknowledge -> hint -> translation -> acknowledge,
 // 784 nodes in the fitter, 2026-09-14).  A hint that guesses wrong only
 // costs the read its idle-read match.
-wire        hint_ext_ok   = epf_ready_pc && !rf_we && !aux_we;
+// A register write landing this cycle disqualifies the hint and the
+// direct read only when it is the base register's (port A would show the
+// old value); a write to any other register, the usual case after a
+// lookahead or record dispatch, leaves them alone.
+wire        hint_ext_ok   = epf_ready_pc && !base_landing && !aux_we;
 wire        hint_pipe_dst = (state == S_PIPE_START) && (p_src != SK_MEM) &&
                             (p_dst == DK_MEM) && p_rmw &&
                             (rr_a == {1'b1, dst_rn_r}) &&
@@ -2495,12 +2694,1291 @@ wire [31:0] hint_addr = hint_data ? m_addr_r :
                         hint_bcc  ? (pc + sxb(ir[7:0])) :
                         hint_pipe ? hint_pipe_addr :
                         hint_ea   ? ea_addr : epf_ftail;
-assign mem_addr  = mem_req ? mem_addr_q  : hint_addr;
-assign mem_instr = mem_req ? mem_instr_q : !(hint_data || hint_pipe || hint_ea);
+// The request bus carries only registered state.  The hint rides its own
+// bus, which only RAM address inputs and the MMU's hint copy listen to,
+// so the address arithmetic behind it never enters a request-cycle path
+// (a combinational cache acknowledge on the shared bus failed timing by
+// 6.6 ns through rr_a -> register file -> hint adder, 2026-09-14).
+// While a request is held (its translation walking) the hint bus repeats
+// it, so the cache's idle read stays on the request.
+assign mem_addr  = mem_addr_q;
+assign mem_instr = mem_instr_q;
+assign mem_hint_addr  = mem_req ? mem_addr_q  : hint_addr;
+assign mem_hint_instr = mem_req ? mem_instr_q : !(hint_data || hint_pipe || hint_ea);
 
 //---------------------------------------------------------------------------
 // main state machine
 //---------------------------------------------------------------------------
+
+// ---- generated by gen_decoder.py from the S_DECODE body: the decode record of the queue head
+localparam NX_NONE = 3'd0, NX_PSTART = 3'd1, NX_PREGS = 3'd2, NX_IMMF_PSTART = 3'd3, NX_IMMREG = 3'd4;
+wire [3:0] rd_ir_hi     = rd_ir[15:12];
+wire [2:0] rdd_reg9     = rd_ir[11:9];
+wire [2:0] rdd_op8_6    = rd_ir[8:6];
+wire [2:0] rdd_mode     = rd_ir[5:3];
+wire [2:0] rdd_rn       = rd_ir[2:0];
+wire [1:0] rdd_move_size = (rd_ir[13:12] == 2'b01) ? `AP040_SZ_B : (rd_ir[13:12] == 2'b11) ? `AP040_SZ_W : `AP040_SZ_L;
+wire [1:0] rdd_std_size = rd_ir[7:6];
+wire       rdd_ea_is_imm = (rdd_mode == 3'b111) && (rdd_rn == 3'b100);
+wire       rdd_dst_not_alt = (rdd_mode == 3'b001) || ((rdd_mode == 3'b111) && (rdd_rn > 3'b001));
+wire       rdd_src_not_data = (rdd_mode == 3'b001) || ((rdd_mode == 3'b111) && (rdd_rn > 3'b100));
+reg        n_inplace;
+reg  [2:0] n_next;
+reg  [1:0] n_immn;
+reg [2:0]    n_p_src; reg n_p_src_v;
+reg [2:0]    n_p_dst; reg n_p_dst_v;
+reg          n_p_rmw; reg n_p_rmw_v;
+reg          n_p_wbsup; reg n_p_wbsup_v;
+reg          n_p_flags; reg n_p_flags_v;
+reg          n_p_sextw; reg n_p_sextw_v;
+reg          n_p_dst_mem_bit; reg n_p_dst_mem_bit_v;
+reg [3:0]    n_exec_kind; reg n_exec_kind_v;
+reg [1:0]    n_op_size; reg n_op_size_v;
+reg [5:0]    n_alu_op; reg n_alu_op_v;
+reg [3:0]    n_p_dreg; reg n_p_dreg_v;
+reg [1:0]    n_p_dsize; reg n_p_dsize_v;
+reg [1:0]    n_p_ssize; reg n_p_ssize_v;
+reg [3:0]    n_p_sreg; reg n_p_sreg_v;
+reg [2:0]    n_dst_rn_r; reg n_dst_rn_r_v;
+reg [2:0]    n_dst_mode_r; reg n_dst_mode_r_v;
+reg [2:0]    n_src_rn_r; reg n_src_rn_r_v;
+reg [2:0]    n_src_mode_r; reg n_src_mode_r_v;
+reg [3:0]    n_rr_a; reg n_rr_a_v;
+reg [3:0]    n_rr_b; reg n_rr_b_v;
+reg [31:0]   n_src_val; reg n_src_val_v;
+reg          n_sh_rox; reg n_sh_rox_v;
+reg          n_md_isdiv; reg n_md_isdiv_v;
+reg          n_md_sign; reg n_md_sign_v;
+reg          n_lk_cyc; reg n_lk_cyc_v;
+always @* begin : decode_record
+	n_inplace = 0; n_next = NX_NONE; n_immn = 2'd1;
+	n_p_src = SK_NONE; n_p_src_v = 1;
+	n_p_dst = DK_NONE; n_p_dst_v = 1;
+	n_p_rmw = 1'b0; n_p_rmw_v = 1;
+	n_p_wbsup = 1'b0; n_p_wbsup_v = 1;
+	n_p_flags = 1'b1; n_p_flags_v = 1;
+	n_p_sextw = 1'b0; n_p_sextw_v = 1;
+	n_p_dst_mem_bit = 1'b0; n_p_dst_mem_bit_v = 1;
+	n_exec_kind = EK_ALU; n_exec_kind_v = 1;
+	n_op_size = 0; n_op_size_v = 0;
+	n_alu_op = 0; n_alu_op_v = 0;
+	n_p_dreg = 0; n_p_dreg_v = 0;
+	n_p_dsize = 0; n_p_dsize_v = 0;
+	n_p_ssize = 0; n_p_ssize_v = 0;
+	n_p_sreg = 0; n_p_sreg_v = 0;
+	n_dst_rn_r = 0; n_dst_rn_r_v = 0;
+	n_dst_mode_r = 0; n_dst_mode_r_v = 0;
+	n_src_rn_r = 0; n_src_rn_r_v = 0;
+	n_src_mode_r = 0; n_src_mode_r_v = 0;
+	n_rr_a = 0; n_rr_a_v = 0;
+	n_rr_b = 0; n_rr_b_v = 0;
+	n_src_val = 0; n_src_val_v = 0;
+	n_sh_rox = 0; n_sh_rox_v = 0;
+	n_md_isdiv = 0; n_md_isdiv_v = 0;
+	n_md_sign = 0; n_md_sign_v = 0;
+	n_lk_cyc = 0; n_lk_cyc_v = 0;
+				// Generic source-memory forms all use the opcode's low An.
+				// Select it while decoding so simple An modes can consume the
+				// asynchronous port-A value as soon as the pipeline starts.
+				// Decode cases which need another register override this below.
+				begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end
+				case (rd_ir_hi)
+					//-------------------------------------------- 0x0: bit/imm
+					4'h0: begin
+						if (rd_ir[8] && rdd_mode == 3'b001) begin
+							// MOVEP
+							n_inplace = 1;
+							n_inplace = 1;
+							n_inplace = 1;
+						end
+						else if (rd_ir[8]) begin
+							// dynamic bit op, bit number in Dn
+							// As for the static forms, an address register is
+							// never a bit destination.  BTST may read program
+							// space or an immediate operand, but the modifying
+							// forms require a data-alterable destination.
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else if (rdd_mode == 3'b111 &&
+							         ((rd_ir[7:6] == 2'b00) ? (rdd_rn > 3'b100)
+							                             : (rdd_rn > 3'b001)))
+								n_inplace = 1;
+							else begin
+								begin n_alu_op = `AP040_ALU_BTST + {4'd0, rd_ir[7:6]}; n_alu_op_v = 1; end
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+								if (rd_ir[7:6] == 2'b00) begin n_p_wbsup = 1; n_p_wbsup_v = 1; end // BTST
+								if (rdd_ea_is_imm)
+									n_inplace = 1;
+								else if (rdd_mode == 3'b000) begin
+									begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+									begin n_p_dsize = `AP040_SZ_L; n_p_dsize_v = 1; end
+									begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+									n_next = NX_PSTART;
+								end
+								else begin
+									begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+									begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+									begin n_p_dst = DK_MEM; n_p_dst_v = 1; end
+									begin n_p_dst_mem_bit = 1; n_p_dst_mem_bit_v = 1; end
+									begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+									begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									n_next = NX_PSTART;
+								end
+							end
+						end
+						else if (rdd_reg9 == 3'b100) begin
+							// static bit op, bit number in extension word
+							// (checked before the size=11 group: BSET is 00xx11)
+							// BTST only reads, so it accepts program space and
+							// an immediate operand; BCHG/BCLR/BSET write and
+							// need a data alterable destination.  An address
+							// register is never allowed.
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else if (rdd_mode == 3'b111 &&
+							         ((rd_ir[7:6] == 2'b00) ? (rdd_rn > 3'b100)
+							                             : (rdd_rn > 3'b001)))
+								n_inplace = 1;
+							else begin
+							begin n_alu_op = `AP040_ALU_BTST + {4'd0, rd_ir[7:6]}; n_alu_op_v = 1; end
+							begin n_p_src = SK_IMM; n_p_src_v = 1; end
+							if (rdd_mode == 3'b000) begin
+								begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+								begin n_p_dsize = `AP040_SZ_L; n_p_dsize_v = 1; end
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+							end
+							else begin
+								begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+								begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end
+								begin n_p_dst_mem_bit = 1; n_p_dst_mem_bit_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								begin n_p_rmw = 1; n_p_rmw_v = 1; end
+							end
+							if (rd_ir[7:6] == 2'b00) begin n_p_wbsup = 1; n_p_wbsup_v = 1; end
+							begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end
+							end
+						end
+						else if (rdd_reg9 == 3'b111 && rdd_std_size != 2'b11) begin
+							// MOVES (0000 1110 11 is CAS.L, not implemented)
+							// Validate the effective-address encoding before the
+							// privilege check.  Invalid MOVES encodings take vector
+							// 4 even in user mode; only a valid MOVES is privileged.
+							if (rdd_mode < 3'b010 ||
+							    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+							else if (!sr_s) n_inplace = 1;
+							else begin
+								begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+								n_inplace = 1;
+							end
+						end
+						else if (rdd_std_size == 2'b11) begin
+							if (!rdd_reg9[2] && rdd_reg9[1:0] != 2'b11) begin
+								// CHK2/CMP2: bounds pair at a control EA
+								if (rdd_mode < 3'b010 || rdd_mode == 3'b011 ||
+								    rdd_mode == 3'b100 || rdd_ea_is_imm) n_inplace = 1;
+								else begin
+									begin n_op_size = rdd_reg9[1] ? `AP040_SZ_L :
+									           rdd_reg9[0] ? `AP040_SZ_W : `AP040_SZ_B; n_op_size_v = 1; end
+									n_inplace = 1;
+								end
+							end
+							else if (rdd_reg9[2] && rdd_reg9[1:0] != 2'b00 && rdd_ea_is_imm) begin
+								// CAS2.W/.L: two extension words follow
+								if (rdd_reg9[1:0] == 2'b01) n_inplace = 1;   // no CAS2.B
+								else begin
+									begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+									begin n_op_size = (rdd_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L; n_op_size_v = 1; end
+									begin begin n_lk_cyc = 1; n_lk_cyc_v = 1; end n_inplace = 1; end
+								end
+							end
+							else if (rdd_reg9[2] && rdd_reg9[1:0] != 2'b00) begin
+								// CAS (memory only)
+								if (rdd_mode < 3'b010 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else begin
+									begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+									begin n_op_size = (rdd_reg9[1:0] == 2'b01) ? `AP040_SZ_B :
+									           (rdd_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L; n_op_size_v = 1; end
+									begin begin n_lk_cyc = 1; n_lk_cyc_v = 1; end n_inplace = 1; end
+								end
+							end
+							else n_inplace = 1;   // CAS2 / CHK2 / CMP2
+						end
+						else begin
+							// ORI/ANDI/SUBI/ADDI/EORI/CMPI
+							if (rdd_ea_is_imm && (rdd_reg9 == 3'b000 || rdd_reg9 == 3'b001 || rdd_reg9 == 3'b101)) begin
+								// to CCR (byte) or SR (word, privileged)
+								if (rdd_std_size == 2'b01 && !sr_s) n_inplace = 1;
+								else if (rdd_std_size > 2'b01) n_inplace = 1;
+								else begin
+									n_inplace = 1;
+									n_inplace = 1;
+									n_inplace = 1;
+								end
+							end
+							else if (rdd_mode == 3'b001) n_inplace = 1;
+							// The destination must be data alterable, so the
+							// PC-relative and immediate encodings of mode 7
+							// are illegal.  CMPI is the exception: the 68020
+							// and later allow it to read program space.
+							else if (rdd_mode == 3'b111 && rdd_rn > 3'b001 &&
+							         !(rdd_reg9 == 3'b110 && rdd_rn < 3'b100))
+								n_inplace = 1;
+							else begin
+								case (rdd_reg9)
+									3'b000: begin n_alu_op = `AP040_ALU_OR; n_alu_op_v = 1; end
+									3'b001: begin n_alu_op = `AP040_ALU_AND; n_alu_op_v = 1; end
+									3'b010: begin n_alu_op = `AP040_ALU_SUB; n_alu_op_v = 1; end
+									3'b011: begin n_alu_op = `AP040_ALU_ADD; n_alu_op_v = 1; end
+									3'b101: begin n_alu_op = `AP040_ALU_EOR; n_alu_op_v = 1; end
+									default: begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+								endcase
+								if (rdd_reg9 == 3'b110) begin n_p_wbsup = 1; n_p_wbsup_v = 1; end // CMPI
+								begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+								begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+								begin n_p_src = SK_IMM; n_p_src_v = 1; end
+								if (rdd_mode == 3'b000) begin
+									begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+									begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_IMMREG; end
+								end
+								else begin
+									begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+									begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end
+								end
+							end
+						end
+					end
+
+					//------------------------------------------- 0x1-0x3: MOVE
+					4'h1, 4'h2, 4'h3: begin
+						if (rd_valid) begin end // descriptor applied after state case
+						else if (rdd_move_size == `AP040_SZ_B &&
+						    (rdd_mode == 3'b001 || rdd_op8_6 == 3'b001)) n_inplace = 1;
+						else if (rdd_op8_6 == 3'b111 && rdd_reg9 > 3'b001) n_inplace = 1;
+						else begin
+							begin n_alu_op = `AP040_ALU_MOVE; n_alu_op_v = 1; end
+							begin n_op_size = rdd_move_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_move_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_move_size; n_p_dsize_v = 1; end
+							// source
+							if (rdd_mode == 3'b000 || rdd_mode == 3'b001) begin
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {rdd_mode[0], rdd_rn}; n_p_sreg_v = 1; end
+							end
+							else if (rdd_ea_is_imm) begin n_p_src = SK_IMM; n_p_src_v = 1; end
+							else begin
+								begin n_p_src = SK_MEM; n_p_src_v = 1; end
+								begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+							end
+							// destination
+							if (rdd_op8_6 == 3'b000) begin
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+							end
+							else if (rdd_op8_6 == 3'b001) begin
+								// MOVEA: full register, no flags, word sexts
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b1, rdd_reg9}; n_p_dreg_v = 1; end
+								begin n_p_flags = 0; n_p_flags_v = 1; end
+								if (rdd_move_size == `AP040_SZ_W) begin n_p_sextw = 1; n_p_sextw_v = 1; end
+								begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+							end
+							else begin
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end
+								begin n_dst_mode_r = rdd_op8_6; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+								// A register or immediate source leaves port A
+								// free for the destination base and port B for
+								// the source register, so S_PIPE_START can start
+								// the destination EA at once (memory-destination
+								// fast path).  A memory source keeps port A.
+								if (rdd_mode == 3'b000 || rdd_mode == 3'b001 || rdd_ea_is_imm)
+									begin n_rr_a = {1'b1, rdd_reg9}; n_rr_a_v = 1; end
+								if (rdd_mode == 3'b000 || rdd_mode == 3'b001)
+									begin n_rr_b = {rdd_mode[0], rdd_rn}; n_rr_b_v = 1; end
+							end
+							if (rdd_ea_is_imm && (rdd_op8_6 == 3'b000 || rdd_op8_6 == 3'b001))
+								begin n_immn = (rdd_move_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_rr_b = {rdd_op8_6[0], rdd_reg9}; n_rr_b_v = 1; n_next = NX_IMMREG; end
+							else if (rdd_ea_is_imm)
+								begin n_immn = (rdd_move_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end
+							else n_next = NX_PSTART;
+						end
+					end
+
+					//------------------------------------------------ 0x4: misc
+					4'h4: begin
+						if (rd_ir[11:0] == 12'hAFC) n_inplace = 1;   // ILLEGAL
+						else if (rdd_op8_6 == 3'b111) begin
+							if (rdd_mode == 3'b000) begin
+								if (rdd_reg9 == 3'b100) begin
+									// EXTB.L
+									begin n_alu_op = `AP040_ALU_EXTB; n_alu_op_v = 1; end
+									begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+									begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+									n_next = NX_PSTART;
+								end
+								else n_inplace = 1;
+							end
+							else if (rdd_mode == 3'b001 || (rdd_mode == 3'b011) ||
+							         (rdd_mode == 3'b100) || rdd_ea_is_imm) n_inplace = 1;
+							else n_inplace = 1; // LEA
+						end
+						else if (rdd_op8_6 == 3'b110) begin
+							// CHK.W
+							begin n_exec_kind = EK_CHK; n_exec_kind_v = 1; end
+							begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+							begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else begin
+								if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end end
+								else if (rdd_ea_is_imm) begin n_p_src = SK_IMM; n_p_src_v = 1; end
+								else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end end
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+								if (rdd_ea_is_imm) begin n_immn = 2'd1; n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; n_next = NX_IMMREG; end
+								else n_next = NX_PSTART;
+							end
+						end
+						else if (rdd_op8_6 == 3'b100 &&
+						         !(rd_ir[11:9] == 3'b100 && rdd_mode == 3'b001)) begin
+							// CHK.L (0100 ddd 100; 0100 100 000 001 rrr is LINK.L)
+							begin n_exec_kind = EK_CHK; n_exec_kind_v = 1; end
+							begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+							begin n_p_ssize = `AP040_SZ_L; n_p_ssize_v = 1; end
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else begin
+								if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end end
+								else if (rdd_ea_is_imm) begin n_p_src = SK_IMM; n_p_src_v = 1; end
+								else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end end
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+								if (rdd_ea_is_imm) begin n_immn = 2'd2; n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; n_next = NX_IMMREG; end
+								else n_next = NX_PSTART;
+							end
+						end
+						else case (rd_ir[11:9])
+							3'b000: begin
+								if (rdd_op8_6 == 3'b011) begin
+									// MOVE from SR (privileged on 68010+)
+									// EA legality is decoded before privilege.  In user
+									// mode MOVE SR,An/PC/#imm is vector 4, not vector 8.
+									if (rdd_dst_not_alt) n_inplace = 1;
+									else if (!sr_s) n_inplace = 1;
+									else begin
+										begin n_p_src = SK_IMPL; n_p_src_v = 1; end n_inplace = 1;
+										begin n_alu_op = `AP040_ALU_MOVE; n_alu_op_v = 1; end
+										begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+										begin n_p_dsize = `AP040_SZ_W; n_p_dsize_v = 1; end
+										begin n_p_flags = 0; n_p_flags_v = 1; end
+										if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+										else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+									end
+								end
+								else if (rdd_op8_6[2]) n_inplace = 1;
+								else begin
+									// NEGX
+									begin n_alu_op = `AP040_ALU_NEGX; n_alu_op_v = 1; end
+									begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+									begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+									begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+									else if (rdd_dst_not_alt) n_inplace = 1;
+									else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+							end
+
+							3'b001: begin
+								if (rdd_op8_6 == 3'b011) begin
+									// MOVE from CCR
+									begin n_p_src = SK_IMPL; n_p_src_v = 1; end n_inplace = 1;
+									begin n_alu_op = `AP040_ALU_MOVE; n_alu_op_v = 1; end
+									begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+									begin n_p_dsize = `AP040_SZ_W; n_p_dsize_v = 1; end
+									begin n_p_flags = 0; n_p_flags_v = 1; end
+										if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+										else if (rdd_dst_not_alt) n_inplace = 1;
+										else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+								else if (rdd_op8_6[2]) n_inplace = 1;
+								else begin
+									// CLR (pure write on 68040)
+									begin n_alu_op = `AP040_ALU_CLR; n_alu_op_v = 1; end
+									begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+									begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+									else if (rdd_dst_not_alt) n_inplace = 1;
+									else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+							end
+
+							3'b010: begin
+								if (rdd_op8_6 == 3'b011) begin
+									// MOVE to CCR
+									begin n_alu_op = `AP040_ALU_MOVE; n_alu_op_v = 1; end
+									begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+									begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end
+									begin n_p_flags = 0; n_p_flags_v = 1; end
+									begin n_p_dst = DK_CCR; n_p_dst_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end n_next = NX_PSTART; end
+									else if (rdd_src_not_data) n_inplace = 1;
+									else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end end
+									else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+								else if (rdd_op8_6[2]) n_inplace = 1;
+								else begin
+									// NEG
+									begin n_alu_op = `AP040_ALU_NEG; n_alu_op_v = 1; end
+									begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+									begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+									begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+									else if (rdd_dst_not_alt) n_inplace = 1;
+									else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+							end
+
+							3'b011: begin
+								if (rdd_op8_6 == 3'b011) begin
+									// MOVE to SR (privileged)
+									// An is not a legal source; encoding rejection wins
+									// over the privilege check just as for MOVE from SR.
+									if (rdd_src_not_data) n_inplace = 1;
+									else if (!sr_s) n_inplace = 1;
+									else begin
+										begin n_alu_op = `AP040_ALU_MOVE; n_alu_op_v = 1; end
+										begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+										begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end
+										begin n_p_flags = 0; n_p_flags_v = 1; end
+										begin n_p_dst = DK_SR; n_p_dst_v = 1; end
+										if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end n_next = NX_PSTART; end
+										else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end end
+										else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+									end
+								end
+								else if (rdd_op8_6[2]) n_inplace = 1;
+								else begin
+									// NOT
+									begin n_alu_op = `AP040_ALU_NOT; n_alu_op_v = 1; end
+									begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+									begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+									begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+									else if (rdd_dst_not_alt) n_inplace = 1;
+									else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+								end
+							end
+
+							3'b100: begin
+								if (rdd_op8_6[2]) n_inplace = 1;
+								else case (rdd_op8_6[1:0])
+								2'b00: begin
+									if (rdd_mode == 3'b001) begin
+										// LINK.L An,#bd32
+										n_inplace = 1;
+										begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end
+										n_inplace = 1;
+									end
+									else begin
+										// NBCD
+										begin n_alu_op = `AP040_ALU_NBCD; n_alu_op_v = 1; end
+										begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+										begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+										begin n_p_rmw = 1; n_p_rmw_v = 1; end
+										if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+										else if (rdd_dst_not_alt) n_inplace = 1;
+										else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+									end
+								end
+								2'b01: begin
+									if (rdd_mode == 3'b000) begin
+										// SWAP
+										begin n_alu_op = `AP040_ALU_SWAP; n_alu_op_v = 1; end
+										begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+										begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+										n_next = NX_PSTART;
+									end
+									else if (rdd_mode == 3'b001) n_inplace = 1; // BKPT
+									else if (rdd_mode == 3'b011 || rdd_mode == 3'b100 || rdd_ea_is_imm) n_inplace = 1;
+									else n_inplace = 1; // PEA
+								end
+								default: begin
+									if (rdd_mode == 3'b000) begin
+										// EXT.W / EXT.L
+										begin n_alu_op = `AP040_ALU_EXT; n_alu_op_v = 1; end
+										begin n_op_size = rdd_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W; n_op_size_v = 1; end
+										begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+										n_next = NX_PSTART;
+									end
+									else begin
+										// MOVEM registers to memory
+										n_inplace = 1;
+										n_inplace = 1;
+										n_inplace = 1;
+										n_inplace = 1;
+										if (rdd_mode == 3'b011 || rdd_mode < 3'b010 || rdd_ea_is_imm ||
+										    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+										else n_inplace = 1;
+									end
+								end
+								endcase
+							end
+
+							3'b101: begin
+								if (rdd_op8_6[2]) n_inplace = 1;
+								else if (rdd_op8_6 == 3'b011) begin
+									// TAS (not bus locked yet).  The 040
+									// reports its operand cycles as a locked
+									// RMW: an access error carries SSW LK
+									// with RW clear.
+									begin n_alu_op = `AP040_ALU_TAS; n_alu_op_v = 1; end
+									begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+									begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+									begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+									else if (rdd_dst_not_alt) n_inplace = 1;
+									else begin
+										begin n_lk_cyc = 1; n_lk_cyc_v = 1; end
+										begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART;
+									end
+								end
+								else begin
+									// TST (An/imm/PC modes allowed on 020+)
+									begin n_alu_op = `AP040_ALU_TST; n_alu_op_v = 1; end
+									begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+									begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end
+									begin n_p_wbsup = 1; n_p_wbsup_v = 1; end
+									if (rdd_mode == 3'b000 || rdd_mode == 3'b001) begin
+										if (rdd_mode == 3'b001 && rdd_std_size == `AP040_SZ_B) n_inplace = 1;
+										else begin
+											begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {rdd_mode[0], rdd_rn}; n_p_sreg_v = 1; end
+											n_next = NX_PSTART;
+										end
+									end
+									else if (rdd_ea_is_imm) begin
+										begin n_p_src = SK_IMM; n_p_src_v = 1; end
+										begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end
+									end
+									else begin
+										begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+										n_next = NX_PSTART;
+									end
+								end
+							end
+
+							3'b110: begin
+								if (rdd_op8_6[2]) n_inplace = 1;
+								else if (!rdd_op8_6[1]) begin
+									// MULx.L / DIVx.L with extension word
+									begin n_exec_kind = EK_MD_L; n_exec_kind_v = 1; end
+									begin n_md_isdiv = rdd_op8_6[0]; n_md_isdiv_v = 1; end
+									begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+									begin n_p_ssize = `AP040_SZ_L; n_p_ssize_v = 1; end
+									if (rdd_mode == 3'b001) n_inplace = 1;
+									else begin
+										if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end end
+										else if (rdd_ea_is_imm) begin n_p_src = SK_IMM; n_p_src_v = 1; end
+										else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end end
+										// extension word first, then any immediate
+										n_inplace = 1;
+									end
+								end
+								else begin
+									// MOVEM memory to registers
+									n_inplace = 1;
+									n_inplace = 1;
+									n_inplace = 1;
+									n_inplace = 1;
+									if (rdd_mode == 3'b100 || rdd_mode < 3'b010 || rdd_ea_is_imm) n_inplace = 1;
+									else n_inplace = 1;
+								end
+							end
+
+							default: begin // 3'b111
+								if (rdd_op8_6 == 3'b010) begin
+									// JSR
+									if (rdd_mode < 3'b010 || rdd_mode == 3'b011 ||
+									    rdd_mode == 3'b100 || rdd_ea_is_imm) n_inplace = 1;
+									else n_inplace = 1;
+								end
+								else if (rdd_op8_6 == 3'b011) begin
+									// JMP
+									if (rdd_mode < 3'b010 || rdd_mode == 3'b011 ||
+									    rdd_mode == 3'b100 || rdd_ea_is_imm) n_inplace = 1;
+									else n_inplace = 1;
+								end
+								else if (rdd_op8_6 == 3'b001) begin
+									casez (rd_ir[5:0])
+										6'b00????: n_inplace = 1;
+										6'b010???: begin n_inplace = 1; begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end n_inplace = 1; end // LINK.W
+										6'b011???: begin begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end n_inplace = 1; end
+										6'b100???: begin // MOVE An,USP
+											if (!sr_s) n_inplace = 1;
+											else begin begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end n_inplace = 1; end
+										end
+										6'b101???: begin // MOVE USP,An
+											if (!sr_s) n_inplace = 1;
+											else begin n_inplace = 1; n_inplace = 1; end
+										end
+										6'b110000: begin // RESET
+											if (!sr_s) n_inplace = 1;
+											else begin n_inplace = 1; n_inplace = 1; end
+										end
+										6'b110001: n_inplace = 1;   // NOP
+										6'b110010: begin // STOP
+											if (!sr_s) n_inplace = 1;
+											else n_inplace = 1;
+										end
+										6'b110011: begin // RTE
+											if (!sr_s) n_inplace = 1;
+											else begin
+												// A bus/access fault while RTE is loading internal state
+												// from the old frame is a double bus fault (MC68040 UM
+												// 8.2), not a new format-$7 exception.
+												n_inplace = 1;
+												n_inplace = 1;
+											end
+										end
+										6'b110100: begin n_inplace = 1; n_inplace = 1; end
+										// RTS: the pop issues from decode (S_RET1 skipped)
+										6'b110101: begin n_inplace = 1; n_inplace = 1; end
+										6'b110110: begin // TRAPV
+											if (sr[1]) n_inplace = 1;
+											else n_inplace = 1;
+										end
+										6'b110111: begin
+											n_inplace = 1;
+											n_inplace = 1;
+										end
+										6'b111010, 6'b111011: begin // MOVEC
+											if (!sr_s) n_inplace = 1;
+											else begin
+												n_inplace = 1;
+												n_inplace = 1;
+											end
+										end
+										default: n_inplace = 1;
+									endcase
+								end
+								else n_inplace = 1;
+							end
+						endcase
+					end
+
+					//------------------------------ 0x5: ADDQ/SUBQ/Scc/DBcc
+					4'h5: begin
+						if (rd_valid) begin end
+						else if (rd_ir[7:6] == 2'b11) begin
+							if (rdd_mode == 3'b001) begin
+								// DBcc
+								n_inplace = 1;
+								begin n_rr_a = {1'b0, rdd_rn}; n_rr_a_v = 1; end
+								n_inplace = 1;
+							end
+							else if (rdd_mode == 3'b111 && rdd_rn >= 3'b010 && rdd_rn <= 3'b100) begin
+								// TRAPcc (optional operand words are consumed
+								// but otherwise ignored)
+								if (rdd_rn == 3'b010)
+									n_inplace = 1;
+								else if (rdd_rn == 3'b011)
+									n_inplace = 1;
+								else begin
+									if (cond_true(rd_ir[11:8]))
+										n_inplace = 1;
+									else n_inplace = 1;
+								end
+							end
+							else begin
+								// Scc
+								begin n_exec_kind = EK_SCC; n_exec_kind_v = 1; end
+								begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+								begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+								begin n_p_flags = 0; n_p_flags_v = 1; end
+								if (rdd_mode == 3'b000) begin begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end begin n_rr_b = {1'b0, rdd_rn}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+								else if (rdd_dst_not_alt) n_inplace = 1;
+								else begin begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end n_next = NX_PSTART; end
+							end
+						end
+						else begin
+							// Register quick forms are handled by rd_valid above.
+							begin n_alu_op = rd_ir[8] ? `AP040_ALU_SUB : `AP040_ALU_ADD; n_alu_op_v = 1; end
+							begin n_p_src = SK_IMPL; n_p_src_v = 1; end
+							begin n_src_val = {28'd0, (rdd_reg9 == 3'd0) ? 4'd8 : {1'b0, rdd_reg9}}; n_src_val_v = 1; end
+							if (rdd_dst_not_alt) n_inplace = 1; // includes byte An
+							else begin
+								begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+								begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								n_next = NX_PSTART;
+							end
+						end
+					end
+
+					//---------------------------------------- 0x6: Bcc/BSR/BRA
+					4'h6: begin
+						if (rd_ir[7:0] == 8'h00 || rd_ir[7:0] == 8'hFF) begin
+							n_inplace = 1;
+							n_inplace = 1;
+							n_inplace = 1;
+						end
+						else if (rd_ir[11:8] == 4'h1) begin : bsr_b
+							// BSR.B; an odd target faults with A7 untouched
+							reg [31:0] bt;
+							bt = pc + sxb(rd_ir[7:0]);
+							if (bt[0]) n_inplace = 1;
+							else begin
+								n_inplace = 1;
+								n_inplace = 1;
+							end
+						end
+						else n_inplace = 1;
+					end
+
+					//------------------------------------------- 0x7: MOVEQ
+					4'h7: begin
+						if (rd_ir[8]) n_inplace = 1;
+						else begin
+							n_inplace = 1;
+							n_inplace = 1;
+							n_inplace = 1;
+							n_inplace = 1; n_inplace = 1;
+							n_inplace = 1;
+						end
+					end
+
+					//------------------------------------- 0x8: OR/DIV/SBCD
+					4'h8: begin
+						if (rd_valid) begin end
+						else if (rdd_op8_6 == 3'b011 || rdd_op8_6 == 3'b111) begin
+							// DIVU.W / DIVS.W
+							begin n_exec_kind = EK_MD_W; n_exec_kind_v = 1; end
+							begin n_md_isdiv = 1; n_md_isdiv_v = 1; end
+							begin n_md_sign = rdd_op8_6[2]; n_md_sign_v = 1; end
+							begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+							begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end begin n_rr_a = {1'b0, rdd_rn}; n_rr_a_v = 1; n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+							else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end end
+							else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+						end
+						else if (rd_ir[8] && rdd_mode[2:1] == 2'b00) begin
+							case (rdd_op8_6[1:0])
+								2'b00: begin
+									// SBCD
+									begin n_alu_op = `AP040_ALU_SBCD; n_alu_op_v = 1; end
+									begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+									begin n_p_ssize = `AP040_SZ_B; n_p_ssize_v = 1; end begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+									if (!rdd_mode[0]) begin
+										begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end
+										begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+									end
+									else begin
+										begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b100; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+										begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b100; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+										begin n_p_rmw = 1; n_p_rmw_v = 1; end
+									end
+									n_next = NX_PSTART;
+								end
+								2'b01: begin
+									// PACK
+									begin n_exec_kind = EK_PACK; n_exec_kind_v = 1; end
+									begin n_p_flags = 0; n_p_flags_v = 1; end
+									begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+									if (!rdd_mode[0]) begin
+										begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end
+										begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+									end
+									else begin
+										begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b100; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+										begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b100; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+									end
+									begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end
+								end
+								2'b10: begin
+									// UNPK
+									begin n_exec_kind = EK_UNPK; n_exec_kind_v = 1; end
+									begin n_p_flags = 0; n_p_flags_v = 1; end
+									begin n_p_ssize = `AP040_SZ_B; n_p_ssize_v = 1; end begin n_p_dsize = `AP040_SZ_W; n_p_dsize_v = 1; end
+									if (!rdd_mode[0]) begin
+										begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end
+										begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+									end
+									else begin
+										begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b100; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+										begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b100; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+									end
+									begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end
+								end
+								default: n_inplace = 1;
+							endcase
+						end
+						else begin
+							// OR
+							begin n_alu_op = `AP040_ALU_OR; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							if (!rd_ir[8]) begin
+								// <ea> OR Dn -> Dn
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+								if (rdd_mode == 3'b001) n_inplace = 1;
+								else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end end
+								else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+							end
+							else begin
+								// Dn OR <ea> -> <ea>
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								// The register-to-EA OR form is memory-only.
+								// Mode 000/001 combinations are reserved for the
+								// SBCD/PACK/UNPK subfamily above.
+								if (rdd_mode < 3'b010 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else n_next = NX_PSTART;
+							end
+						end
+					end
+
+					//------------------------------------ 0x9/0xD: SUB/ADD
+					4'h9, 4'hD: begin : dec_addsub
+						reg is_add;
+						is_add = (rd_ir_hi == 4'hD);
+						if (rd_valid) begin end
+						else if (rdd_op8_6 == 3'b011 || rdd_op8_6 == 3'b111) begin
+							// ADDA/SUBA
+							begin n_alu_op = is_add ? `AP040_ALU_ADD : `AP040_ALU_SUB; n_alu_op_v = 1; end
+							begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_op8_6[2] ? `AP040_SZ_L : `AP040_SZ_W; n_p_ssize_v = 1; end
+							begin n_p_sextw = !rdd_op8_6[2]; n_p_sextw_v = 1; end
+							begin n_p_flags = 0; n_p_flags_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b1, rdd_reg9}; n_p_dreg_v = 1; end
+							if (rdd_ea_is_imm) begin
+								begin n_p_src = SK_IMM; n_p_src_v = 1; end
+								begin n_immn = rdd_op8_6[2] ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end
+							end
+							else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+						end
+						else if (rd_ir[8] && rdd_mode[2:1] == 2'b00 && rdd_std_size != 2'b11) begin
+							// Predecrement ADDX/SUBX; register form is shared.
+							begin n_alu_op = is_add ? `AP040_ALU_ADDX : `AP040_ALU_SUBX; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b100; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+							begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b100; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+							begin n_p_rmw = 1; n_p_rmw_v = 1; end
+							n_next = NX_PSTART;
+						end
+						else begin
+							begin n_alu_op = is_add ? `AP040_ALU_ADD : `AP040_ALU_SUB; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							if (!rd_ir[8]) begin
+								// <ea> op Dn -> Dn
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+								if (rdd_mode == 3'b001 && rdd_std_size == `AP040_SZ_B) n_inplace = 1;
+								else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end end
+								else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+							end
+							else begin
+								// Dn op <ea> -> <ea>
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								// The register-to-EA ADD/SUB form is memory-only;
+								// register-direct encodings belong to ADDX/SUBX.
+								if (rdd_mode < 3'b010 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else n_next = NX_PSTART;
+							end
+						end
+					end
+
+					//---------------------------------------------- 0xA: A-line
+					4'hA: n_inplace = 1;
+
+					//---------------------------------- 0xB: CMP/CMPA/EOR/CMPM
+					4'hB: begin
+						if (rd_valid) begin end
+						else if (rdd_op8_6 == 3'b011 || rdd_op8_6 == 3'b111) begin
+							// CMPA
+							begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+							begin n_op_size = `AP040_SZ_L; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_op8_6[2] ? `AP040_SZ_L : `AP040_SZ_W; n_p_ssize_v = 1; end
+							begin n_p_sextw = !rdd_op8_6[2]; n_p_sextw_v = 1; end
+							begin n_p_wbsup = 1; n_p_wbsup_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b1, rdd_reg9}; n_p_dreg_v = 1; end
+							if (rdd_ea_is_imm) begin
+								begin n_p_src = SK_IMM; n_p_src_v = 1; end
+								begin n_immn = rdd_op8_6[2] ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end
+							end
+							else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+						end
+						else if (!rd_ir[8]) begin
+							// CMP <ea>,Dn
+							begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end
+							begin n_p_wbsup = 1; n_p_wbsup_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+							if (rdd_mode == 3'b001 && rdd_std_size == `AP040_SZ_B) n_inplace = 1;
+							else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end end
+							else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+						end
+						else if (rdd_mode == 3'b001) begin
+							// CMPM (Ay)+,(Ax)+
+							begin n_alu_op = `AP040_ALU_CMP; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							begin n_p_wbsup = 1; n_p_wbsup_v = 1; end
+							begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b011; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+							begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b011; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+							begin n_p_rmw = 1; n_p_rmw_v = 1; end
+							n_next = NX_PSTART;
+						end
+						else begin
+							// EOR Dn,<ea>
+							begin n_alu_op = `AP040_ALU_EOR; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+							if (rdd_dst_not_alt) n_inplace = 1;
+							else begin
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								n_next = NX_PSTART;
+							end
+						end
+					end
+
+					//------------------------------------ 0xC: AND/MUL/EXG
+					4'hC: begin
+						if (rd_valid) begin end
+						else if (rdd_op8_6 == 3'b011 || rdd_op8_6 == 3'b111) begin
+							// MULU.W / MULS.W
+							begin n_exec_kind = EK_MD_W; n_exec_kind_v = 1; end
+							begin n_md_isdiv = 0; n_md_isdiv_v = 1; end
+							begin n_md_sign = rdd_op8_6[2]; n_md_sign_v = 1; end
+							begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+							begin n_p_ssize = `AP040_SZ_W; n_p_ssize_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+							if (rdd_mode == 3'b001) n_inplace = 1;
+							else if (rdd_mode == 3'b000) begin begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end begin n_rr_a = {1'b0, rdd_rn}; n_rr_a_v = 1; n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; n_next = NX_PREGS; end end
+							else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = 2'd1; n_next = NX_IMMF_PSTART; end end
+							else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+						end
+						else if (rd_ir[8] && rdd_op8_6[1:0] == 2'b00 && rdd_mode[2:1] == 2'b00) begin
+							// ABCD
+							begin n_alu_op = `AP040_ALU_ABCD; n_alu_op_v = 1; end
+							begin n_op_size = `AP040_SZ_B; n_op_size_v = 1; end
+							begin n_p_ssize = `AP040_SZ_B; n_p_ssize_v = 1; end begin n_p_dsize = `AP040_SZ_B; n_p_dsize_v = 1; end
+							if (!rdd_mode[0]) begin
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_rn}; n_p_sreg_v = 1; end
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+							end
+							else begin
+								begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = 3'b100; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_dst_mode_r = 3'b100; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_reg9; n_dst_rn_r_v = 1; end
+								begin n_p_rmw = 1; n_p_rmw_v = 1; end
+							end
+							n_next = NX_PSTART;
+						end
+						else if (rd_ir[8] && (rdd_op8_6[1:0] == 2'b01) && rdd_mode[2:1] == 2'b00) begin
+							// EXG Dn,Dn (mode 000) / EXG An,An (mode 001)
+							begin n_rr_a = {rdd_mode[0], rdd_reg9}; n_rr_a_v = 1; end
+							begin n_rr_b = {rdd_mode[0], rdd_rn}; n_rr_b_v = 1; end
+							n_inplace = 1;
+						end
+						else if (rd_ir[8] && rdd_op8_6[1:0] == 2'b10 && rdd_mode == 3'b001) begin
+							// EXG Dn,An
+							begin n_rr_a = {1'b0, rdd_reg9}; n_rr_a_v = 1; end
+							begin n_rr_b = {1'b1, rdd_rn}; n_rr_b_v = 1; end
+							n_inplace = 1;
+						end
+						else begin
+							// AND
+							begin n_alu_op = `AP040_ALU_AND; n_alu_op_v = 1; end
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_ssize = rdd_std_size; n_p_ssize_v = 1; end begin n_p_dsize = rdd_std_size; n_p_dsize_v = 1; end
+							if (!rd_ir[8]) begin
+								begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_reg9}; n_p_dreg_v = 1; end
+								if (rdd_mode == 3'b001) n_inplace = 1;
+								else if (rdd_ea_is_imm) begin begin n_p_src = SK_IMM; n_p_src_v = 1; end begin n_immn = (rdd_std_size == `AP040_SZ_L) ? 2'd2 : 2'd1; n_next = NX_IMMF_PSTART; end end
+								else begin begin n_p_src = SK_MEM; n_p_src_v = 1; end begin n_src_mode_r = rdd_mode; n_src_mode_r_v = 1; end begin n_src_rn_r = rdd_rn; n_src_rn_r_v = 1; end n_next = NX_PSTART; end
+							end
+							else begin
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+								begin n_p_dst = DK_MEM; n_p_dst_v = 1; end begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+								// The register-to-EA AND form is memory-only.
+								// Mode 000 combinations not claimed by ABCD/EXG
+								// are reserved, rather than AND Dn,Dn aliases.
+								if (rdd_mode < 3'b010 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else n_next = NX_PSTART;
+							end
+						end
+					end
+
+					//---------------------------------------- 0xE: shifts
+					4'hE: begin
+						if (rd_ir[7:6] == 2'b11) begin
+							if (rd_ir[11]) begin
+								// bitfield group; ext word first
+								// modify ops need an alterable EA
+								if (rdd_mode == 3'b001 || rdd_mode == 3'b011 ||
+								    rdd_mode == 3'b100 || rdd_ea_is_imm) n_inplace = 1;
+								else if ((rdd_mode == 3'b111 && rdd_rn > 3'b001) &&
+								         (rd_ir[10:8] == 3'd2 || rd_ir[10:8] == 3'd4 ||
+								          rd_ir[10:8] == 3'd6 || rd_ir[10:8] == 3'd7)) n_inplace = 1;
+								else n_inplace = 1;
+							end
+							else begin
+								// memory shift by one, word
+								begin n_exec_kind = EK_SHIFT; n_exec_kind_v = 1; end
+								begin n_sh_rox = (rd_ir[10:9] == 2'b10); n_sh_rox_v = 1; end
+								case (rd_ir[10:9])
+									2'b00: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1; n_alu_op_v = 1; end
+									2'b01: begin n_alu_op = rd_ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1; n_alu_op_v = 1; end
+									2'b10: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1; n_alu_op_v = 1; end
+									default: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1; n_alu_op_v = 1; end
+								endcase
+								begin n_op_size = `AP040_SZ_W; n_op_size_v = 1; end
+								begin n_p_dsize = `AP040_SZ_W; n_p_dsize_v = 1; end
+								begin n_p_src = SK_NONE; n_p_src_v = 1; end   // count of one
+								begin n_p_rmw = 1; n_p_rmw_v = 1; end
+								// Memory shifts require a memory-alterable EA: Dn/An
+								// direct and all program-space encodings are illegal.
+								if (rdd_mode < 3'b010 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else begin
+									begin n_p_dst = DK_MEM; n_p_dst_v = 1; end
+									begin n_dst_mode_r = rdd_mode; n_dst_mode_r_v = 1; end begin n_dst_rn_r = rdd_rn; n_dst_rn_r_v = 1; end
+									n_next = NX_PSTART;
+								end
+							end
+						end
+						else begin
+							// register shift
+							begin n_exec_kind = EK_SHIFT; n_exec_kind_v = 1; end
+							begin n_sh_rox = (rd_ir[4:3] == 2'b10); n_sh_rox_v = 1; end
+							case (rd_ir[4:3])
+								2'b00: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1; n_alu_op_v = 1; end
+								2'b01: begin n_alu_op = rd_ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1; n_alu_op_v = 1; end
+								2'b10: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1; n_alu_op_v = 1; end
+								default: begin n_alu_op = rd_ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1; n_alu_op_v = 1; end
+							endcase
+							begin n_op_size = rdd_std_size; n_op_size_v = 1; end
+							begin n_p_dst = DK_REG; n_p_dst_v = 1; end begin n_p_dreg = {1'b0, rdd_rn}; n_p_dreg_v = 1; end
+							if (rd_ir[5]) begin
+								begin n_p_src = SK_REG; n_p_src_v = 1; end begin n_p_sreg = {1'b0, rdd_reg9}; n_p_sreg_v = 1; end begin n_rr_b = {1'b0, rdd_reg9}; n_rr_b_v = 1; end
+							end
+							else begin
+								begin n_p_src = SK_IMPL; n_p_src_v = 1; end
+								begin n_src_val = {26'd0, (rdd_reg9 == 3'd0) ? 6'd8 : {3'd0, rdd_reg9}}; n_src_val_v = 1; end
+							end
+							n_next = NX_PSTART;
+						end
+					end
+
+					//------------------------------------------ 0xF: 040 group
+					default: begin
+						if (rd_ir[11:8] == 4'h4) begin
+							// CINV/CPUSH: write-through caches hold no dirty
+							// data, so both invalidate the selected caches
+							// (scope is widened to ALL, which is safe)
+							// Scope bit patterns 000 and 100 are unassigned
+							// F-line encodings.  Classify them before privilege.
+							if (rd_ir[4:3] == 2'b00) n_inplace = 1;
+							else if (!sr_s) n_inplace = 1;
+							else begin
+								n_inplace = 1;
+								n_inplace = 1;
+								n_inplace = 1;
+								n_inplace = 1;
+								n_inplace = 1;
+							end
+						end
+						else if (rd_ir[11:8] == 4'h5) begin
+							if (rd_ir[7:5] == 3'b000) begin
+								// PFLUSH group
+								if (!sr_s) n_inplace = 1;
+								else begin
+									n_inplace = 1;
+									n_inplace = 1;
+									if (rd_ir[4]) begin
+										// PFLUSHAN / PFLUSHA
+										n_inplace = 1;
+									end
+									else begin
+										begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end
+										n_inplace = 1;
+									end
+								end
+							end
+							else if (rd_ir[7:6] == 2'b01) begin
+								// PTEST
+								// Only F548..F54F and F568..F56F are PTEST;
+								// the rest of this quadrant is unassigned F-line.
+								if (rd_ir[4:3] != 2'b01) n_inplace = 1;
+								else if (!sr_s) n_inplace = 1;
+								else begin
+									begin n_rr_a = {1'b1, rdd_rn}; n_rr_a_v = 1; end
+									n_inplace = 1;
+								end
+							end
+							else n_inplace = 1;
+						end
+						else if (rd_ir[11:8] == 4'h2) begin
+							// FPU coprocessor space (cpid 1)
+							if (AP040_HAS_FPU == 0)
+								n_inplace = 1;
+							else case (rd_ir[7:6])
+								2'b00: begin                         // general
+									// Mode-7 registers 5..7 are reserved for every
+									// coprocessor command.  Reject them before fetching
+									// an extension word; malformed primary opcodes take
+									// the F-line vector, independent of the next word.
+									if (rdd_mode == 3'b111 && rdd_rn > 3'b100)
+										n_inplace = 1;
+									else n_inplace = 1;
+								end
+								2'b01: begin                         // FScc/FDBcc/FTRAPcc
+									// As in the general command space, mode-7
+									// registers 5..7 are primary-word F-line errors.
+									if (rdd_mode == 3'b111 && rdd_rn > 3'b100)
+										n_inplace = 1;
+									else n_inplace = 1;
+								end
+								2'b10:   n_inplace = 1;      // FBcc.W
+								default: n_inplace = 1;      // FBcc.L
+							endcase
+						end
+						else if (rd_ir[11:8] == 4'h3) begin
+							// FSAVE/FRESTORE state-frame model: NULL, IDLE and the
+							// revision-$41 unimplemented-instruction frame are
+							// implemented.  A true BUSY arithmetic-exception frame
+							// remains outside this non-pipelined FPU's state model.
+							if (rd_ir[7:6] == 2'b00) begin
+								// FSAVE: control alterable or -(An)
+								// Malformed coprocessor EAs are F-line faults and
+								// are classified before privilege.
+								if (rdd_mode < 3'b010 || rdd_mode == 3'b011 ||
+								    (rdd_mode == 3'b111 && rdd_rn > 3'b001)) n_inplace = 1;
+								else if (!sr_s) n_inplace = 1;
+								else n_inplace = 1;
+							end
+							else if (rd_ir[7:6] == 2'b01) begin
+								// FRESTORE: control, (An)+ or PC relative
+								if (rdd_mode < 3'b010 || rdd_mode == 3'b100 ||
+								    (rdd_mode == 3'b111 && rdd_rn >= 3'b100)) n_inplace = 1;
+								else if (!sr_s) n_inplace = 1;
+								else n_inplace = 1;
+							end
+							else n_inplace = 1;
+						end
+						else if (rd_ir[11:8] == 4'h6 && rd_ir[7:5] == 3'b000) begin
+							// MOVE16 with absolute long operand
+							n_inplace = 1;
+							n_inplace = 1;
+						end
+						else if (rd_ir[11:8] == 4'h6 && rd_ir[7:3] == 5'b00100) begin
+							// MOVE16 (Ax)+,(Ay)+
+							n_inplace = 1;
+							n_inplace = 1;
+						end
+						else n_inplace = 1;
+					end
+				endcase
+end
+
+`ifdef DECODE_CHECK
+// Equivalence check: the record computed in the S_DECODE cycle (rd_ir == ir)
+// against the registers the body wrote, one cycle later.  Descriptor-covered
+// opcodes are skipped (dispatch_reg_decode overrides the body there).
+reg        chk_v; reg [15:0] chk_ir; reg [31:0] chk_pc; reg [2:0] chk_next;
+reg [2:0]    chk_p_src; reg chk_p_src_v;
+reg [2:0]    chk_p_dst; reg chk_p_dst_v;
+reg          chk_p_rmw; reg chk_p_rmw_v;
+reg          chk_p_wbsup; reg chk_p_wbsup_v;
+reg          chk_p_flags; reg chk_p_flags_v;
+reg          chk_p_sextw; reg chk_p_sextw_v;
+reg          chk_p_dst_mem_bit; reg chk_p_dst_mem_bit_v;
+reg [3:0]    chk_exec_kind; reg chk_exec_kind_v;
+reg [1:0]    chk_op_size; reg chk_op_size_v;
+reg [5:0]    chk_alu_op; reg chk_alu_op_v;
+reg [3:0]    chk_p_dreg; reg chk_p_dreg_v;
+reg [1:0]    chk_p_dsize; reg chk_p_dsize_v;
+reg [1:0]    chk_p_ssize; reg chk_p_ssize_v;
+reg [3:0]    chk_p_sreg; reg chk_p_sreg_v;
+reg [2:0]    chk_dst_rn_r; reg chk_dst_rn_r_v;
+reg [2:0]    chk_dst_mode_r; reg chk_dst_mode_r_v;
+reg [2:0]    chk_src_rn_r; reg chk_src_rn_r_v;
+reg [2:0]    chk_src_mode_r; reg chk_src_mode_r_v;
+reg [3:0]    chk_rr_a; reg chk_rr_a_v;
+reg [3:0]    chk_rr_b; reg chk_rr_b_v;
+reg [31:0]   chk_src_val; reg chk_src_val_v;
+reg          chk_sh_rox; reg chk_sh_rox_v;
+reg          chk_md_isdiv; reg chk_md_isdiv_v;
+reg          chk_md_sign; reg chk_md_sign_v;
+reg          chk_lk_cyc; reg chk_lk_cyc_v;
+always @(posedge clk) begin
+	chk_v <= 0;
+	if (ce && state == S_DECODE && !rd_valid && !n_inplace) begin
+		chk_v <= 1; chk_ir <= ir; chk_pc <= pc_i; chk_next <= n_next;
+		chk_p_src <= n_p_src; chk_p_src_v <= n_p_src_v;
+		chk_p_dst <= n_p_dst; chk_p_dst_v <= n_p_dst_v;
+		chk_p_rmw <= n_p_rmw; chk_p_rmw_v <= n_p_rmw_v;
+		chk_p_wbsup <= n_p_wbsup; chk_p_wbsup_v <= n_p_wbsup_v;
+		chk_p_flags <= n_p_flags; chk_p_flags_v <= n_p_flags_v;
+		chk_p_sextw <= n_p_sextw; chk_p_sextw_v <= n_p_sextw_v;
+		chk_p_dst_mem_bit <= n_p_dst_mem_bit; chk_p_dst_mem_bit_v <= n_p_dst_mem_bit_v;
+		chk_exec_kind <= n_exec_kind; chk_exec_kind_v <= n_exec_kind_v;
+		chk_op_size <= n_op_size; chk_op_size_v <= n_op_size_v;
+		chk_alu_op <= n_alu_op; chk_alu_op_v <= n_alu_op_v;
+		chk_p_dreg <= n_p_dreg; chk_p_dreg_v <= n_p_dreg_v;
+		chk_p_dsize <= n_p_dsize; chk_p_dsize_v <= n_p_dsize_v;
+		chk_p_ssize <= n_p_ssize; chk_p_ssize_v <= n_p_ssize_v;
+		chk_p_sreg <= n_p_sreg; chk_p_sreg_v <= n_p_sreg_v;
+		chk_dst_rn_r <= n_dst_rn_r; chk_dst_rn_r_v <= n_dst_rn_r_v;
+		chk_dst_mode_r <= n_dst_mode_r; chk_dst_mode_r_v <= n_dst_mode_r_v;
+		chk_src_rn_r <= n_src_rn_r; chk_src_rn_r_v <= n_src_rn_r_v;
+		chk_src_mode_r <= n_src_mode_r; chk_src_mode_r_v <= n_src_mode_r_v;
+		chk_rr_a <= n_rr_a; chk_rr_a_v <= n_rr_a_v;
+		chk_rr_b <= n_rr_b; chk_rr_b_v <= n_rr_b_v;
+		chk_src_val <= n_src_val; chk_src_val_v <= n_src_val_v;
+		chk_sh_rox <= n_sh_rox; chk_sh_rox_v <= n_sh_rox_v;
+		chk_md_isdiv <= n_md_isdiv; chk_md_isdiv_v <= n_md_isdiv_v;
+		chk_md_sign <= n_md_sign; chk_md_sign_v <= n_md_sign_v;
+		chk_lk_cyc <= n_lk_cyc; chk_lk_cyc_v <= n_lk_cyc_v;
+	end
+	if (chk_v && ce) begin
+		if (chk_p_src_v && chk_p_src !== p_src) $display("DECODE_CHECK pc=%h ir=%h field p_src record=%h body=%h", chk_pc, chk_ir, chk_p_src, p_src);
+		if (chk_p_dst_v && chk_p_dst !== p_dst) $display("DECODE_CHECK pc=%h ir=%h field p_dst record=%h body=%h", chk_pc, chk_ir, chk_p_dst, p_dst);
+		if (chk_p_rmw_v && chk_p_rmw !== p_rmw) $display("DECODE_CHECK pc=%h ir=%h field p_rmw record=%h body=%h", chk_pc, chk_ir, chk_p_rmw, p_rmw);
+		if (chk_p_wbsup_v && chk_p_wbsup !== p_wbsup) $display("DECODE_CHECK pc=%h ir=%h field p_wbsup record=%h body=%h", chk_pc, chk_ir, chk_p_wbsup, p_wbsup);
+		if (chk_p_flags_v && chk_p_flags !== p_flags) $display("DECODE_CHECK pc=%h ir=%h field p_flags record=%h body=%h", chk_pc, chk_ir, chk_p_flags, p_flags);
+		if (chk_p_sextw_v && chk_p_sextw !== p_sextw) $display("DECODE_CHECK pc=%h ir=%h field p_sextw record=%h body=%h", chk_pc, chk_ir, chk_p_sextw, p_sextw);
+		if (chk_p_dst_mem_bit_v && chk_p_dst_mem_bit !== p_dst_mem_bit) $display("DECODE_CHECK pc=%h ir=%h field p_dst_mem_bit record=%h body=%h", chk_pc, chk_ir, chk_p_dst_mem_bit, p_dst_mem_bit);
+		if (chk_exec_kind_v && chk_exec_kind !== exec_kind) $display("DECODE_CHECK pc=%h ir=%h field exec_kind record=%h body=%h", chk_pc, chk_ir, chk_exec_kind, exec_kind);
+		if (chk_op_size_v && chk_op_size !== op_size) $display("DECODE_CHECK pc=%h ir=%h field op_size record=%h body=%h", chk_pc, chk_ir, chk_op_size, op_size);
+		if (chk_alu_op_v && chk_alu_op !== alu_op) $display("DECODE_CHECK pc=%h ir=%h field alu_op record=%h body=%h", chk_pc, chk_ir, chk_alu_op, alu_op);
+		if (chk_p_dreg_v && chk_p_dreg !== p_dreg) $display("DECODE_CHECK pc=%h ir=%h field p_dreg record=%h body=%h", chk_pc, chk_ir, chk_p_dreg, p_dreg);
+		if (chk_p_dsize_v && chk_p_dsize !== p_dsize) $display("DECODE_CHECK pc=%h ir=%h field p_dsize record=%h body=%h", chk_pc, chk_ir, chk_p_dsize, p_dsize);
+		if (chk_p_ssize_v && chk_p_ssize !== p_ssize) $display("DECODE_CHECK pc=%h ir=%h field p_ssize record=%h body=%h", chk_pc, chk_ir, chk_p_ssize, p_ssize);
+		if (chk_p_sreg_v && chk_p_sreg !== p_sreg) $display("DECODE_CHECK pc=%h ir=%h field p_sreg record=%h body=%h", chk_pc, chk_ir, chk_p_sreg, p_sreg);
+		if (chk_dst_rn_r_v && chk_dst_rn_r !== dst_rn_r) $display("DECODE_CHECK pc=%h ir=%h field dst_rn_r record=%h body=%h", chk_pc, chk_ir, chk_dst_rn_r, dst_rn_r);
+		if (chk_dst_mode_r_v && chk_dst_mode_r !== dst_mode_r) $display("DECODE_CHECK pc=%h ir=%h field dst_mode_r record=%h body=%h", chk_pc, chk_ir, chk_dst_mode_r, dst_mode_r);
+		if (chk_src_rn_r_v && chk_src_rn_r !== src_rn_r) $display("DECODE_CHECK pc=%h ir=%h field src_rn_r record=%h body=%h", chk_pc, chk_ir, chk_src_rn_r, src_rn_r);
+		if (chk_src_mode_r_v && chk_src_mode_r !== src_mode_r) $display("DECODE_CHECK pc=%h ir=%h field src_mode_r record=%h body=%h", chk_pc, chk_ir, chk_src_mode_r, src_mode_r);
+		if (chk_rr_a_v && chk_rr_a !== rr_a) $display("DECODE_CHECK pc=%h ir=%h field rr_a record=%h body=%h", chk_pc, chk_ir, chk_rr_a, rr_a);
+		if (chk_rr_b_v && chk_rr_b !== rr_b && !(chk_next == NX_IMMREG && state == S_IMMF)) $display("DECODE_CHECK pc=%h ir=%h field rr_b record=%h body=%h", chk_pc, chk_ir, chk_rr_b, rr_b);
+		if (chk_src_val_v && chk_src_val !== src_val) $display("DECODE_CHECK pc=%h ir=%h field src_val record=%h body=%h", chk_pc, chk_ir, chk_src_val, src_val);
+		if (chk_sh_rox_v && chk_sh_rox !== sh_rox) $display("DECODE_CHECK pc=%h ir=%h field sh_rox record=%h body=%h", chk_pc, chk_ir, chk_sh_rox, sh_rox);
+		if (chk_md_isdiv_v && chk_md_isdiv !== md_isdiv) $display("DECODE_CHECK pc=%h ir=%h field md_isdiv record=%h body=%h", chk_pc, chk_ir, chk_md_isdiv, md_isdiv);
+		if (chk_md_sign_v && chk_md_sign !== md_sign) $display("DECODE_CHECK pc=%h ir=%h field md_sign record=%h body=%h", chk_pc, chk_ir, chk_md_sign, md_sign);
+		if (chk_lk_cyc_v && chk_lk_cyc !== lk_cyc) $display("DECODE_CHECK pc=%h ir=%h field lk_cyc record=%h body=%h", chk_pc, chk_ir, chk_lk_cyc, lk_cyc);
+		if (chk_next == NX_PSTART && state != S_PIPE_START) $display("DECODE_CHECK pc=%h ir=%h next PSTART but state=%0d", chk_pc, chk_ir, state);
+		if (chk_next == NX_PREGS && state != S_PIPE_REGS) $display("DECODE_CHECK pc=%h ir=%h next PREGS but state=%0d", chk_pc, chk_ir, state);
+		if (chk_next == NX_IMMF_PSTART && state != S_PIPE_START && state != S_IMMF) $display("DECODE_CHECK pc=%h ir=%h next IMMF_PSTART but state=%0d", chk_pc, chk_ir, state);
+		if (chk_next == NX_IMMREG && state != S_PIPE_REGS && state != S_IMMF) $display("DECODE_CHECK pc=%h ir=%h next IMMREG but state=%0d", chk_pc, chk_ir, state);
+		if (chk_next == NX_NONE) $display("DECODE_CHECK pc=%h ir=%h record has no next (in-place expected) state=%0d", chk_pc, chk_ir, state);
+	end
+end
+`endif
 
 always @(posedge clk) begin
 	// Combinational carriers, valid only inside this block: the fetch queue's
@@ -3015,6 +4493,13 @@ always @(posedge clk) begin
 						dst_val <= rf_rdata_b;
 						state <= S_EXEC;
 					end
+					// UNLK: A7 was written with the read issue; the
+					// popped frame pointer lands here and the
+					// instruction retires.
+					else if (r_m_ret == S_UNLK3) begin
+						rfw({1'b1, d_rn}, mem_rdata);
+						fetch_next;
+					end
 					else begin
 						m_val <= mem_rdata;
 						state <= r_m_ret;
@@ -3183,24 +4668,27 @@ always @(posedge clk) begin
 						// simple modes here and bypass S_EA_DISP; extension-bearing
 						// modes overlap EA selection with extension-request setup.
 						case (src_mode_r)
+							// The base comes through the forwarded port: a record
+							// handed over at a retire that writes this register
+							// reaches here while that write lands.
 							3'b010: begin
 								if (p_dst == DK_REG) rr_b <= p_dreg;
-								mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
+								mrd(rf_capture_a, p_ssize, S_PIPE_SDONE);
 							end
 							3'b011: begin
 								if (p_dst == DK_REG) rr_b <= p_dreg;
-								mrd(rf_rdata_a, p_ssize, S_PIPE_SDONE);
+								mrd(rf_capture_a, p_ssize, S_PIPE_SDONE);
 								rfw({1'b1, src_rn_r},
-								    rf_rdata_a + an_adj(src_rn_r, p_ssize));
-								u_rec({1'b1, src_rn_r}, rf_rdata_a);
+								    rf_capture_a + an_adj(src_rn_r, p_ssize));
+								u_rec({1'b1, src_rn_r}, rf_capture_a);
 							end
 							3'b100: begin : pipe_predec_read
 								reg [31:0] predec_addr;
-								predec_addr = rf_rdata_a - an_adj(src_rn_r, p_ssize);
+								predec_addr = rf_capture_a - an_adj(src_rn_r, p_ssize);
 								if (p_dst == DK_REG) rr_b <= p_dreg;
 								mrd(predec_addr, p_ssize, S_PIPE_SDONE);
 								rfw({1'b1, src_rn_r}, predec_addr);
-								u_rec({1'b1, src_rn_r}, rf_rdata_a);
+								u_rec({1'b1, src_rn_r}, rf_capture_a);
 							end
 							default:
 								ea_operand_start(src_mode_r, src_rn_r, p_ssize,
@@ -3278,11 +4766,21 @@ always @(posedge clk) begin
 				if (exec_kind == EK_ALU && p_dst == DK_REG) begin
 					retire_operand_alu;
 				end
+				else if (shift_fire && (shift_cnt != 6'd0)) begin
+					// register shift, whole count in one ALU call (a zero
+					// count keeps the S_SHIFT path for its special flags)
+					sr[4:0] <= alu_fl;
+					rfw(p_dreg, merge_sz(rf_capture_b, alu_res, op_size));
+					fetch_next;
+				end
 				else begin
+					// Forwarded ports: a lookahead dispatch lands here one
+					// cycle after its producer's register write, which is
+					// still in flight (rf_we) in this cycle.
 					if (state == S_PIPE_SDONE) src_val <= m_val;
-					else if (p_src == SK_REG) src_val <= rf_rdata_a;
+					else if (p_src == SK_REG) src_val <= rf_capture_a;
 					if (p_dst == DK_REG) begin
-						dst_val <= rf_rdata_b;
+						dst_val <= rf_capture_b;
 						state <= S_EXEC;
 					end
 					else state <= S_PIPE_DST;
@@ -3941,6 +5439,14 @@ always @(posedge clk) begin
 				end
 			end
 
+			// The redirect is issued here, one cycle after the push's
+			// acknowledge, so the port is free and the target fetch goes
+			// out at once: a redirect from inside the acknowledge cycle
+			// is deferred to the fill engine, whose fill does not seed the
+			// branch refill sector (v3, Sieve offset 0: +49 K cycles).
+			// The push's undo record retires with the push: go_pc, unlike
+			// fetch_next, does not clear it, and a fetch fault at the
+			// target must not roll A7 back past the push.
 			S_JSR2: begin
 				rfw(4'd15, dbg_a7 - 32'd4);
 				go_pc(br_tgt);
@@ -3958,21 +5464,17 @@ always @(posedge clk) begin
 				fetch_next;
 			end
 
-			S_LINK1: begin
-				rr_a <= {1'b1, d_rn};
-				state <= S_LINK2;
-			end
-
+			// LINK: decode selected An on port A; push it, and write An
+			// with the same edge (undo-recorded so a faulting push
+			// restarts with the old An).  A7 follows once the push has
+			// completed.
 			S_LINK2: begin : link2
 				reg [31:0] spn;
 				spn = dbg_a7 - 32'd4;
 				t_a <= spn;
-				mwr(spn, `AP040_SZ_L, (d_rn == 3'd7) ? spn : rf_rdata_a, S_LINK3);
-			end
-
-			S_LINK3: begin
-				rfw({1'b1, d_rn}, t_a);
-				state <= S_LINK4;
+				mwr(spn, `AP040_SZ_L, (d_rn == 3'd7) ? spn : rf_rdata_a, S_LINK4);
+				rfw({1'b1, d_rn}, spn);
+				u_rec({1'b1, d_rn}, rf_rdata_a);
 			end
 
 			S_LINK4: begin
@@ -3980,16 +5482,17 @@ always @(posedge clk) begin
 				fetch_next;
 			end
 
+			// UNLK: pop through An, write A7 with the read issue
+			// (undo-recorded), retire in the read's acknowledge cycle.
 			S_UNLK1: begin
-				t_a <= rf_rdata_a;
-				mrd(rf_rdata_a, `AP040_SZ_L, S_UNLK2);
+				mrd(rf_rdata_a, `AP040_SZ_L, S_UNLK3);
+				rfw(4'd15, rf_rdata_a + 32'd4);
+				u_rec(4'd15, dbg_a7);
 			end
 
-			S_UNLK2: begin
-				rfw(4'd15, t_a + 32'd4);
-				state <= S_UNLK3;
-			end
-
+			// Reached only through the byte-split (page-crossing) read
+			// path, which returns to r_m_ret as a state; the aligned
+			// case retires in the S_MRD acknowledge.
 			S_UNLK3: begin
 				rfw({1'b1, d_rn}, m_val);
 				fetch_next;
@@ -5703,1114 +7206,1024 @@ always @(posedge clk) begin
 
 			//---------------------------------------------------------- decode
 			S_DECODE: begin
-				// Generic source-memory forms all use the opcode's low An.
-				// Select it while decoding so simple An modes can consume the
-				// asynchronous port-A value as soon as the pipeline starts.
-				// Decode cases which need another register override this below.
-				rr_a <= {1'b1, d_rn};
-				case (ir_hi)
-					//-------------------------------------------- 0x0: bit/imm
-					4'h0: begin
-						if (ir[8] && d_mode == 3'b001) begin
-							// MOVEP
-							mp_dir <= ir[7];
-							mp_cnt <= ir[6] ? 3'd4 : 3'd2;
-							immf(2'd1, S_MOVEP1);
-						end
-						else if (ir[8]) begin
-							// dynamic bit op, bit number in Dn
-							// As for the static forms, an address register is
-							// never a bit destination.  BTST may read program
-							// space or an immediate operand, but the modifying
-							// forms require a data-alterable destination.
-							if (d_mode == 3'b001) go_illegal;
-							else if (d_mode == 3'b111 &&
-							         ((ir[7:6] == 2'b00) ? (d_rn > 3'b100)
-							                             : (d_rn > 3'b001)))
-								go_illegal;
-							else begin
-								alu_op <= `AP040_ALU_BTST + {4'd0, ir[7:6]};
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-								if (ir[7:6] == 2'b00) p_wbsup <= 1; // BTST
-								if (ea_is_imm)
-									immf(2'd1, S_BTSTI);
-								else if (d_mode == 3'b000) begin
-									op_size <= `AP040_SZ_L;
-									p_dsize <= `AP040_SZ_L;
-									p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-									pipe_go;
+				// Step D: the body keeps only the paths the record marks in
+				// place (generated by step_d.py); the record over ir (rd_ir
+				// selects ir here) is applied after it, so its values win
+				// over the shared statements kept for the in-place paths.
+				begin
+					rr_a <= {1'b1, d_rn};
+					case (ir_hi)
+						4'h0:
+						begin
+							if (ir[8] && d_mode == 3'b001)
+							begin
+								mp_dir <= ir[7];
+								mp_cnt <= ir[6] ? 3'd4 : 3'd2;
+								immf(2'd1, S_MOVEP1);
+							end
+							else
+								if (ir[8])
+								begin
+									if (d_mode == 3'b001)
+										go_illegal;
+									else
+										if (d_mode == 3'b111 && ((ir[7:6] == 2'b00) ? (d_rn > 3'b100) : (d_rn > 3'b001)))
+											go_illegal;
+										else
+										begin
+											alu_op <= `AP040_ALU_BTST + {4'd0, ir[7:6]};
+											p_src <= SK_REG;
+											p_sreg <= {1'b0, d_reg9};
+											rr_b <= {1'b0, d_reg9};
+											if (ir[7:6] == 2'b00)
+												p_wbsup <= 1;
+											if (ea_is_imm)
+												immf(2'd1, S_BTSTI);
+										end
 								end
-								else begin
-									op_size <= `AP040_SZ_B;
-									p_dsize <= `AP040_SZ_B;
-									p_dst <= DK_MEM;
-									p_dst_mem_bit <= 1;
-									dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-									p_rmw <= 1;
-									pipe_go;
-								end
-							end
-						end
-						else if (d_reg9 == 3'b100) begin
-							// static bit op, bit number in extension word
-							// (checked before the size=11 group: BSET is 00xx11)
-							// BTST only reads, so it accepts program space and
-							// an immediate operand; BCHG/BCLR/BSET write and
-							// need a data alterable destination.  An address
-							// register is never allowed.
-							if (d_mode == 3'b001) go_illegal;
-							else if (d_mode == 3'b111 &&
-							         ((ir[7:6] == 2'b00) ? (d_rn > 3'b100)
-							                             : (d_rn > 3'b001)))
-								go_illegal;
-							else begin
-							alu_op <= `AP040_ALU_BTST + {4'd0, ir[7:6]};
-							p_src <= SK_IMM;
-							if (d_mode == 3'b000) begin
-								op_size <= `AP040_SZ_L;
-								p_dsize <= `AP040_SZ_L;
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-							end
-							else begin
-								op_size <= `AP040_SZ_B;
-								p_dsize <= `AP040_SZ_B;
-								p_dst <= DK_MEM;
-								p_dst_mem_bit <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								p_rmw <= 1;
-							end
-							if (ir[7:6] == 2'b00) p_wbsup <= 1;
-							immf(2'd1, S_PIPE_START);
-							end
-						end
-						else if (d_reg9 == 3'b111 && std_size != 2'b11) begin
-							// MOVES (0000 1110 11 is CAS.L, not implemented)
-							// Validate the effective-address encoding before the
-							// privilege check.  Invalid MOVES encodings take vector
-							// 4 even in user mode; only a valid MOVES is privileged.
-							if (d_mode < 3'b010 ||
-							    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-							else if (!sr_s) go_priv;
-							else begin
-								op_size <= std_size;
-								immf(2'd1, S_MOVES1);
-							end
-						end
-						else if (std_size == 2'b11) begin
-							if (!d_reg9[2] && d_reg9[1:0] != 2'b11) begin
-								// CHK2/CMP2: bounds pair at a control EA
-								if (d_mode < 3'b010 || d_mode == 3'b011 ||
-								    d_mode == 3'b100 || ea_is_imm) go_illegal;
-								else begin
-									op_size <= d_reg9[1] ? `AP040_SZ_L :
-									           d_reg9[0] ? `AP040_SZ_W : `AP040_SZ_B;
-									immf(2'd1, S_CHK2_A);
-								end
-							end
-							else if (d_reg9[2] && d_reg9[1:0] != 2'b00 && ea_is_imm) begin
-								// CAS2.W/.L: two extension words follow
-								if (d_reg9[1:0] == 2'b01) go_illegal;   // no CAS2.B
-								else begin
-									alu_op <= `AP040_ALU_CMP;
-									op_size <= (d_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L;
-									begin lk_cyc <= 1; immf(2'd2, S_CAS2_0); end
-								end
-							end
-							else if (d_reg9[2] && d_reg9[1:0] != 2'b00) begin
-								// CAS (memory only)
-								if (d_mode < 3'b010 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-								else begin
-									alu_op <= `AP040_ALU_CMP;
-									op_size <= (d_reg9[1:0] == 2'b01) ? `AP040_SZ_B :
-									           (d_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L;
-									begin lk_cyc <= 1; immf(2'd1, S_CAS1); end
-								end
-							end
-							else go_illegal;   // CAS2 / CHK2 / CMP2
-						end
-						else begin
-							// ORI/ANDI/SUBI/ADDI/EORI/CMPI
-							if (ea_is_imm && (d_reg9 == 3'b000 || d_reg9 == 3'b001 || d_reg9 == 3'b101)) begin
-								// to CCR (byte) or SR (word, privileged)
-								if (std_size == 2'b01 && !sr_s) go_priv;
-								else if (std_size > 2'b01) go_illegal;
-								else begin
-									srop_kind <= (d_reg9 == 3'b000) ? 2'd0 :
-									             (d_reg9 == 3'b001) ? 2'd1 : 2'd2;
-									srop_sr <= (std_size == 2'b01);
-									immf(2'd1, S_SROP);
-								end
-							end
-							else if (d_mode == 3'b001) go_illegal;
-							// The destination must be data alterable, so the
-							// PC-relative and immediate encodings of mode 7
-							// are illegal.  CMPI is the exception: the 68020
-							// and later allow it to read program space.
-							else if (d_mode == 3'b111 && d_rn > 3'b001 &&
-							         !(d_reg9 == 3'b110 && d_rn < 3'b100))
-								go_illegal;
-							else begin
-								case (d_reg9)
-									3'b000: alu_op <= `AP040_ALU_OR;
-									3'b001: alu_op <= `AP040_ALU_AND;
-									3'b010: alu_op <= `AP040_ALU_SUB;
-									3'b011: alu_op <= `AP040_ALU_ADD;
-									3'b101: alu_op <= `AP040_ALU_EOR;
-									default: alu_op <= `AP040_ALU_CMP;
-								endcase
-								if (d_reg9 == 3'b110) p_wbsup <= 1; // CMPI
-								op_size <= std_size;
-								p_ssize <= std_size; p_dsize <= std_size;
-								p_src <= SK_IMM;
-								if (d_mode == 3'b000) begin
-									p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-									immf_reg((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, {1'b0, d_rn});
-								end
-								else begin
-									p_dst <= DK_MEM; p_rmw <= 1;
-									dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-									immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
-								end
-							end
-						end
-					end
-
-					//------------------------------------------- 0x1-0x3: MOVE
-					4'h1, 4'h2, 4'h3: begin
-						if (rd_valid) begin end // descriptor applied after state case
-						else if (move_size == `AP040_SZ_B &&
-						    (d_mode == 3'b001 || d_op8_6 == 3'b001)) go_illegal;
-						else if (d_op8_6 == 3'b111 && d_reg9 > 3'b001) go_illegal;
-						else begin
-							alu_op <= `AP040_ALU_MOVE;
-							op_size <= move_size;
-							p_ssize <= move_size; p_dsize <= move_size;
-							// source
-							if (d_mode == 3'b000 || d_mode == 3'b001) begin
-								p_src <= SK_REG; p_sreg <= {d_mode[0], d_rn};
-							end
-							else if (ea_is_imm) p_src <= SK_IMM;
-							else begin
-								p_src <= SK_MEM;
-								src_mode_r <= d_mode; src_rn_r <= d_rn;
-							end
-							// destination
-							if (d_op8_6 == 3'b000) begin
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-							end
-							else if (d_op8_6 == 3'b001) begin
-								// MOVEA: full register, no flags, word sexts
-								p_dst <= DK_REG; p_dreg <= {1'b1, d_reg9};
-								p_flags <= 0;
-								if (move_size == `AP040_SZ_W) p_sextw <= 1;
-								op_size <= `AP040_SZ_L;
-							end
-							else begin
-								p_dst <= DK_MEM;
-								dst_mode_r <= d_op8_6; dst_rn_r <= d_reg9;
-								// A register or immediate source leaves port A
-								// free for the destination base and port B for
-								// the source register, so S_PIPE_START can start
-								// the destination EA at once (memory-destination
-								// fast path).  A memory source keeps port A.
-								if (d_mode == 3'b000 || d_mode == 3'b001 || ea_is_imm)
-									rr_a <= {1'b1, d_reg9};
-								if (d_mode == 3'b000 || d_mode == 3'b001)
-									rr_b <= {d_mode[0], d_rn};
-							end
-							if (ea_is_imm && (d_op8_6 == 3'b000 || d_op8_6 == 3'b001))
-								immf_reg((move_size == `AP040_SZ_L) ? 2'd2 : 2'd1, {d_op8_6[0], d_reg9});
-							else if (ea_is_imm)
-								immf((move_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
-							else pipe_go;
-						end
-					end
-
-					//------------------------------------------------ 0x4: misc
-					4'h4: begin
-						if (ir[11:0] == 12'hAFC) go_illegal;   // ILLEGAL
-						else if (d_op8_6 == 3'b111) begin
-							if (d_mode == 3'b000) begin
-								if (d_reg9 == 3'b100) begin
-									// EXTB.L
-									alu_op <= `AP040_ALU_EXTB;
-									op_size <= `AP040_SZ_L;
-									p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-									pipe_go;
-								end
-								else go_illegal;
-							end
-							else if (d_mode == 3'b001 || (d_mode == 3'b011) ||
-							         (d_mode == 3'b100) || ea_is_imm) go_illegal;
-							else ea_start(d_mode, d_rn, `AP040_SZ_L, S_LEA1); // LEA
-						end
-						else if (d_op8_6 == 3'b110) begin
-							// CHK.W
-							exec_kind <= EK_CHK;
-							op_size <= `AP040_SZ_W;
-							p_ssize <= `AP040_SZ_W;
-							if (d_mode == 3'b001) go_illegal;
-							else begin
-								if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; end
-								else if (ea_is_imm) p_src <= SK_IMM;
-								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; end
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (ea_is_imm) immf_reg(2'd1, {1'b0, d_reg9});
-								else pipe_go;
-							end
-						end
-						else if (d_op8_6 == 3'b100 &&
-						         !(ir[11:9] == 3'b100 && d_mode == 3'b001)) begin
-							// CHK.L (0100 ddd 100; 0100 100 000 001 rrr is LINK.L)
-							exec_kind <= EK_CHK;
-							op_size <= `AP040_SZ_L;
-							p_ssize <= `AP040_SZ_L;
-							if (d_mode == 3'b001) go_illegal;
-							else begin
-								if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; end
-								else if (ea_is_imm) p_src <= SK_IMM;
-								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; end
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (ea_is_imm) immf_reg(2'd2, {1'b0, d_reg9});
-								else pipe_go;
-							end
-						end
-						else case (ir[11:9])
-							3'b000: begin
-								if (d_op8_6 == 3'b011) begin
-									// MOVE from SR (privileged on 68010+)
-									// EA legality is decoded before privilege.  In user
-									// mode MOVE SR,An/PC/#imm is vector 4, not vector 8.
-									if (dst_not_alt) go_illegal;
-									else if (!sr_s) go_priv;
-									else begin
-										p_src <= SK_IMPL; src_val <= {16'd0, sr};
-										alu_op <= `AP040_ALU_MOVE;
-										op_size <= `AP040_SZ_W;
-										p_dsize <= `AP040_SZ_W;
-										p_flags <= 0;
-										if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-										else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
+								else
+									if (d_reg9 == 3'b100)
+									begin
+										if (d_mode == 3'b001)
+											go_illegal;
+										else
+											if (d_mode == 3'b111 && ((ir[7:6] == 2'b00) ? (d_rn > 3'b100) : (d_rn > 3'b001)))
+												go_illegal;
 									end
+									else
+										if (d_reg9 == 3'b111 && std_size != 2'b11)
+										begin
+											if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+												go_illegal;
+											else
+												if (!sr_s)
+													go_priv;
+												else
+												begin
+													op_size <= std_size;
+													immf(2'd1, S_MOVES1);
+												end
+										end
+										else
+											if (std_size == 2'b11)
+											begin
+												if (!d_reg9[2] && d_reg9[1:0] != 2'b11)
+												begin
+													if (d_mode < 3'b010 || d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm)
+														go_illegal;
+													else
+													begin
+														op_size <= d_reg9[1] ? `AP040_SZ_L :
+									           d_reg9[0] ? `AP040_SZ_W : `AP040_SZ_B;
+														immf(2'd1, S_CHK2_A);
+													end
+												end
+												else
+													if (d_reg9[2] && d_reg9[1:0] != 2'b00 && ea_is_imm)
+													begin
+														if (d_reg9[1:0] == 2'b01)
+															go_illegal;
+														else
+														begin
+															alu_op <= `AP040_ALU_CMP;
+															op_size <= (d_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L;
+															begin
+																lk_cyc <= 1;
+																immf(2'd2, S_CAS2_0);
+															end
+														end
+													end
+													else
+														if (d_reg9[2] && d_reg9[1:0] != 2'b00)
+														begin
+															if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+																go_illegal;
+															else
+															begin
+																alu_op <= `AP040_ALU_CMP;
+																op_size <= (d_reg9[1:0] == 2'b01) ? `AP040_SZ_B :
+									           (d_reg9[1:0] == 2'b10) ? `AP040_SZ_W : `AP040_SZ_L;
+																begin
+																	lk_cyc <= 1;
+																	immf(2'd1, S_CAS1);
+																end
+															end
+														end
+														else
+															go_illegal;
+											end
+											else
+											begin
+												if (ea_is_imm && (d_reg9 == 3'b000 || d_reg9 == 3'b001 || d_reg9 == 3'b101))
+												begin
+													if (std_size == 2'b01 && !sr_s)
+														go_priv;
+													else
+														if (std_size > 2'b01)
+															go_illegal;
+														else
+														begin
+															srop_kind <= (d_reg9 == 3'b000) ? 2'd0 :
+									             (d_reg9 == 3'b001) ? 2'd1 : 2'd2;
+															srop_sr <= (std_size == 2'b01);
+															immf(2'd1, S_SROP);
+														end
+												end
+												else
+													if (d_mode == 3'b001)
+														go_illegal;
+													else
+														if (d_mode == 3'b111 && d_rn > 3'b001 && !(d_reg9 == 3'b110 && d_rn < 3'b100))
+															go_illegal;
+											end
+						end
+						4'h1, 4'h2, 4'h3:
+						begin
+							if (rd_valid)
+							begin end
+							else
+								if (move_size == `AP040_SZ_B && (d_mode == 3'b001 || d_op8_6 == 3'b001))
+									go_illegal;
+								else
+									if (d_op8_6 == 3'b111 && d_reg9 > 3'b001)
+										go_illegal;
+						end
+						4'h4:
+						begin
+							if (ir[11:0] == 12'hAFC)
+								go_illegal;
+							else
+								if (d_op8_6 == 3'b111)
+								begin
+									if (d_mode == 3'b000)
+									begin
+										if (d_reg9 == 3'b100)
+										begin end
+										else
+											go_illegal;
+									end
+									else
+										if (d_mode == 3'b001 || (d_mode == 3'b011) || (d_mode == 3'b100) || ea_is_imm)
+											go_illegal;
+										else
+											ea_start(d_mode, d_rn, `AP040_SZ_L, S_LEA1);
 								end
-								else if (d_op8_6[2]) go_illegal;
-								else begin
-									// NEGX
-									alu_op <= `AP040_ALU_NEGX;
-									op_size <= std_size;
-									p_dsize <= std_size;
-									p_rmw <= 1;
-									if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-									else if (dst_not_alt) go_illegal;
-									else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-								end
-							end
-
-							3'b001: begin
-								if (d_op8_6 == 3'b011) begin
-									// MOVE from CCR
-									p_src <= SK_IMPL; src_val <= {27'd0, sr[4:0]};
-									alu_op <= `AP040_ALU_MOVE;
-									op_size <= `AP040_SZ_W;
-									p_dsize <= `AP040_SZ_W;
-									p_flags <= 0;
-										if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-										else if (dst_not_alt) go_illegal;
-										else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-								end
-								else if (d_op8_6[2]) go_illegal;
-								else begin
-									// CLR (pure write on 68040)
-									alu_op <= `AP040_ALU_CLR;
-									op_size <= std_size;
-									p_dsize <= std_size;
-									if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-									else if (dst_not_alt) go_illegal;
-									else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-								end
-							end
-
-							3'b010: begin
-								if (d_op8_6 == 3'b011) begin
-									// MOVE to CCR
-									alu_op <= `AP040_ALU_MOVE;
-									op_size <= `AP040_SZ_W;
-									p_ssize <= `AP040_SZ_W;
-									p_flags <= 0;
-									p_dst <= DK_CCR;
-									if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; pipe_go; end
-									else if (src_not_data) go_illegal;
-									else if (ea_is_imm) begin p_src <= SK_IMM; immf(2'd1, S_PIPE_START); end
-									else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-								end
-								else if (d_op8_6[2]) go_illegal;
-								else begin
-									// NEG
-									alu_op <= `AP040_ALU_NEG;
-									op_size <= std_size;
-									p_dsize <= std_size;
-									p_rmw <= 1;
-									if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-									else if (dst_not_alt) go_illegal;
-									else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-								end
-							end
-
-							3'b011: begin
-								if (d_op8_6 == 3'b011) begin
-									// MOVE to SR (privileged)
-									// An is not a legal source; encoding rejection wins
-									// over the privilege check just as for MOVE from SR.
-									if (src_not_data) go_illegal;
-									else if (!sr_s) go_priv;
-									else begin
-										alu_op <= `AP040_ALU_MOVE;
+								else
+									if (d_op8_6 == 3'b110)
+									begin
+										exec_kind <= EK_CHK;
 										op_size <= `AP040_SZ_W;
 										p_ssize <= `AP040_SZ_W;
-										p_flags <= 0;
-										p_dst <= DK_SR;
-										if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; pipe_go; end
-										else if (ea_is_imm) begin p_src <= SK_IMM; immf(2'd1, S_PIPE_START); end
-										else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
+										if (d_mode == 3'b001)
+											go_illegal;
 									end
-								end
-								else if (d_op8_6[2]) go_illegal;
-								else begin
-									// NOT
-									alu_op <= `AP040_ALU_NOT;
-									op_size <= std_size;
-									p_dsize <= std_size;
-									p_rmw <= 1;
-									if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-									else if (dst_not_alt) go_illegal;
-									else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-								end
-							end
-
-							3'b100: begin
-								if (d_op8_6[2]) go_illegal;
-								else case (d_op8_6[1:0])
-								2'b00: begin
-									if (d_mode == 3'b001) begin
-										// LINK.L An,#bd32
-										br_long <= 1;
-										immf(2'd2, S_LINK1);
-									end
-									else begin
-										// NBCD
-										alu_op <= `AP040_ALU_NBCD;
-										op_size <= `AP040_SZ_B;
-										p_dsize <= `AP040_SZ_B;
-										p_rmw <= 1;
-										if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-										else if (dst_not_alt) go_illegal;
-										else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-									end
-								end
-								2'b01: begin
-									if (d_mode == 3'b000) begin
-										// SWAP
-										alu_op <= `AP040_ALU_SWAP;
-										op_size <= `AP040_SZ_L;
-										p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-										pipe_go;
-									end
-									else if (d_mode == 3'b001) go_illegal; // BKPT
-									else if (d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm) go_illegal;
-									else ea_start(d_mode, d_rn, `AP040_SZ_L, S_PEA1); // PEA
-								end
-								default: begin
-									if (d_mode == 3'b000) begin
-										// EXT.W / EXT.L
-										alu_op <= `AP040_ALU_EXT;
-										op_size <= d_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W;
-										p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-										pipe_go;
-									end
-									else begin
-										// MOVEM registers to memory
-										mm_dir <= 0;
-										mm_size <= d_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W;
-										mm_predec <= (d_mode == 3'b100);
-										mm_postinc <= 0;
-										if (d_mode == 3'b011 || d_mode < 3'b010 || ea_is_imm ||
-										    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-										else immf(2'd1, S_MOVEM_SET);
-									end
-								end
-								endcase
-							end
-
-							3'b101: begin
-								if (d_op8_6[2]) go_illegal;
-								else if (d_op8_6 == 3'b011) begin
-									// TAS (not bus locked yet).  The 040
-									// reports its operand cycles as a locked
-									// RMW: an access error carries SSW LK
-									// with RW clear.
-									alu_op <= `AP040_ALU_TAS;
-									op_size <= `AP040_SZ_B;
-									p_dsize <= `AP040_SZ_B;
-									p_rmw <= 1;
-									if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-									else if (dst_not_alt) go_illegal;
-									else begin
-										lk_cyc <= 1;
-										p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go;
-									end
-								end
-								else begin
-									// TST (An/imm/PC modes allowed on 020+)
-									alu_op <= `AP040_ALU_TST;
-									op_size <= std_size;
-									p_ssize <= std_size;
-									p_wbsup <= 1;
-									if (d_mode == 3'b000 || d_mode == 3'b001) begin
-										if (d_mode == 3'b001 && std_size == `AP040_SZ_B) go_illegal;
-										else begin
-											p_src <= SK_REG; p_sreg <= {d_mode[0], d_rn};
-											pipe_go;
+									else
+										if (d_op8_6 == 3'b100 && !(ir[11:9] == 3'b100 && d_mode == 3'b001))
+										begin
+											exec_kind <= EK_CHK;
+											op_size <= `AP040_SZ_L;
+											p_ssize <= `AP040_SZ_L;
+											if (d_mode == 3'b001)
+												go_illegal;
 										end
+										else
+											case (ir[11:9])
+												3'b000:
+												begin
+													if (d_op8_6 == 3'b011)
+													begin
+														if (dst_not_alt)
+															go_illegal;
+														else
+															if (!sr_s)
+																go_priv;
+															else
+															begin
+																p_src <= SK_IMPL;
+																src_val <= {16'd0, sr};
+																alu_op <= `AP040_ALU_MOVE;
+																op_size <= `AP040_SZ_W;
+																p_dsize <= `AP040_SZ_W;
+																p_flags <= 0;
+																if (d_mode == 3'b000)
+																begin
+																	p_dst <= DK_REG;
+																	p_dreg <= {1'b0, d_rn};
+																	pipe_go_regdst({1'b0, d_rn});
+																end
+																else
+																begin
+																	p_dst <= DK_MEM;
+																	dst_mode_r <= d_mode;
+																	dst_rn_r <= d_rn;
+																	pipe_go;
+																end
+															end
+													end
+													else
+														if (d_op8_6[2])
+															go_illegal;
+														else
+														begin
+															alu_op <= `AP040_ALU_NEGX;
+															op_size <= std_size;
+															p_dsize <= std_size;
+															p_rmw <= 1;
+															if (d_mode == 3'b000)
+															begin end
+															else
+																if (dst_not_alt)
+																	go_illegal;
+														end
+												end
+												3'b001:
+												begin
+													if (d_op8_6 == 3'b011)
+													begin
+														p_src <= SK_IMPL;
+														src_val <= {27'd0, sr[4:0]};
+														alu_op <= `AP040_ALU_MOVE;
+														op_size <= `AP040_SZ_W;
+														p_dsize <= `AP040_SZ_W;
+														p_flags <= 0;
+														if (d_mode == 3'b000)
+														begin
+															p_dst <= DK_REG;
+															p_dreg <= {1'b0, d_rn};
+															pipe_go_regdst({1'b0, d_rn});
+														end
+														else
+															if (dst_not_alt)
+																go_illegal;
+															else
+															begin
+																p_dst <= DK_MEM;
+																dst_mode_r <= d_mode;
+																dst_rn_r <= d_rn;
+																pipe_go;
+															end
+													end
+													else
+														if (d_op8_6[2])
+															go_illegal;
+														else
+														begin
+															alu_op <= `AP040_ALU_CLR;
+															op_size <= std_size;
+															p_dsize <= std_size;
+															if (d_mode == 3'b000)
+															begin end
+															else
+																if (dst_not_alt)
+																	go_illegal;
+														end
+												end
+												3'b010:
+												begin
+													if (d_op8_6 == 3'b011)
+													begin
+														alu_op <= `AP040_ALU_MOVE;
+														op_size <= `AP040_SZ_W;
+														p_ssize <= `AP040_SZ_W;
+														p_flags <= 0;
+														p_dst <= DK_CCR;
+														if (d_mode == 3'b000)
+														begin end
+														else
+															if (src_not_data)
+																go_illegal;
+													end
+													else
+														if (d_op8_6[2])
+															go_illegal;
+														else
+														begin
+															alu_op <= `AP040_ALU_NEG;
+															op_size <= std_size;
+															p_dsize <= std_size;
+															p_rmw <= 1;
+															if (d_mode == 3'b000)
+															begin end
+															else
+																if (dst_not_alt)
+																	go_illegal;
+														end
+												end
+												3'b011:
+												begin
+													if (d_op8_6 == 3'b011)
+													begin
+														if (src_not_data)
+															go_illegal;
+														else
+															if (!sr_s)
+																go_priv;
+													end
+													else
+														if (d_op8_6[2])
+															go_illegal;
+														else
+														begin
+															alu_op <= `AP040_ALU_NOT;
+															op_size <= std_size;
+															p_dsize <= std_size;
+															p_rmw <= 1;
+															if (d_mode == 3'b000)
+															begin end
+															else
+																if (dst_not_alt)
+																	go_illegal;
+														end
+												end
+												3'b100:
+												begin
+													if (d_op8_6[2])
+														go_illegal;
+													else
+														case (d_op8_6[1:0])
+															2'b00:
+															begin
+																if (d_mode == 3'b001)
+																begin
+																	br_long <= 1;
+																	rr_a <= {1'b1, d_rn};
+																	immf(2'd2, S_LINK2);
+																end
+																else
+																begin
+																	alu_op <= `AP040_ALU_NBCD;
+																	op_size <= `AP040_SZ_B;
+																	p_dsize <= `AP040_SZ_B;
+																	p_rmw <= 1;
+																	if (d_mode == 3'b000)
+																	begin end
+																	else
+																		if (dst_not_alt)
+																			go_illegal;
+																end
+															end
+															2'b01:
+															begin
+																if (d_mode == 3'b000)
+																begin end
+																else
+																	if (d_mode == 3'b001)
+																		go_illegal;
+																	else
+																		if (d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm)
+																			go_illegal;
+																		else
+																			ea_start(d_mode, d_rn, `AP040_SZ_L, S_PEA1);
+															end
+															default:
+															begin
+																if (d_mode == 3'b000)
+																begin end
+																else
+																begin
+																	mm_dir <= 0;
+																	mm_size <= d_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W;
+																	mm_predec <= (d_mode == 3'b100);
+																	mm_postinc <= 0;
+																	if (d_mode == 3'b011 || d_mode < 3'b010 || ea_is_imm || (d_mode == 3'b111 && d_rn > 3'b001))
+																		go_illegal;
+																	else
+																		immf(2'd1, S_MOVEM_SET);
+																end
+															end
+														endcase
+												end
+												3'b101:
+												begin
+													if (d_op8_6[2])
+														go_illegal;
+													else
+														if (d_op8_6 == 3'b011)
+														begin
+															alu_op <= `AP040_ALU_TAS;
+															op_size <= `AP040_SZ_B;
+															p_dsize <= `AP040_SZ_B;
+															p_rmw <= 1;
+															if (d_mode == 3'b000)
+															begin end
+															else
+																if (dst_not_alt)
+																	go_illegal;
+														end
+														else
+														begin
+															alu_op <= `AP040_ALU_TST;
+															op_size <= std_size;
+															p_ssize <= std_size;
+															p_wbsup <= 1;
+															if (d_mode == 3'b000 || d_mode == 3'b001)
+															begin
+																if (d_mode == 3'b001 && std_size == `AP040_SZ_B)
+																	go_illegal;
+															end
+														end
+												end
+												3'b110:
+												begin
+													if (d_op8_6[2])
+														go_illegal;
+													else
+														if (!d_op8_6[1])
+														begin
+															exec_kind <= EK_MD_L;
+															md_isdiv <= d_op8_6[0];
+															op_size <= `AP040_SZ_L;
+															p_ssize <= `AP040_SZ_L;
+															if (d_mode == 3'b001)
+																go_illegal;
+															else
+															begin
+																if (d_mode == 3'b000)
+																begin
+																	p_src <= SK_REG;
+																	p_sreg <= {1'b0, d_rn};
+																end
+																else
+																	if (ea_is_imm)
+																		p_src <= SK_IMM;
+																	else
+																	begin
+																		p_src <= SK_MEM;
+																		src_mode_r <= d_mode;
+																		src_rn_r <= d_rn;
+																	end
+																immf(2'd1, S_MDL_EXT);
+															end
+														end
+														else
+														begin
+															mm_dir <= 1;
+															mm_size <= d_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W;
+															mm_predec <= 0;
+															mm_postinc <= (d_mode == 3'b011);
+															if (d_mode == 3'b100 || d_mode < 3'b010 || ea_is_imm)
+																go_illegal;
+															else
+																immf(2'd1, S_MOVEM_SET);
+														end
+												end
+												default:
+												begin
+													if (d_op8_6 == 3'b010)
+													begin
+														if (d_mode < 3'b010 || d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm)
+															go_illegal;
+														else
+															ea_start(d_mode, d_rn, `AP040_SZ_L, S_JSR1);
+													end
+													else
+														if (d_op8_6 == 3'b011)
+														begin
+															if (d_mode < 3'b010 || d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm)
+																go_illegal;
+															else
+																ea_start(d_mode, d_rn, `AP040_SZ_L, S_JMP1);
+														end
+														else
+															if (d_op8_6 == 3'b001)
+															begin
+																casez (ir[5:0])
+																	6'b00????: exc(`AP040_VEC_TRAP + {4'd0, ir[3:0]}, 4'd0, pc, 32'd0);
+																	6'b010???:
+																	begin
+																		br_long <= 0;
+																		rr_a <= {1'b1, d_rn};
+																		immf(2'd1, S_LINK2);
+																	end
+																	6'b011???:
+																	begin
+																		rr_a <= {1'b1, d_rn};
+																		state <= S_UNLK1;
+																	end
+																	6'b100???:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																		begin
+																			rr_a <= {1'b1, d_rn};
+																			state <= S_USP1;
+																		end
+																	end
+																	6'b101???:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																		begin
+																			rfw({1'b1, d_rn}, usp_wb);
+																			fetch_next;
+																		end
+																	end
+																	6'b110000:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																		begin
+																			rst_cnt <= 8'd127;
+																			state <= S_RESET_HOLD;
+																		end
+																	end
+																	6'b110001: fetch_next;
+																	6'b110010:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																			immf(2'd1, S_STOP_LD);
+																	end
+																	6'b110011:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																		begin
+																			in_exc <= 1;
+																			state <= S_RTE_SR;
+																		end
+																	end
+																	6'b110100:
+																	begin
+																		ret_kind <= RK_RTD;
+																		immf(2'd1, S_RET1);
+																	end
+																	6'b110101:
+																	begin
+																		ret_kind <= RK_RTS;
+																		mrd(dbg_a7_wb, `AP040_SZ_L, S_RET2);
+																	end
+																	6'b110110:
+																	begin
+																		if (sr[1])
+																			exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
+																		else
+																			fetch_next;
+																	end
+																	6'b110111:
+																	begin
+																		ret_kind <= RK_RTR;
+																		state <= S_RET1;
+																	end
+																	6'b111010, 6'b111011:
+																	begin
+																		if (!sr_s)
+																			go_priv;
+																		else
+																		begin
+																			mvc_dir <= ir[0];
+																			immf(2'd1, S_MOVEC1);
+																		end
+																	end
+																	default: go_illegal;
+																endcase
+															end
+															else
+																go_illegal;
+												end
+											endcase
+						end
+						4'h5:
+						begin
+							if (rd_valid)
+							begin end
+							else
+								if (ir[7:6] == 2'b11)
+								begin
+									if (d_mode == 3'b001)
+									begin
+										br_base <= pc;
+										rr_a <= {1'b0, d_rn};
+										immf(2'd1, S_DBCC1);
 									end
-									else if (ea_is_imm) begin
-										p_src <= SK_IMM;
-										immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START);
-									end
-									else begin
-										p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn;
-										pipe_go;
-									end
+									else
+										if (d_mode == 3'b111 && d_rn >= 3'b010 && d_rn <= 3'b100)
+										begin
+											if (d_rn == 3'b010)
+												immf(2'd1, cond_true(ir[11:8]) ? S_TRAPCC : S_NEXT);
+											else
+												if (d_rn == 3'b011)
+													immf(2'd2, cond_true(ir[11:8]) ? S_TRAPCC : S_NEXT);
+												else
+												begin
+													if (cond_true(ir[11:8]))
+														exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
+													else
+														fetch_next;
+												end
+										end
+										else
+										begin
+											exec_kind <= EK_SCC;
+											op_size <= `AP040_SZ_B;
+											p_dsize <= `AP040_SZ_B;
+											p_flags <= 0;
+											if (d_mode == 3'b000)
+											begin end
+											else
+												if (dst_not_alt)
+													go_illegal;
+										end
 								end
-							end
-
-							3'b110: begin
-								if (d_op8_6[2]) go_illegal;
-								else if (!d_op8_6[1]) begin
-									// MULx.L / DIVx.L with extension word
-									exec_kind <= EK_MD_L;
-									md_isdiv <= d_op8_6[0];
-									op_size <= `AP040_SZ_L;
-									p_ssize <= `AP040_SZ_L;
-									if (d_mode == 3'b001) go_illegal;
-									else begin
-										if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; end
-										else if (ea_is_imm) p_src <= SK_IMM;
-										else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; end
-										// extension word first, then any immediate
-										immf(2'd1, S_MDL_EXT);
-									end
+								else
+								begin
+									alu_op <= ir[8] ? `AP040_ALU_SUB : `AP040_ALU_ADD;
+									p_src <= SK_IMPL;
+									src_val <= {28'd0, (d_reg9 == 3'd0) ? 4'd8 : {1'b0, d_reg9}};
+									if (dst_not_alt)
+										go_illegal;
 								end
-								else begin
-									// MOVEM memory to registers
-									mm_dir <= 1;
-									mm_size <= d_op8_6[0] ? `AP040_SZ_L : `AP040_SZ_W;
-									mm_predec <= 0;
-									mm_postinc <= (d_mode == 3'b011);
-									if (d_mode == 3'b100 || d_mode < 3'b010 || ea_is_imm) go_illegal;
-									else immf(2'd1, S_MOVEM_SET);
-								end
-							end
-
-							default: begin // 3'b111
-								if (d_op8_6 == 3'b010) begin
-									// JSR
-									if (d_mode < 3'b010 || d_mode == 3'b011 ||
-									    d_mode == 3'b100 || ea_is_imm) go_illegal;
-									else ea_start(d_mode, d_rn, `AP040_SZ_L, S_JSR1);
-								end
-								else if (d_op8_6 == 3'b011) begin
-									// JMP
-									if (d_mode < 3'b010 || d_mode == 3'b011 ||
-									    d_mode == 3'b100 || ea_is_imm) go_illegal;
-									else ea_start(d_mode, d_rn, `AP040_SZ_L, S_JMP1);
-								end
-								else if (d_op8_6 == 3'b001) begin
-									casez (ir[5:0])
-										6'b00????: exc(`AP040_VEC_TRAP + {4'd0, ir[3:0]}, 4'd0, pc, 32'd0);
-										6'b010???: begin br_long <= 0; immf(2'd1, S_LINK1); end // LINK.W
-										6'b011???: begin rr_a <= {1'b1, d_rn}; state <= S_UNLK1; end
-										6'b100???: begin // MOVE An,USP
-											if (!sr_s) go_priv;
-											else begin rr_a <= {1'b1, d_rn}; state <= S_USP1; end
-										end
-										6'b101???: begin // MOVE USP,An
-											if (!sr_s) go_priv;
-											else begin rfw({1'b1, d_rn}, usp_wb); fetch_next; end
-										end
-										6'b110000: begin // RESET
-											if (!sr_s) go_priv;
-											else begin rst_cnt <= 8'd127; state <= S_RESET_HOLD; end
-										end
-										6'b110001: fetch_next;   // NOP
-										6'b110010: begin // STOP
-											if (!sr_s) go_priv;
-											else immf(2'd1, S_STOP_LD);
-										end
-										6'b110011: begin // RTE
-											if (!sr_s) go_priv;
-											else begin
-												// A bus/access fault while RTE is loading internal state
-												// from the old frame is a double bus fault (MC68040 UM
-												// 8.2), not a new format-$7 exception.
-												in_exc <= 1;
-												state <= S_RTE_SR;
-											end
-										end
-										6'b110100: begin ret_kind <= RK_RTD; immf(2'd1, S_RET1); end
-										6'b110101: begin ret_kind <= RK_RTS; state <= S_RET1; end
-										6'b110110: begin // TRAPV
-											if (sr[1]) exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
-											else fetch_next;
-										end
-										6'b110111: begin
-											ret_kind <= RK_RTR;
-											state <= S_RET1;
-										end
-										6'b111010, 6'b111011: begin // MOVEC
-											if (!sr_s) go_priv;
-											else begin
-												mvc_dir <= ir[0];
-												immf(2'd1, S_MOVEC1);
-											end
-										end
-										default: go_illegal;
-									endcase
-								end
-								else go_illegal;
-							end
-						endcase
-					end
-
-					//------------------------------ 0x5: ADDQ/SUBQ/Scc/DBcc
-					4'h5: begin
-						if (rd_valid) begin end
-						else if (ir[7:6] == 2'b11) begin
-							if (d_mode == 3'b001) begin
-								// DBcc
+						end
+						4'h6:
+						begin
+							if (ir[7:0] == 8'h00 || ir[7:0] == 8'hFF)
+							begin
 								br_base <= pc;
-								rr_a <= {1'b0, d_rn};
-								immf(2'd1, S_DBCC1);
+								br_long <= (ir[7:0] == 8'hFF);
+								immf((ir[7:0] == 8'hFF) ? 2'd2 : 2'd1, S_BCC_EXT);
 							end
-							else if (d_mode == 3'b111 && d_rn >= 3'b010 && d_rn <= 3'b100) begin
-								// TRAPcc (optional operand words are consumed
-								// but otherwise ignored)
-								if (d_rn == 3'b010)
-									immf(2'd1, cond_true(ir[11:8]) ? S_TRAPCC : S_NEXT);
-								else if (d_rn == 3'b011)
-									immf(2'd2, cond_true(ir[11:8]) ? S_TRAPCC : S_NEXT);
-								else begin
-									if (cond_true(ir[11:8]))
-										exc(`AP040_VEC_TRAPCC, 4'd2, pc, pc_i);
-									else fetch_next;
-								end
-							end
-							else begin
-								// Scc
-								exec_kind <= EK_SCC;
-								op_size <= `AP040_SZ_B;
-								p_dsize <= `AP040_SZ_B;
-								p_flags <= 0;
-								if (d_mode == 3'b000) begin p_dst <= DK_REG; p_dreg <= {1'b0, d_rn}; pipe_go_regdst({1'b0, d_rn}); end
-								else if (dst_not_alt) go_illegal;
-								else begin p_dst <= DK_MEM; dst_mode_r <= d_mode; dst_rn_r <= d_rn; pipe_go; end
-							end
-						end
-						else begin
-							// Register quick forms are handled by rd_valid above.
-							alu_op <= ir[8] ? `AP040_ALU_SUB : `AP040_ALU_ADD;
-							p_src <= SK_IMPL;
-							src_val <= {28'd0, (d_reg9 == 3'd0) ? 4'd8 : {1'b0, d_reg9}};
-							if (dst_not_alt) go_illegal; // includes byte An
-							else begin
-								op_size <= std_size;
-								p_dsize <= std_size;
-								p_dst <= DK_MEM; p_rmw <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								pipe_go;
-							end
-						end
-					end
-
-					//---------------------------------------- 0x6: Bcc/BSR/BRA
-					4'h6: begin
-						if (ir[7:0] == 8'h00 || ir[7:0] == 8'hFF) begin
-							br_base <= pc;
-							br_long <= (ir[7:0] == 8'hFF);
-							immf((ir[7:0] == 8'hFF) ? 2'd2 : 2'd1, S_BCC_EXT);
-						end
-						else if (ir[11:8] == 4'h1) begin : bsr_b
-							// BSR.B; an odd target faults with A7 untouched
-							reg [31:0] bt;
-							bt = pc + sxb(ir[7:0]);
-							if (bt[0]) go_pc(bt);
-							else begin
-								br_tgt <= bt;
-								mwr(dbg_a7_wb - 32'd4, `AP040_SZ_L, pc, S_BSR_PUSH);
-							end
-						end
-						else finish_bcc(pc + sxb(ir[7:0]), cond_true(ir[11:8]));
-					end
-
-					//------------------------------------------- 0x7: MOVEQ
-					4'h7: begin
-						if (ir[8]) go_illegal;
-						else begin
-							rfw({1'b0, d_reg9}, sxb(ir[7:0]));
-							sr[3] <= ir[7];
-							sr[2] <= (ir[7:0] == 8'd0);
-							sr[1] <= 0; sr[0] <= 0;
-							fetch_next;
-						end
-					end
-
-					//------------------------------------- 0x8: OR/DIV/SBCD
-					4'h8: begin
-						if (rd_valid) begin end
-						else if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111) begin
-							// DIVU.W / DIVS.W
-							exec_kind <= EK_MD_W;
-							md_isdiv <= 1;
-							md_sign <= d_op8_6[2];
-							op_size <= `AP040_SZ_W;
-							p_ssize <= `AP040_SZ_W;
-							p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-							if (d_mode == 3'b001) go_illegal;
-							else if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; pipe_go_regpair({1'b0, d_rn}, {1'b0, d_reg9}); end
-							else if (ea_is_imm) begin p_src <= SK_IMM; immf(2'd1, S_PIPE_START); end
-							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-						end
-						else if (ir[8] && d_mode[2:1] == 2'b00) begin
-							case (d_op8_6[1:0])
-								2'b00: begin
-									// SBCD
-									alu_op <= `AP040_ALU_SBCD;
-									op_size <= `AP040_SZ_B;
-									p_ssize <= `AP040_SZ_B; p_dsize <= `AP040_SZ_B;
-									if (!d_mode[0]) begin
-										p_src <= SK_REG; p_sreg <= {1'b0, d_rn};
-										p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-									end
-									else begin
-										p_src <= SK_MEM; src_mode_r <= 3'b100; src_rn_r <= d_rn;
-										p_dst <= DK_MEM; dst_mode_r <= 3'b100; dst_rn_r <= d_reg9;
-										p_rmw <= 1;
-									end
-									pipe_go;
-								end
-								2'b01: begin
-									// PACK
-									exec_kind <= EK_PACK;
-									p_flags <= 0;
-									p_ssize <= `AP040_SZ_W; p_dsize <= `AP040_SZ_B;
-									if (!d_mode[0]) begin
-										p_src <= SK_REG; p_sreg <= {1'b0, d_rn};
-										p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-									end
-									else begin
-										p_src <= SK_MEM; src_mode_r <= 3'b100; src_rn_r <= d_rn;
-										p_dst <= DK_MEM; dst_mode_r <= 3'b100; dst_rn_r <= d_reg9;
-									end
-									immf(2'd1, S_PIPE_START);
-								end
-								2'b10: begin
-									// UNPK
-									exec_kind <= EK_UNPK;
-									p_flags <= 0;
-									p_ssize <= `AP040_SZ_B; p_dsize <= `AP040_SZ_W;
-									if (!d_mode[0]) begin
-										p_src <= SK_REG; p_sreg <= {1'b0, d_rn};
-										p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-									end
-									else begin
-										p_src <= SK_MEM; src_mode_r <= 3'b100; src_rn_r <= d_rn;
-										p_dst <= DK_MEM; dst_mode_r <= 3'b100; dst_rn_r <= d_reg9;
-									end
-									immf(2'd1, S_PIPE_START);
-								end
-								default: go_illegal;
-							endcase
-						end
-						else begin
-							// OR
-							alu_op <= `AP040_ALU_OR;
-							op_size <= std_size;
-							p_ssize <= std_size; p_dsize <= std_size;
-							if (!ir[8]) begin
-								// <ea> OR Dn -> Dn
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (d_mode == 3'b001) go_illegal;
-								else if (ea_is_imm) begin p_src <= SK_IMM; immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START); end
-								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-							end
-							else begin
-								// Dn OR <ea> -> <ea>
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-								p_dst <= DK_MEM; p_rmw <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								// The register-to-EA OR form is memory-only.
-								// Mode 000/001 combinations are reserved for the
-								// SBCD/PACK/UNPK subfamily above.
-								if (d_mode < 3'b010 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-								else pipe_go;
-							end
-						end
-					end
-
-					//------------------------------------ 0x9/0xD: SUB/ADD
-					4'h9, 4'hD: begin : dec_addsub
-						reg is_add;
-						is_add = (ir_hi == 4'hD);
-						if (rd_valid) begin end
-						else if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111) begin
-							// ADDA/SUBA
-							alu_op <= is_add ? `AP040_ALU_ADD : `AP040_ALU_SUB;
-							op_size <= `AP040_SZ_L;
-							p_ssize <= d_op8_6[2] ? `AP040_SZ_L : `AP040_SZ_W;
-							p_sextw <= !d_op8_6[2];
-							p_flags <= 0;
-							p_dst <= DK_REG; p_dreg <= {1'b1, d_reg9};
-							if (ea_is_imm) begin
-								p_src <= SK_IMM;
-								immf(d_op8_6[2] ? 2'd2 : 2'd1, S_PIPE_START);
-							end
-							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-						end
-						else if (ir[8] && d_mode[2:1] == 2'b00 && std_size != 2'b11) begin
-							// Predecrement ADDX/SUBX; register form is shared.
-							alu_op <= is_add ? `AP040_ALU_ADDX : `AP040_ALU_SUBX;
-							op_size <= std_size;
-							p_ssize <= std_size; p_dsize <= std_size;
-							p_src <= SK_MEM; src_mode_r <= 3'b100; src_rn_r <= d_rn;
-							p_dst <= DK_MEM; dst_mode_r <= 3'b100; dst_rn_r <= d_reg9;
-							p_rmw <= 1;
-							pipe_go;
-						end
-						else begin
-							alu_op <= is_add ? `AP040_ALU_ADD : `AP040_ALU_SUB;
-							op_size <= std_size;
-							p_ssize <= std_size; p_dsize <= std_size;
-							if (!ir[8]) begin
-								// <ea> op Dn -> Dn
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (d_mode == 3'b001 && std_size == `AP040_SZ_B) go_illegal;
-								else if (ea_is_imm) begin p_src <= SK_IMM; immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START); end
-								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-							end
-							else begin
-								// Dn op <ea> -> <ea>
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-								p_dst <= DK_MEM; p_rmw <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								// The register-to-EA ADD/SUB form is memory-only;
-								// register-direct encodings belong to ADDX/SUBX.
-								if (d_mode < 3'b010 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-								else pipe_go;
-							end
-						end
-					end
-
-					//---------------------------------------------- 0xA: A-line
-					4'hA: exc(`AP040_VEC_ALINE, 4'd0, pc_i, 32'd0);
-
-					//---------------------------------- 0xB: CMP/CMPA/EOR/CMPM
-					4'hB: begin
-						if (rd_valid) begin end
-						else if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111) begin
-							// CMPA
-							alu_op <= `AP040_ALU_CMP;
-							op_size <= `AP040_SZ_L;
-							p_ssize <= d_op8_6[2] ? `AP040_SZ_L : `AP040_SZ_W;
-							p_sextw <= !d_op8_6[2];
-							p_wbsup <= 1;
-							p_dst <= DK_REG; p_dreg <= {1'b1, d_reg9};
-							if (ea_is_imm) begin
-								p_src <= SK_IMM;
-								immf(d_op8_6[2] ? 2'd2 : 2'd1, S_PIPE_START);
-							end
-							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-						end
-						else if (!ir[8]) begin
-							// CMP <ea>,Dn
-							alu_op <= `AP040_ALU_CMP;
-							op_size <= std_size;
-							p_ssize <= std_size;
-							p_wbsup <= 1;
-							p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-							if (d_mode == 3'b001 && std_size == `AP040_SZ_B) go_illegal;
-							else if (ea_is_imm) begin p_src <= SK_IMM; immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START); end
-							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-						end
-						else if (d_mode == 3'b001) begin
-							// CMPM (Ay)+,(Ax)+
-							alu_op <= `AP040_ALU_CMP;
-							op_size <= std_size;
-							p_ssize <= std_size; p_dsize <= std_size;
-							p_wbsup <= 1;
-							p_src <= SK_MEM; src_mode_r <= 3'b011; src_rn_r <= d_rn;
-							p_dst <= DK_MEM; dst_mode_r <= 3'b011; dst_rn_r <= d_reg9;
-							p_rmw <= 1;
-							pipe_go;
-						end
-						else begin
-							// EOR Dn,<ea>
-							alu_op <= `AP040_ALU_EOR;
-							op_size <= std_size;
-							p_dsize <= std_size;
-							p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-							if (dst_not_alt) go_illegal;
-							else begin
-								p_dst <= DK_MEM; p_rmw <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								pipe_go;
-							end
-						end
-					end
-
-					//------------------------------------ 0xC: AND/MUL/EXG
-					4'hC: begin
-						if (rd_valid) begin end
-						else if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111) begin
-							// MULU.W / MULS.W
-							exec_kind <= EK_MD_W;
-							md_isdiv <= 0;
-							md_sign <= d_op8_6[2];
-							op_size <= `AP040_SZ_W;
-							p_ssize <= `AP040_SZ_W;
-							p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-							if (d_mode == 3'b001) go_illegal;
-							else if (d_mode == 3'b000) begin p_src <= SK_REG; p_sreg <= {1'b0, d_rn}; pipe_go_regpair({1'b0, d_rn}, {1'b0, d_reg9}); end
-							else if (ea_is_imm) begin p_src <= SK_IMM; immf(2'd1, S_PIPE_START); end
-							else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-						end
-						else if (ir[8] && d_op8_6[1:0] == 2'b00 && d_mode[2:1] == 2'b00) begin
-							// ABCD
-							alu_op <= `AP040_ALU_ABCD;
-							op_size <= `AP040_SZ_B;
-							p_ssize <= `AP040_SZ_B; p_dsize <= `AP040_SZ_B;
-							if (!d_mode[0]) begin
-								p_src <= SK_REG; p_sreg <= {1'b0, d_rn};
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-							end
-							else begin
-								p_src <= SK_MEM; src_mode_r <= 3'b100; src_rn_r <= d_rn;
-								p_dst <= DK_MEM; dst_mode_r <= 3'b100; dst_rn_r <= d_reg9;
-								p_rmw <= 1;
-							end
-							pipe_go;
-						end
-						else if (ir[8] && (d_op8_6[1:0] == 2'b01) && d_mode[2:1] == 2'b00) begin
-							// EXG Dn,Dn (mode 000) / EXG An,An (mode 001)
-							rr_a <= {d_mode[0], d_reg9};
-							rr_b <= {d_mode[0], d_rn};
-							state <= S_EXG1;
-						end
-						else if (ir[8] && d_op8_6[1:0] == 2'b10 && d_mode == 3'b001) begin
-							// EXG Dn,An
-							rr_a <= {1'b0, d_reg9};
-							rr_b <= {1'b1, d_rn};
-							state <= S_EXG1;
-						end
-						else begin
-							// AND
-							alu_op <= `AP040_ALU_AND;
-							op_size <= std_size;
-							p_ssize <= std_size; p_dsize <= std_size;
-							if (!ir[8]) begin
-								p_dst <= DK_REG; p_dreg <= {1'b0, d_reg9};
-								if (d_mode == 3'b001) go_illegal;
-								else if (ea_is_imm) begin p_src <= SK_IMM; immf((std_size == `AP040_SZ_L) ? 2'd2 : 2'd1, S_PIPE_START); end
-								else begin p_src <= SK_MEM; src_mode_r <= d_mode; src_rn_r <= d_rn; pipe_go; end
-							end
-							else begin
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-								p_dst <= DK_MEM; p_rmw <= 1;
-								dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-								// The register-to-EA AND form is memory-only.
-								// Mode 000 combinations not claimed by ABCD/EXG
-								// are reserved, rather than AND Dn,Dn aliases.
-								if (d_mode < 3'b010 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-								else pipe_go;
-							end
-						end
-					end
-
-					//---------------------------------------- 0xE: shifts
-					4'hE: begin
-						if (ir[7:6] == 2'b11) begin
-							if (ir[11]) begin
-								// bitfield group; ext word first
-								// modify ops need an alterable EA
-								if (d_mode == 3'b001 || d_mode == 3'b011 ||
-								    d_mode == 3'b100 || ea_is_imm) go_illegal;
-								else if ((d_mode == 3'b111 && d_rn > 3'b001) &&
-								         (ir[10:8] == 3'd2 || ir[10:8] == 3'd4 ||
-								          ir[10:8] == 3'd6 || ir[10:8] == 3'd7)) go_illegal;
-								else immf(2'd1, S_BF0);
-							end
-							else begin
-								// memory shift by one, word
-								exec_kind <= EK_SHIFT;
-								sh_rox <= (ir[10:9] == 2'b10);
-								case (ir[10:9])
-									2'b00: alu_op <= ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1;
-									2'b01: alu_op <= ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1;
-									2'b10: alu_op <= ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
-									default: alu_op <= ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1;
-								endcase
-								op_size <= `AP040_SZ_W;
-								p_dsize <= `AP040_SZ_W;
-								p_src <= SK_NONE;   // count of one
-								p_rmw <= 1;
-								// Memory shifts require a memory-alterable EA: Dn/An
-								// direct and all program-space encodings are illegal.
-								if (d_mode < 3'b010 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_illegal;
-								else begin
-									p_dst <= DK_MEM;
-									dst_mode_r <= d_mode; dst_rn_r <= d_rn;
-									pipe_go;
-								end
-							end
-						end
-						else begin
-							// register shift
-							exec_kind <= EK_SHIFT;
-							sh_rox <= (ir[4:3] == 2'b10);
-							case (ir[4:3])
-								2'b00: alu_op <= ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1;
-								2'b01: alu_op <= ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1;
-								2'b10: alu_op <= ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
-								default: alu_op <= ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1;
-							endcase
-							op_size <= std_size;
-							p_dst <= DK_REG; p_dreg <= {1'b0, d_rn};
-							if (ir[5]) begin
-								p_src <= SK_REG; p_sreg <= {1'b0, d_reg9}; rr_b <= {1'b0, d_reg9};
-							end
-							else begin
-								p_src <= SK_IMPL;
-								src_val <= {26'd0, (d_reg9 == 3'd0) ? 6'd8 : {3'd0, d_reg9}};
-							end
-							pipe_go;
-						end
-					end
-
-					//------------------------------------------ 0xF: 040 group
-					default: begin
-						if (ir[11:8] == 4'h4) begin
-							// CINV/CPUSH: write-through caches hold no dirty
-							// data, so both invalidate the selected caches
-							// (scope is widened to ALL, which is safe)
-							// Scope bit patterns 000 and 100 are unassigned
-							// F-line encodings.  Classify them before privilege.
-							if (ir[4:3] == 2'b00) go_fp_fline;
-							else if (!sr_s) go_priv;
-							else begin
-								cinv_ic <= ir[7];
-								cinv_dc <= ir[6];
-								epf_flush;
-								cinv_req <= 1;
-								state <= S_CINV2;
-							end
-						end
-						else if (ir[11:8] == 4'h5) begin
-							if (ir[7:5] == 3'b000) begin
-								// PFLUSH group
-								if (!sr_s) go_priv;
-								else begin
-									epf_flush;
-									pf_mode <= ir[4:3];
-									if (ir[4]) begin
-										// PFLUSHAN / PFLUSHA
-										state <= S_PFLUSH2;
-									end
-									else begin
-										rr_a <= {1'b1, d_rn};
-										state <= S_PFLUSH1;
+							else
+								if (ir[11:8] == 4'h1)
+								begin : bsr_b
+									reg [31:0] bt;
+									bt = pc + sxb(ir[7:0]);
+									if (bt[0])
+										go_pc(bt);
+									else
+									begin
+										br_tgt <= bt;
+										mwr(dbg_a7_wb - 32'd4, `AP040_SZ_L, pc, S_BSR_PUSH);
 									end
 								end
+								else
+									finish_bcc(pc + sxb(ir[7:0]), cond_true(ir[11:8]));
+						end
+						4'h7:
+						begin
+							if (ir[8])
+								go_illegal;
+							else
+							begin
+								rfw({1'b0, d_reg9}, sxb(ir[7:0]));
+								sr[3] <= ir[7];
+								sr[2] <= (ir[7:0] == 8'd0);
+								sr[1] <= 0;
+								sr[0] <= 0;
+								fetch_next;
 							end
-							else if (ir[7:6] == 2'b01) begin
-								// PTEST
-								// Only F548..F54F and F568..F56F are PTEST;
-								// the rest of this quadrant is unassigned F-line.
-								if (ir[4:3] != 2'b01) go_fp_fline;
-								else if (!sr_s) go_priv;
-								else begin
-									rr_a <= {1'b1, d_rn};
-									state <= S_PTEST1;
+						end
+						4'h8:
+						begin
+							if (rd_valid)
+							begin end
+							else
+								if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111)
+								begin
+									exec_kind <= EK_MD_W;
+									md_isdiv <= 1;
+									md_sign <= d_op8_6[2];
+									op_size <= `AP040_SZ_W;
+									p_ssize <= `AP040_SZ_W;
+									p_dst <= DK_REG;
+									p_dreg <= {1'b0, d_reg9};
+									if (d_mode == 3'b001)
+										go_illegal;
+								end
+								else
+									if (ir[8] && d_mode[2:1] == 2'b00)
+									begin
+										case (d_op8_6[1:0])
+											default: go_illegal;
+										endcase
+									end
+									else
+									begin
+										alu_op <= `AP040_ALU_OR;
+										op_size <= std_size;
+										p_ssize <= std_size;
+										p_dsize <= std_size;
+										if (!ir[8])
+										begin
+											p_dst <= DK_REG;
+											p_dreg <= {1'b0, d_reg9};
+											if (d_mode == 3'b001)
+												go_illegal;
+										end
+										else
+										begin
+											p_src <= SK_REG;
+											p_sreg <= {1'b0, d_reg9};
+											rr_b <= {1'b0, d_reg9};
+											p_dst <= DK_MEM;
+											p_rmw <= 1;
+											dst_mode_r <= d_mode;
+											dst_rn_r <= d_rn;
+											if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+												go_illegal;
+										end
+									end
+						end
+						4'h9, 4'hD:
+						begin : dec_addsub
+							reg is_add;
+							is_add = (ir_hi == 4'hD);
+							if (rd_valid)
+							begin end
+							else
+								if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111)
+								begin end
+								else
+									if (ir[8] && d_mode[2:1] == 2'b00 && std_size != 2'b11)
+									begin end
+									else
+									begin
+										alu_op <= is_add ? `AP040_ALU_ADD : `AP040_ALU_SUB;
+										op_size <= std_size;
+										p_ssize <= std_size;
+										p_dsize <= std_size;
+										if (!ir[8])
+										begin
+											p_dst <= DK_REG;
+											p_dreg <= {1'b0, d_reg9};
+											if (d_mode == 3'b001 && std_size == `AP040_SZ_B)
+												go_illegal;
+										end
+										else
+										begin
+											p_src <= SK_REG;
+											p_sreg <= {1'b0, d_reg9};
+											rr_b <= {1'b0, d_reg9};
+											p_dst <= DK_MEM;
+											p_rmw <= 1;
+											dst_mode_r <= d_mode;
+											dst_rn_r <= d_rn;
+											if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+												go_illegal;
+										end
+									end
+						end
+						4'hA: exc(`AP040_VEC_ALINE, 4'd0, pc_i, 32'd0);
+						4'hB:
+						begin
+							if (rd_valid)
+							begin end
+							else
+								if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111)
+								begin end
+								else
+									if (!ir[8])
+									begin
+										alu_op <= `AP040_ALU_CMP;
+										op_size <= std_size;
+										p_ssize <= std_size;
+										p_wbsup <= 1;
+										p_dst <= DK_REG;
+										p_dreg <= {1'b0, d_reg9};
+										if (d_mode == 3'b001 && std_size == `AP040_SZ_B)
+											go_illegal;
+									end
+									else
+										if (d_mode == 3'b001)
+										begin end
+										else
+										begin
+											alu_op <= `AP040_ALU_EOR;
+											op_size <= std_size;
+											p_dsize <= std_size;
+											p_src <= SK_REG;
+											p_sreg <= {1'b0, d_reg9};
+											rr_b <= {1'b0, d_reg9};
+											if (dst_not_alt)
+												go_illegal;
+										end
+						end
+						4'hC:
+						begin
+							if (rd_valid)
+							begin end
+							else
+								if (d_op8_6 == 3'b011 || d_op8_6 == 3'b111)
+								begin
+									exec_kind <= EK_MD_W;
+									md_isdiv <= 0;
+									md_sign <= d_op8_6[2];
+									op_size <= `AP040_SZ_W;
+									p_ssize <= `AP040_SZ_W;
+									p_dst <= DK_REG;
+									p_dreg <= {1'b0, d_reg9};
+									if (d_mode == 3'b001)
+										go_illegal;
+								end
+								else
+									if (ir[8] && d_op8_6[1:0] == 2'b00 && d_mode[2:1] == 2'b00)
+									begin end
+									else
+										if (ir[8] && (d_op8_6[1:0] == 2'b01) && d_mode[2:1] == 2'b00)
+										begin
+											rr_a <= {d_mode[0], d_reg9};
+											rr_b <= {d_mode[0], d_rn};
+											state <= S_EXG1;
+										end
+										else
+											if (ir[8] && d_op8_6[1:0] == 2'b10 && d_mode == 3'b001)
+											begin
+												rr_a <= {1'b0, d_reg9};
+												rr_b <= {1'b1, d_rn};
+												state <= S_EXG1;
+											end
+											else
+											begin
+												alu_op <= `AP040_ALU_AND;
+												op_size <= std_size;
+												p_ssize <= std_size;
+												p_dsize <= std_size;
+												if (!ir[8])
+												begin
+													p_dst <= DK_REG;
+													p_dreg <= {1'b0, d_reg9};
+													if (d_mode == 3'b001)
+														go_illegal;
+												end
+												else
+												begin
+													p_src <= SK_REG;
+													p_sreg <= {1'b0, d_reg9};
+													rr_b <= {1'b0, d_reg9};
+													p_dst <= DK_MEM;
+													p_rmw <= 1;
+													dst_mode_r <= d_mode;
+													dst_rn_r <= d_rn;
+													if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+														go_illegal;
+												end
+											end
+						end
+						4'hE:
+						begin
+							if (ir[7:6] == 2'b11)
+							begin
+								if (ir[11])
+								begin
+									if (d_mode == 3'b001 || d_mode == 3'b011 || d_mode == 3'b100 || ea_is_imm)
+										go_illegal;
+									else
+										if ((d_mode == 3'b111 && d_rn > 3'b001) && (ir[10:8] == 3'd2 || ir[10:8] == 3'd4 || ir[10:8] == 3'd6 || ir[10:8] == 3'd7))
+											go_illegal;
+										else
+											immf(2'd1, S_BF0);
+								end
+								else
+								begin
+									exec_kind <= EK_SHIFT;
+									sh_rox <= (ir[10:9] == 2'b10);
+									case (ir[10:9])
+										2'b00: alu_op <= ir[8] ? `AP040_ALU_ASL1 : `AP040_ALU_ASR1;
+										2'b01: alu_op <= ir[8] ? `AP040_ALU_LSL1 : `AP040_ALU_LSR1;
+										2'b10: alu_op <= ir[8] ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
+										default: alu_op <= ir[8] ? `AP040_ALU_ROL1 : `AP040_ALU_ROR1;
+									endcase
+									op_size <= `AP040_SZ_W;
+									p_dsize <= `AP040_SZ_W;
+									p_src <= SK_NONE;
+									p_rmw <= 1;
+									if (d_mode < 3'b010 || (d_mode == 3'b111 && d_rn > 3'b001))
+										go_illegal;
 								end
 							end
-							else exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
 						end
-						else if (ir[11:8] == 4'h2) begin
-							// FPU coprocessor space (cpid 1)
-							if (AP040_HAS_FPU == 0)
-								exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
-							else case (ir[7:6])
-								2'b00: begin                         // general
-									// Mode-7 registers 5..7 are reserved for every
-									// coprocessor command.  Reject them before fetching
-									// an extension word; malformed primary opcodes take
-									// the F-line vector, independent of the next word.
-									if (d_mode == 3'b111 && d_rn > 3'b100)
-										exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
-									else immf(2'd1, S_FPU_DEC);
-								end
-								2'b01: begin                         // FScc/FDBcc/FTRAPcc
-									// As in the general command space, mode-7
-									// registers 5..7 are primary-word F-line errors.
-									if (d_mode == 3'b111 && d_rn > 3'b100)
-										exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
-									else immf(2'd1, S_FSCC0);
-								end
-								2'b10:   immf(2'd1, S_FBCC);      // FBcc.W
-								default: immf(2'd2, S_FBCC);      // FBcc.L
-							endcase
-						end
-						else if (ir[11:8] == 4'h3) begin
-							// FSAVE/FRESTORE state-frame model: NULL, IDLE and the
-							// revision-$41 unimplemented-instruction frame are
-							// implemented.  A true BUSY arithmetic-exception frame
-							// remains outside this non-pipelined FPU's state model.
-							if (ir[7:6] == 2'b00) begin
-								// FSAVE: control alterable or -(An)
-								// Malformed coprocessor EAs are F-line faults and
-								// are classified before privilege.
-								if (d_mode < 3'b010 || d_mode == 3'b011 ||
-								    (d_mode == 3'b111 && d_rn > 3'b001)) go_fp_fline;
-								else if (!sr_s) go_priv;
-								else ea_start(d_mode, d_rn, `AP040_SZ_L, S_FSAVE1);
+						default:
+						begin
+							if (ir[11:8] == 4'h4)
+							begin
+								if (ir[4:3] == 2'b00)
+									go_fp_fline;
+								else
+									if (!sr_s)
+										go_priv;
+									else
+									begin
+										cinv_ic <= ir[7];
+										cinv_dc <= ir[6];
+										epf_flush;
+										cinv_req <= 1;
+										state <= S_CINV2;
+									end
 							end
-							else if (ir[7:6] == 2'b01) begin
-								// FRESTORE: control, (An)+ or PC relative
-								if (d_mode < 3'b010 || d_mode == 3'b100 ||
-								    (d_mode == 3'b111 && d_rn >= 3'b100)) go_fp_fline;
-								else if (!sr_s) go_priv;
-								else ea_start(d_mode, d_rn, `AP040_SZ_L, S_FREST1);
-							end
-							else exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+							else
+								if (ir[11:8] == 4'h5)
+								begin
+									if (ir[7:5] == 3'b000)
+									begin
+										if (!sr_s)
+											go_priv;
+										else
+										begin
+											epf_flush;
+											pf_mode <= ir[4:3];
+											if (ir[4])
+											begin
+												state <= S_PFLUSH2;
+											end
+											else
+											begin
+												rr_a <= {1'b1, d_rn};
+												state <= S_PFLUSH1;
+											end
+										end
+									end
+									else
+										if (ir[7:6] == 2'b01)
+										begin
+											if (ir[4:3] != 2'b01)
+												go_fp_fline;
+											else
+												if (!sr_s)
+													go_priv;
+												else
+												begin
+													rr_a <= {1'b1, d_rn};
+													state <= S_PTEST1;
+												end
+										end
+										else
+											exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+								end
+								else
+									if (ir[11:8] == 4'h2)
+									begin
+										if (AP040_HAS_FPU == 0)
+											exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+										else
+											case (ir[7:6])
+												2'b00:
+												begin
+													if (d_mode == 3'b111 && d_rn > 3'b100)
+														exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+													else
+														immf(2'd1, S_FPU_DEC);
+												end
+												2'b01:
+												begin
+													if (d_mode == 3'b111 && d_rn > 3'b100)
+														exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+													else
+														immf(2'd1, S_FSCC0);
+												end
+												2'b10: immf(2'd1, S_FBCC);
+												default: immf(2'd2, S_FBCC);
+											endcase
+									end
+									else
+										if (ir[11:8] == 4'h3)
+										begin
+											if (ir[7:6] == 2'b00)
+											begin
+												if (d_mode < 3'b010 || d_mode == 3'b011 || (d_mode == 3'b111 && d_rn > 3'b001))
+													go_fp_fline;
+												else
+													if (!sr_s)
+														go_priv;
+													else
+														ea_start(d_mode, d_rn, `AP040_SZ_L, S_FSAVE1);
+											end
+											else
+												if (ir[7:6] == 2'b01)
+												begin
+													if (d_mode < 3'b010 || d_mode == 3'b100 || (d_mode == 3'b111 && d_rn >= 3'b100))
+														go_fp_fline;
+													else
+														if (!sr_s)
+															go_priv;
+														else
+															ea_start(d_mode, d_rn, `AP040_SZ_L, S_FREST1);
+												end
+												else
+													exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
+										end
+										else
+											if (ir[11:8] == 4'h6 && ir[7:5] == 3'b000)
+											begin
+												m16_form <= {1'b0, ir[4:3]};
+												immf(2'd2, S_M16_SRC);
+											end
+											else
+												if (ir[11:8] == 4'h6 && ir[7:3] == 5'b00100)
+												begin
+													m16_form <= 3'd4;
+													immf(2'd1, S_M16_SRC);
+												end
+												else
+													exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
 						end
-						else if (ir[11:8] == 4'h6 && ir[7:5] == 3'b000) begin
-							// MOVE16 with absolute long operand
-							m16_form <= {1'b0, ir[4:3]};
-							immf(2'd2, S_M16_SRC);
-						end
-						else if (ir[11:8] == 4'h6 && ir[7:3] == 5'b00100) begin
-							// MOVE16 (Ax)+,(Ay)+
-							m16_form <= 3'd4;
-							immf(2'd1, S_M16_SRC);
-						end
-						else exc(`AP040_VEC_FLINE, 4'd0, pc_i, 32'd0);
-					end
-				endcase
+					endcase
+				end
+				if (!n_inplace) apply_record_decode;
 			end
-
-			//------------------------------------------------------- stopped
 			S_STOP_LD: begin
 				epf_flush;
 				sr <= imm[15:0] & `AP040_SR_MASK;
@@ -6871,11 +8284,15 @@ always @(posedge clk) begin
 		// S_NEXT) is a producer too: it retires through the same
 		// fetch_next, writes no register at that point, and its
 		// self-modifying-code flush already blocks the pop.
-		if (rd_valid && ((state == S_DECODE) ||
-		    (rd_queue_pop && !aux_we &&
-		     (regs_alu_fire ||
-		      ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT))))))
+		// Steps C/C2/C3: every retire that pops the next opcode (rd_queue_pop
+		// is set only by fetch_next's pop branch) hands it over from the
+		// descriptor or the decode record when they cover it, from this one
+		// site: the same call inside fetch_next was inlined at 83 sites and
+		// cost 8,400 ALMs of duplicated record muxes.
+		if (rd_valid && ((state == S_DECODE) || (rd_queue_pop && n_desc_ok)))
 			dispatch_reg_decode;
+		else if (rd_queue_pop && n_apply_ok)
+			apply_record;
 		// The branch lookahead: fetch_next has just dispatched the Bcc at
 		// the head into S_DECODE; resolve it here instead.  Taken: the
 		// same redirect finish_bcc would take a cycle later (refill
@@ -6887,7 +8304,7 @@ always @(posedge clk) begin
 		// acknowledge would otherwise sit in this decision's path (the
 		// address hint's translation to the acknowledge, -1.26 ns).
 		else if (rd_is_bcc && rd_queue_pop && !aux_we && (state != S_DECODE) &&
-		         !rd_bcc_t[0] &&
+		         rd_bcc_fl_ok && !rd_bcc_t[0] &&
 		         !sr[15] && !sr[14] && !irq_pend &&
 		         (regs_alu_fire ||
 		          ((state == S_MWR) && d_ack && (r_m_ret == S_NEXT)))) begin

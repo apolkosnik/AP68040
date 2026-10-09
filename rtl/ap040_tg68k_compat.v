@@ -94,6 +94,9 @@ wire        mem_write;
 wire        mem_instr;
 wire  [1:0] mem_size;
 wire [31:0] mem_addr;
+wire [31:0] mem_hint_addr, mm_hint_addr;
+wire        mem_hint_instr, mm_hint_instr, mm_hint_match;
+wire [21:0] mm_hint_ptag;
 wire [31:0] mem_wdata;
 wire  [2:0] mem_fc;
 wire        mem_ack;
@@ -175,6 +178,8 @@ ap040_core #(
 	.mem_instr(mem_instr),
 	.mem_size(mem_size),
 	.mem_addr(mem_addr),
+	.mem_hint_addr(mem_hint_addr),
+	.mem_hint_instr(mem_hint_instr),
 	.mem_wdata(mem_wdata),
 	.mem_fc(mem_fc),
 	.mem_ack(mem_ack),
@@ -241,6 +246,8 @@ ap040_mmu mmu (
 	.c_instr(mem_instr),
 	.c_size(mem_size),
 	.c_addr(mem_addr),
+	.c_hint_addr(mem_hint_addr),
+	.c_hint_instr(mem_hint_instr),
 	.c_wdata(mem_wdata),
 	.c_fc(mem_fc),
 	.c_ack(mem_ack),
@@ -268,6 +275,10 @@ ap040_mmu mmu (
 	.m_instr(mm_instr),
 	.m_size(mm_size),
 	.m_addr(mm_addr),
+	.m_hint_addr(mm_hint_addr),
+	.m_hint_instr(mm_hint_instr),
+	.m_hint_ptag(mm_hint_ptag),
+	.m_hint_match(mm_hint_match),
 	.m_wdata(mm_wdata),
 	.m_fc(mm_fc),
 	.m_ack(mm_ack),
@@ -373,6 +384,10 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_instr(mm_instr),
 		.c_size(mm_size),
 		.c_addr(mm_addr),
+		.c_hint_addr(mm_hint_addr),
+		.c_hint_instr(mm_hint_instr),
+		.c_hint_ptag(mm_hint_ptag),
+		.c_hint_match(mm_hint_match),
 		.c_wdata(mm_wdata),
 		.c_fc(mm_fc),
 		.c_nocache(mm_nocache | ~cache_allow |
