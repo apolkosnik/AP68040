@@ -202,7 +202,6 @@ logic  [2:0] iack_lvl;
 logic        dm_iack;
 
 logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
-logic        sk_ld, sk_go;                  // the DC2-EX skid's moves
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
@@ -236,7 +235,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
 	.irq_pending(irq_pending),
-	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .sk_ld(sk_ld), .sk_go(sk_go), .adv_ex(adv_ex), .adv_wb(adv_wb),
+	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_ldata_al(dm_ldata_al), .dm_ldata_alv(dm_ldata_alv), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
 	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy),
@@ -257,7 +256,7 @@ ap68040_dmu dmu (
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
 	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
 	.dm_older(dm_older),
-	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .sk_ld(sk_ld), .sk_go(sk_go), .adv_ex(adv_ex), .adv_wb(adv_wb),
+	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
 	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .ldata_al(dm_ldata_al), .ldata_alv(dm_ldata_alv), .fault(dm_fault), .fvec(dm_fvec),
 	.faddr(dm_faddr), .fssw(dm_fssw),
@@ -306,7 +305,7 @@ logic [BTB_AW-1:0] btb_wi;
 logic [BTB_TW-1:0] btb_wtag;
 logic [30:0] btb_wtgt;
 logic  [1:0] btb_wkind;
-logic [30:0] d_ras [8];
+logic [30:0] d_ras;
 logic        ras_rv;
 logic  [2:0] ras_rtp;
 logic  [3:0] ras_rn;

@@ -72,7 +72,7 @@ module ap68040_decode
 	output logic        btb_wslot,
 	output logic  [1:0] btb_wkind,
 	output logic [30:0] btb_wtgt,
-	output logic [30:0] ras_o [8],    // the return stack, for the fetch's
+	output logic [30:0] ras_o,        // the return stack's top, for the fetch's
 	output logic  [2:0] ras_tp_o,
 	output logic  [3:0] ras_n_o
 );
@@ -358,7 +358,10 @@ always_ff @(posedge clk) begin
 	bw_wa <= bht_wa;
 	bw_wd <= bht_nd;
 end
-logic [31:0] ras [8];
+// (a LUT RAM: one push, one read at the top and one at the pointer the
+// fetch resynchronizes to; never cleared -- an entry is read only below
+// the count of entries pushed)
+(* ramstyle = "MLAB, no_rw_check" *) logic [31:0] ras [8];
 logic  [2:0] ras_tp;           // the top entry
 logic  [3:0] ras_n;            // entries held (0..8)
 
@@ -681,11 +684,11 @@ wire        btb_ok = (ntarget[0] == 1'b0) && (nrec.exc == 8'd0);
 // the entry's kind: a call pushes the fetch's return stack, a return pops it
 wire  [1:0] btb_kind = rcall ? 2'd1 : rret ? 2'd2 : 2'd0;
 always_comb begin
-	for (int i = 0; i < 8; i++) ras_o[i] = ras[i][31:1];
 	// a back-end redirect resynchronizes the fetch's stack from the
-	// restored pointer
+	// restored pointer (its pointer and the top entry)
 	ras_tp_o = ras_rv ? ras_rtp : ras_tp;
 	ras_n_o  = ras_rv ? ras_rn  : ras_n;
+	ras_o    = ras[ras_tp_o][31:1];
 end
 
 wire room  = (rq_n != 2'd3);
@@ -793,7 +796,6 @@ always_ff @(posedge clk) begin
 		part_fpg   <= 1'b0;
 		ras_tp     <= '0;
 		ras_n      <= '0;
-		for (int i = 0; i < 8; i++) ras[i] <= '0;
 	end
 	else begin
 		d_redir_v  <= 1'b0;

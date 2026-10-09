@@ -85,9 +85,9 @@ module ap68040_fetch
 	input  logic        btb_wslot,    // the branch ends at word 1 of the long word
 	input  logic  [1:0] btb_wkind,    // 0 branch, 1 call, 2 return (target from the stack)
 	input  logic [30:0] btb_wtgt,     // target[31:1]
-	input  logic [30:0] d_ras [8],    // D1's return stack: the fetch's is
-	input  logic  [2:0] d_ras_tp,     // ... resynchronized from it on every
-	input  logic  [3:0] d_ras_n,      // ... redirect
+	input  logic [30:0] d_ras,        // D1's return stack, its top entry: the
+	input  logic  [2:0] d_ras_tp,     // ... fetch's pointer and top entry are
+	input  logic  [3:0] d_ras_n,      // ... resynchronized on every redirect
 
 	// DMU: table walks for the I-ATC, I-ATC maintenance, cache invalidation
 	output logic        iw_req,
@@ -216,7 +216,10 @@ assign btb_q   = btb_hit0 ? btb_q0 : btb_q1;
 
 // the fetch's return stack: pushed by calls the BTB takes, popped by the
 // returns it takes (their target), resynchronized from D1's on redirects
-logic [30:0] fras [8];
+// (a LUT RAM: one write a cycle -- a call's push, or the top entry on a
+// redirect -- and the top read; the entries below the top are the fetch's
+// own: only predictions, EX checks every return)
+(* ramstyle = "MLAB, no_rw_check" *) logic [30:0] fras [8];
 logic  [2:0] fras_tp;
 logic  [3:0] fras_n;
 logic        atc_hit;
@@ -406,6 +409,10 @@ wire out_next = (b_req_r && !b_gnt) || b_gnt || (busy && !(b_done || b_err));
 // sequential
 //--------------------------------------------------------------------------
 always_ff @(posedge clk) begin
+	logic        frw;              // the return stack's write (below)
+	logic  [2:0] frwa;
+	logic [30:0] frwd;
+	frw = 1'b0; frwa = '0; frwd = '0;
 	if (!nreset) begin
 		cnt   <= '0;
 		qf    <= '0; qd <= '0; qa <= '0;
@@ -418,7 +425,6 @@ always_ff @(posedge clk) begin
 		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0;
 		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0; f1_bkind <= '0;
 		fras_tp <= '0; fras_n <= '0;
-		for (int i = 0; i < 8; i++) fras[i] <= '0;
 		f2_b  <= '0; f2_t <= '0; f3_b <= '0; f3_t <= '0;
 		qb    <= '0; tq_n <= '0;
 		for (int i = 0; i < 4; i++) tq[i] <= '0;
@@ -555,7 +561,9 @@ always_ff @(posedge clk) begin
 				fpc  <= {t, 1'b0};
 				fnew <= 1'b0;
 				if (f1_bkind == 2'd1) begin
-					fras[fras_tp + 3'd1] <= {f1_pc[31:2], f1_bslot} + 31'd1;
+					frw  = 1'b1;
+					frwa = fras_tp + 3'd1;
+					frwd = {f1_pc[31:2], f1_bslot} + 31'd1;
 					fras_tp <= fras_tp + 3'd1;
 					if (fras_n != 4'd8) fras_n <= fras_n + 4'd1;
 				end
@@ -711,7 +719,9 @@ always_ff @(posedge clk) begin
 			tq_n  <= '0;
 			f1_v  <= 1'b0;
 			f1_bt <= 1'b0;
-			for (int i = 0; i < 8; i++) fras[i] <= d_ras[i];
+			frw  = 1'b1;
+			frwa = d_ras_tp;
+			frwd = d_ras;
 			fras_tp <= d_ras_tp;
 			fras_n  <= d_ras_n;
 			fpc   <= {redir_npc[31:1], 1'b0};
@@ -785,6 +795,8 @@ always_ff @(posedge clk) begin
 			end
 		end
 	end
+	// the return stack's one write port
+	if (nreset && frw) fras[frwa] <= frwd;
 end
 
 endmodule
