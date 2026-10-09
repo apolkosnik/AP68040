@@ -399,7 +399,7 @@ logic  [7:0] lp_trip [LPN];
 logic  [7:0] lp_cnt  [LPN];
 logic  [7:0] lp_sp   [LPN];
 logic        lp_x    [LPN];
-logic  [2:0] lp_rr;
+logic [$clog2(LPN)-1:0] lp_rr;
 logic        lp_sync;
 logic [LPN-1:0] lp_hit;
 logic        lp_exit, lp_br, lp_ovr;
@@ -739,7 +739,7 @@ always_ff @(posedge clk) begin
 	else begin
 		if (flush) lp_sync <= 1'b1;
 		else if (push) lp_sync <= 1'b0;
-		if (lp_we && !lp_tk && lp_mp && !lp_whit) lp_rr <= lp_rr + 3'd1;
+		if (lp_we && !lp_tk && lp_mp && !lp_whit) lp_rr <= lp_rr + 1'b1;
 		for (int i = 0; i < LPN; i++) begin
 			logic        v_n, cf_n;
 			logic  [7:0] trip_n, cnt_n, base, inc;
@@ -758,7 +758,7 @@ always_ff @(posedge clk) begin
 					cnt_n  = 8'd0;
 				end
 			end
-			else if (lp_we && !lp_tk && lp_mp && !lp_whit && lp_rr == 3'(i)) begin
+			else if (lp_we && !lp_tk && lp_mp && !lp_whit && lp_rr == $clog2(LPN)'(i)) begin
 				v_n    = 1'b1;
 				tag_n  = lp_wa;
 				cf_n   = 1'b0;
