@@ -67,7 +67,9 @@ cmd_t cmds [$];
 
 // the current FPU's selection ports: unused here (the FPU selects its own
 // register-ready flags; the core selects them outside, checked in the FPU)
-`define XPORTS .okv_next(), .sel_x(1'b0), .aok_x(1'b0), .bok_x(1'b0), .opmode_n(7'd0), .op_class_n(3'd0), .src_fmt_n(3'd0),
+`define XPORTS .okv_next(), .sel_x(1'b0), .aok_x(1'b0), .bok_x(1'b0), .opmode_n(7'd0), .op_class_n(3'd0), .src_fmt_n(3'd0), .frestore_we(1'b0), .frestore_wf(4'd0), .frestore_wd(32'd0),
+// the committed FPU's (REF=old) staged-frame ports
+`define OPORTS .frestore_wbt(96'd0), .frestore_fpiar(32'd0), .frestore_cmd1(16'd0), .frestore_cmd3(16'd0), .frestore_stag(3'd0), .frestore_dtag(3'd0), .frestore_flags(3'd0), .frestore_fpt(96'd0), .frestore_et(96'd0), .frestore_grs(3'd0), .frestore_wbte15(1'b0),
 `define FPU_INST(P, PIPEV, MOD, X) \
 	MOD #(.PIPE(PIPEV)) P``_fpu ( \
 		.clk(clk), .nreset(nreset), .ce(1'b1), \
@@ -91,11 +93,7 @@ cmd_t cmds [$];
 		.frestore_cusavepc(8'd0), .frestore_et15(1'b0), .frestore_fpt15(1'b0), \
 		.fstate_grs(), .fstate_wbte15(), \
 		.fstate_busy(), .fstate_wbt(), .fstate_fpiar_c(), \
-		.frestore_wbt(96'd0), .frestore_fpiar(32'd0), .frestore_busy(1'b0), \
-		.frestore_cmd1(16'd0), .frestore_cmd3(16'd0), \
-		.frestore_stag(3'd0), .frestore_dtag(3'd0), .frestore_flags(3'd0), \
-		.frestore_fpt(96'd0), .frestore_et(96'd0), \
-		.frestore_grs(3'd0), .frestore_wbte15(1'b0), \
+		.frestore_busy(1'b0), \
 		.fp_reset(1'b0) \
 	);
 
@@ -117,7 +115,7 @@ end
 `ifdef REF_OLD
 // REF_OLD: the reference is the committed FPU (ap040_fpu_ref, renamed by
 // tb/build_fpu_pipe.sh), both with the pipeline: a check of a refactor
-`FPU_INST(r, 1, ap040_fpu_ref, )
+`FPU_INST(r, 1, ap040_fpu_ref, `OPORTS)
 `else
 `FPU_INST(r, 0, ap040_fpu, `XPORTS)
 `endif

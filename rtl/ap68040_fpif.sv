@@ -233,12 +233,13 @@ logic [15:0] s_cmd1, s_cmd3;
 logic  [2:0] s_stag, s_dtag, s_flags, s_grs;
 logic [95:0] s_fpt, s_et, s_wbt;
 logic [31:0] s_fpiarc;
-logic [15:0] r_cmd1, r_cmd3;
-logic  [2:0] r_stag, r_dtag, r_flags, r_grs;
-logic [95:0] r_fpt, r_et, r_wbt;
-logic [31:0] r_fpiar;
+// FRESTORE: the frame's words go to the FPU's frame registers as they are
+// read (f_rwe/f_rwf/f_rwd); the resume decision's few bits stay here
+logic        f_rwe;
+logic  [3:0] f_rwf;
+logic [31:0] f_rwd;
 logic  [7:0] r_cusavepc;
-logic        r_et15, r_fpt15, r_wbte15, r_busy;
+logic        r_et15, r_fpt15, r_busy;
 
 ap040_fpu fpu (
 	.clk(clk), .nreset(nreset), .ce(1'b1),
@@ -265,11 +266,8 @@ ap040_fpu fpu (
 	.frestore_cusavepc(r_cusavepc), .frestore_et15(r_et15), .frestore_fpt15(r_fpt15),
 	.fstate_grs(s_grs), .fstate_wbte15(s_wbte15),
 	.fstate_busy(s_busy), .fstate_wbt(s_wbt), .fstate_fpiar_c(s_fpiarc),
-	.frestore_wbt(r_wbt), .frestore_fpiar(r_fpiar), .frestore_busy(r_busy),
-	.frestore_cmd1(r_cmd1), .frestore_cmd3(r_cmd3),
-	.frestore_stag(r_stag), .frestore_dtag(r_dtag), .frestore_flags(r_flags),
-	.frestore_fpt(r_fpt), .frestore_et(r_et),
-	.frestore_grs(r_grs), .frestore_wbte15(r_wbte15),
+	.frestore_busy(r_busy),
+	.frestore_we(f_rwe), .frestore_wf(f_rwf), .frestore_wd(f_rwd),
 	.fp_reset(f_rst)
 );
 
@@ -693,12 +691,12 @@ always_ff @(posedge clk) begin
 		f_class <= '0; f_fmt <= '0; f_srcr <= '0; f_dstr <= '0; f_fmsel <= '0; f_opm <= '0;
 		f_aok <= 1'b0; f_bok <= 1'b0;
 		f_din <= '0; f_dnice <= 1'b0; f_fmwd <= '0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
-		r_cmd1 <= '0; r_cmd3 <= '0; r_stag <= '0; r_dtag <= '0; r_flags <= '0; r_grs <= '0;
-		r_fpt <= '0; r_et <= '0; r_wbt <= '0; r_fpiar <= '0; r_cusavepc <= '0;
-		r_et15 <= 1'b0; r_fpt15 <= 1'b0; r_wbte15 <= 1'b0; r_busy <= 1'b0;
+		f_rwe <= 1'b0; f_rwf <= '0; f_rwd <= '0; r_cusavepc <= '0;
+		r_et15 <= 1'b0; r_fpt15 <= 1'b0; r_busy <= 1'b0;
 	end
 	else begin
 		f_req <= 1'b0; f_crwe <= 1'b0; f_iawe <= 1'b0; f_bsun <= 1'b0; f_fmwe <= 1'b0;
+		f_rwe <= 1'b0;
 		f_rst <= 1'b0; f_fsave_ack <= 1'b0; f_rest_idle <= 1'b0; f_rest_unimp <= 1'b0;
 		f_pendcap <= 1'b0;
 		fresh     <= 1'b0;
@@ -885,40 +883,45 @@ always_ff @(posedge clk) begin
 			end
 			FC_RSW: if (adv) begin
 				logic [4:0] k;
+				logic [4:0] f;             // the field it holds (ap040_fpu's frestore_wf)
 				k = immb[6:2];
+				f = 5'h1F;
 				if (rs_kind == 2'd3) case (k)
 					5'd2:  r_cusavepc <= av[31:24];
-					5'd6:  r_wbt[95:64] <= av;
-					5'd7:  r_wbt[63:32] <= av;
-					5'd8:  r_wbt[31:0]  <= av;
-					5'd10: r_fpiar <= av;
-					5'd13: r_cmd3 <= av[31:16];
-					5'd15: begin r_stag <= av[31:29]; r_et15 <= av[28]; r_grs <= av[25:23]; end
-					5'd16: r_cmd1 <= av[31:16];
-					5'd17: begin r_dtag <= av[31:29]; r_fpt15 <= av[28]; r_wbte15 <= av[20]; end
-					5'd18: r_flags <= {av[26], av[25], av[20]};
-					5'd19: r_fpt[95:64] <= av;
-					5'd20: r_fpt[63:32] <= av;
-					5'd21: r_fpt[31:0]  <= av;
-					5'd22: r_et[95:64]  <= av;
-					5'd23: r_et[63:32]  <= av;
-					5'd24: r_et[31:0]   <= av;
+					5'd6:  f = 5'd0;
+					5'd7:  f = 5'd1;
+					5'd8:  f = 5'd2;
+					5'd10: f = 5'd3;
+					5'd13: f = 5'd4;
+					5'd15: begin f = 5'd5; r_et15 <= av[28]; end
+					5'd16: f = 5'd6;
+					5'd17: begin f = 5'd7; r_fpt15 <= av[28]; end
+					5'd18: f = 5'd8;
+					5'd19: f = 5'd9;
+					5'd20: f = 5'd10;
+					5'd21: f = 5'd11;
+					5'd22: f = 5'd12;
+					5'd23: f = 5'd13;
+					5'd24: f = 5'd14;
 					default: ;
 				endcase
 				else if (rs_kind == 2'd2) case (REV40 ? k + 5'd2 : k)
-					5'd1:  r_cmd3 <= av[31:16];
-					5'd3:  begin r_stag <= av[31:29]; r_grs <= av[25:23]; end
-					5'd4:  r_cmd1 <= av[31:16];
-					5'd5:  begin r_dtag <= av[31:29]; r_wbte15 <= av[20]; end
-					5'd6:  r_flags <= {av[26], av[25], av[20]};
-					5'd7:  r_fpt[95:64] <= av;
-					5'd8:  r_fpt[63:32] <= av;
-					5'd9:  r_fpt[31:0]  <= av;
-					5'd10: r_et[95:64]  <= av;
-					5'd11: r_et[63:32]  <= av;
-					5'd12: r_et[31:0]   <= av;
+					5'd1:  f = 5'd4;
+					5'd3:  f = 5'd5;
+					5'd4:  f = 5'd6;
+					5'd5:  f = 5'd7;
+					5'd6:  f = 5'd8;
+					5'd7:  f = 5'd9;
+					5'd8:  f = 5'd10;
+					5'd9:  f = 5'd11;
+					5'd10: f = 5'd12;
+					5'd11: f = 5'd13;
+					5'd12: f = 5'd14;
 					default: ;
 				endcase
+				f_rwe <= (f != 5'h1F);
+				f_rwf <= f[3:0];
+				f_rwd <= av;
 			end
 			default: ;
 		endcase
