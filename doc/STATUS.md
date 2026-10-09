@@ -174,6 +174,7 @@ after every step, which caught two changes that saved nothing):
 | 1571385 | | D1's return stack one read address (MLAB), SDP RAMs with registered output (no bypass), the multiplier's partial products summed in two adders |
 | 33ec2d8 | 25,118 | the predecode ring as two MLAB banks by slot parity; one right and one left funnel for every slow-ALU shift (833 -> 628 ALMs) |
 | 035e51d | 24,935 | the ring banks with one write statement each (two read as two ports and stayed logic) |
+| ab9f58f | 24,831 | D1's PC-relative adds one adder per EA (PC16/PCX exclusive), the slow path's two phases one mk_ea; this seed meets 60 MHz at both corners (+0.29/+0.40 ns) |
 
 Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
 the only change from 1,786,890); bench_fpu unchanged.  Kept at 8 entries:
