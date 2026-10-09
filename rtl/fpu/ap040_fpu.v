@@ -368,9 +368,6 @@ reg signed [17:0] e_w;        // working exponent (wrap safe)
 // F_NORM2, each entered from one place), so the encoder and shifter start
 // from flip-flops rather than from a decode of fst.
 reg  [1:0] nsel;
-wire [63:0] norm_m = nsel[0] ? b_m :
-                     nsel[1] ? acc_hi[63:0] : a_m;
-wire [6:0] norm_lz = clz64(norm_m);
 
 // v >> n with every bit shifted out ORed into bit 0 (n up to 67: all out)
 function [66:0] shr_sticky;
@@ -382,8 +379,6 @@ function [66:0] shr_sticky;
 		shr_sticky = ((n >= 7'd67) ? 67'd0 : (v >> n)) | {66'd0, |(v & m)};
 	end
 endfunction
-wire [66:0] norm_shifted =
-    {norm_m, (nsel[1] ? grs : 3'd0)} << norm_lz;
 // synthesis translate_off
 always @(posedge clk)
 	if (nsel != {fst == F_NORM2, fst == F_RESTORE_N})
@@ -591,6 +586,20 @@ reg  [66:0] p3_sv;
 reg   [2:0] p4_g, p5_g;
 reg         p6_inx, p6_nice;
 reg         p1_ni, p2_ni, p3_ni;   // an integer source: normalize in P4
+
+// The pipeline's P4 normalizes with the same encoder and shifter: it holds
+// an operation only while the state machine is idle (p4_v, a register,
+// selects it).
+wire [63:0] norm_m = nsel[0] ? b_m :
+                     nsel[1] ? acc_hi[63:0] :
+                     p4_v    ? p4_m : a_m;
+wire [6:0] norm_lz = clz64(norm_m);
+wire [66:0] norm_shifted =
+    {norm_m, (nsel[1] ? grs : (!nsel[0] && p4_v) ? p4_g : 3'd0)} << norm_lz;
+// one right shifter with sticky for F_SHR and the pipeline's P2 alignment
+// (P2 holds an operation only while the state machine is idle)
+wire        shr_fsm = (fst == F_SHR);
+wire [66:0] shr_out = shr_sticky(shr_fsm ? sh_v : {p2_sm, 3'd0}, shr_fsm ? sh_cnt : p2_sh);
 
 // one 64x64 multiplier for both: the state machine multiplies only in
 // F_MULT, which it reaches with the pipeline empty
@@ -908,7 +917,7 @@ always @(posedge clk) begin
 		p3_e  <= p2_e;
 		p3_es <= p2_es;
 		p3_bm <= p2_bm;
-		p3_sv <= shr_sticky({p2_sm, 3'd0}, p2_sh);
+		p3_sv <= shr_out;
 
 		//----------------------------------------------------------------- P3
 		p4_v  <= p3_v;
@@ -977,14 +986,14 @@ always @(posedge clk) begin
 		if (p4_n) begin : p4_norm
 			reg [6:0]  lz;
 			reg [66:0] nv;
-			lz = clz64(p4_m);
+			lz = norm_lz;                 // (the shared encoder: p4_v selects)
 			if (lz == 7'd64) begin
 				p5_m <= {p4_g, 61'd0};
 				p5_g <= 3'd0;
 				p5_e <= p4_e - 18'sd64;
 			end
 			else begin
-				nv = {p4_m, p4_g} << lz;
+				nv = norm_shifted;
 				p5_m <= nv[66:3];
 				p5_g <= nv[2:0];
 				p5_e <= p4_e - {11'd0, lz};
@@ -2879,7 +2888,7 @@ always @(posedge clk) begin
 				// value shifted by sh_cnt, every bit shifted out ORed into
 				// bit 0 ({int[66:3], G, R, S}; the former 32/16/8/4/2/1
 				// steps composed to the same)
-				if (sh_cnt != 0) sh_v <= shr_sticky(sh_v, sh_cnt);
+				if (sh_cnt != 0) sh_v <= shr_out;
 				sh_cnt <= 7'd0;
 				fst    <= sh_ret;
 			end
