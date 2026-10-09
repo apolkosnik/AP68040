@@ -124,32 +124,38 @@ function automatic ea_t mk_ea(input logic [3:0] idx, input logic [2:0] r,
                               input logic [15:0] w2, input logic [15:0] w3,
                               input logic [15:0] w4);
 	ea_t e;
+	logic [31:0] bdx, pcs;
+	// the full-format base displacement (AX/PCX), formed for every mode, so
+	// PC16 and PCX (exclusive) add the PC with one adder
+	case (w0[5:4])
+		2'd2:    bdx = sx16(w1);
+		2'd3:    bdx = {w1, w2};
+		default: bdx = 32'd0;
+	endcase
+	if (!w0[8]) bdx = {{24{w0[7]}}, w0[7:0]};
+	pcs = pcb + ((idx == EM_PC16) ? sx16(w0) : bdx);
 	e = '0;
 	e.m    = idx;
 	e.r    = r;
 	e.xoff = p[2:0];
 	case (idx)
 		EM_AD16, EM_ABSW: e.bd = sx16(w0);
-		EM_PC16: e.bd = pcb + sx16(w0);
+		EM_PC16: e.bd = pcs;
 		EM_ABSL: e.bd = {w0, w1};
 		EM_IMM:  e.bd = (immlen == 3'd1) ? {16'd0, w0} : {w0, w1};
 		EM_AX, EM_PCX: begin
-			logic [31:0] bd;
 			e.xa = w0[15];
 			e.xr = w0[14:12];
 			e.xl = w0[11];
 			e.sc = w0[10:9];
-			if (!w0[8]) begin
-				bd = {{24{w0[7]}}, w0[7:0]};
-			end
-			else begin
+			if (w0[8]) begin
 				logic [15:0] o0, o1;
 				e.bs = w0[7];
 				e.is = w0[6];
 				case (w0[5:4])
-					2'd2: begin bd = sx16(w1);  o0 = w2; o1 = w3; end
-					2'd3: begin bd = {w1, w2};  o0 = w3; o1 = w4; end
-					default: begin bd = 32'd0; o0 = w1; o1 = w2; end
+					2'd2: begin o0 = w2; o1 = w3; end
+					2'd3: begin o0 = w3; o1 = w4; end
+					default: begin o0 = w1; o1 = w2; end
 				endcase
 				if (w0[1:0] != 2'd0)
 					e.mi = (w0[2] && !w0[6]) ? 2'd2 : 2'd1;
@@ -160,7 +166,7 @@ function automatic ea_t mk_ea(input logic [3:0] idx, input logic [2:0] r,
 				endcase
 			end
 			// PC-relative with the base not suppressed: the PC is added here
-			e.bd = (idx == EM_PCX && !e.bs) ? (pcb + bd) : bd;
+			e.bd = (idx == EM_PCX && !e.bs) ? pcs : bdx;
 		end
 		default: ;
 	endcase
@@ -443,14 +449,14 @@ always_comb begin
 		if ({1'b0, l} <= qcnt) begin
 			use_n = {1'b0, l};
 			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
-			if (ph == PH_EA0)
-				nrec.ea0 = mk_ea(i, part.opw[2:0], part_len, il,
-				                 part.pc + {27'd0, part_len, 1'b0},
-				                 win[0], win[1], win[2], win[3], win[4]);
-			else
-				nrec.ea1 = mk_ea(i, part.opw[11:9], part_len, 3'd0,
-				                 part.pc + {27'd0, part_len, 1'b0},
-				                 win[0], win[1], win[2], win[3], win[4]);
+			begin
+				// (one instance for both phases: the same words and base)
+				ea_t e;
+				e = mk_ea(i, (ph == PH_EA0) ? part.opw[2:0] : part.opw[11:9], part_len, il,
+				          part.pc + {27'd0, part_len, 1'b0},
+				          win[0], win[1], win[2], win[3], win[4]);
+				if (ph == PH_EA0) nrec.ea0 = e; else nrec.ea1 = e;
+			end
 			// an FPU immediate is read from the instruction stream by the
 			// microcode: its address follows the extension word (the
 			// operation word says FPU: the record's routine is past the
