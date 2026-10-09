@@ -329,6 +329,20 @@ reg        r_resume;        // normalized BUSY operands bypass datatype retraps
 reg  [2:0] r_stag;          // source tag retained while that conversion runs
 reg  [6:0] r_op;
 reg [95:0] r_din;
+// the memory operand's significand in the working format, by r_fmt: one
+// bus (and one negator, of the integer left-aligned: the same bits as a
+// byte or word negated in place) for every unpack of r_din into a_m.  A
+// single or double's integer bit is its exponent's: set for a normal
+// number, clear for zero, a denormal, infinity and a NaN
+wire [31:0] unp_i  = (r_fmt == 3'd0) ? r_din[95:64] :
+                     (r_fmt == 3'd4) ? {r_din[95:80], 16'd0} : {r_din[95:88], 24'd0};
+wire [31:0] unp_im = r_din[95] ? (32'd0 - unp_i) : unp_i;
+wire        unp_hs = (r_din[94:87] != 8'd0) && (r_din[94:87] != 8'hFF);
+wire        unp_hd = (r_din[94:84] != 11'd0) && (r_din[94:84] != 11'h7FF);
+wire [63:0] unp_m  = (r_fmt == 3'd1) ? {unp_hs, r_din[86:64], 40'd0} :
+                     (r_fmt == 3'd5) ? {unp_hd, r_din[83:32], 11'd0} :
+                     (r_fmt == 3'd0 || r_fmt == 3'd4 || r_fmt == 3'd6) ? {unp_im, 32'd0} :
+                     r_din[63:0];
 
 // operand/result in working format
 reg         a_s;
@@ -1869,8 +1883,7 @@ always @(posedge clk) begin
 						3'd0: begin : cv_l
 							a_s <= r_din[95];
 							a_t <= (r_din[95:64] == 32'd0) ? T_ZERO : T_NUM;
-							a_m <= {(r_din[95] ? (32'd0 - r_din[95:64])
-							                   : r_din[95:64]), 32'd0};
+							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd31;   // integer bit at 63
 							r_stag <= (r_din[95:64] == 32'd0) ? 3'd1 : 3'd0;
 							fst <= F_NORM;
@@ -1878,8 +1891,7 @@ always @(posedge clk) begin
 						3'd4: begin : cv_w
 							a_s <= r_din[95];
 							a_t <= (r_din[95:80] == 16'd0) ? T_ZERO : T_NUM;
-							a_m <= {(r_din[95] ? (16'd0 - r_din[95:80])
-							                   : r_din[95:80]), 48'd0};
+							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd15;
 							r_stag <= (r_din[95:80] == 16'd0) ? 3'd1 : 3'd0;
 							fst <= F_NORM;
@@ -1887,8 +1899,7 @@ always @(posedge clk) begin
 						3'd6: begin : cv_b
 							a_s <= r_din[95];
 							a_t <= (r_din[95:88] == 8'd0) ? T_ZERO : T_NUM;
-							a_m <= {(r_din[95] ? (8'd0 - r_din[95:88])
-							                   : r_din[95:88]), 56'd0};
+							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd7;
 							r_stag <= (r_din[95:88] == 8'd0) ? 3'd1 : 3'd0;
 							fst <= F_NORM;
@@ -1903,7 +1914,7 @@ always @(posedge clk) begin
 								// source payload and leave the explicit integer bit clear.
 								// (The quiet bit is bit 62 and is set below for an
 								// SNaN.)  Infinity is canonicalized during writeback.
-								a_m <= {1'b0, r_din[86:64], 40'd0};
+								a_m <= unp_m;
 								fst <= F_EXEC;
 							end
 							else if (r_din[94:87] == 8'd0) begin
@@ -1913,7 +1924,7 @@ always @(posedge clk) begin
 									// unimplemented instruction
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd16257;
-										a_m <= {1'b0, r_din[86:64], 40'd0};
+										a_m <= unp_m;
 										r_stag <= 3'd5; fst <= F_NORM;
 									end
 									else begin
@@ -1930,7 +1941,7 @@ always @(posedge clk) begin
 								else begin
 									r_stag <= 3'd1;
 									a_t <= T_ZERO;
-									a_m <= 0;
+									a_m <= unp_m;        // (zero: exponent and fraction 0)
 									a_e <= 0;
 									fst <= F_EXEC;
 								end
@@ -1939,7 +1950,7 @@ always @(posedge clk) begin
 								r_stag <= 3'd0;
 								a_t <= T_NUM;
 								a_e <= {9'd0, r_din[94:87]} + 17'd16256; // -127+16383
-								a_m <= {1'b1, r_din[86:64], 40'd0};
+								a_m <= unp_m;
 								// a binary operation: straight to F_BIN (as
 								// for a register source)
 								if (bin_op(r_op) && !r_unimp) begin
@@ -1973,7 +1984,7 @@ always @(posedge clk) begin
 								// Match the 68040 NaN encoding: bit 63 remains clear;
 								// only the payload (and, when needed, quiet bit 62) is
 								// carried into the extended significand.
-								a_m <= {1'b0, r_din[83:32], 11'd0};
+								a_m <= unp_m;
 								fst <= F_EXEC;
 							end
 							else if (r_din[94:84] == 11'd0) begin
@@ -1982,7 +1993,7 @@ always @(posedge clk) begin
 									// data type trap, vector 55
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd15361;
-										a_m <= {1'b0, r_din[83:32], 11'd0};
+										a_m <= unp_m;
 										r_stag <= 3'd5; fst <= F_NORM;
 									end
 									else begin
@@ -1999,7 +2010,7 @@ always @(posedge clk) begin
 								else begin
 									r_stag <= 3'd1;
 									a_t <= T_ZERO;
-									a_m <= 0;
+									a_m <= unp_m;        // (zero: exponent and fraction 0)
 									a_e <= 0;
 									fst <= F_EXEC;
 								end
@@ -2008,7 +2019,7 @@ always @(posedge clk) begin
 								r_stag <= 3'd0;
 								a_t <= T_NUM;
 								a_e <= {6'd0, r_din[94:84]} + 17'd15360; // -1023+16383
-								a_m <= {1'b1, r_din[83:32], 11'd0};
+								a_m <= unp_m;
 								if (bin_op(r_op) && !r_unimp) begin
 									op_kind <= bin_kind(r_op);
 									grs <= 3'd0;
