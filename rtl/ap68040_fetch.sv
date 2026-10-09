@@ -100,6 +100,7 @@ module ap68040_fetch
 	input  atce_t       iatc_went,
 	input  logic        iatc_flush_all,
 	input  logic        iatc_flush_page,
+	input  logic        iatc_flush_pre,   // the cycle before: the page's set is read
 	input  logic        iatc_flush_ng,
 	input  logic [31:0] iatc_flush_la,
 	input  logic        iatc_flush_fc2,
@@ -222,13 +223,16 @@ assign btb_q   = btb_hit0 ? btb_q0 : btb_q1;
 (* ramstyle = "MLAB, no_rw_check" *) logic [30:0] fras [8];
 logic  [2:0] fras_tp;
 logic  [3:0] fras_n;
-logic        atc_hit;
+// (the lookup's RAM read is F0's: F0 presents fpc, F1 compares f1_pc; a
+// page flush presents its page the cycle before, F0 then idle)
+logic        atc_hit, atc_st;
 atce_t       atc_e;
 ap68040_atc iatc (
 	.clk(clk), .nreset(nreset), .p8k(tc_p),
-	.la(iatc_flush_page ? iatc_flush_la : fpc),
-	.fc2(iatc_flush_page ? iatc_flush_fc2 : smode),
-	.hit(atc_hit), .ent(atc_e),
+	.la_n(iatc_flush_pre ? iatc_flush_la : fpc),
+	.la(iatc_flush_page ? iatc_flush_la : f1_pc),
+	.fc2(iatc_flush_page ? iatc_flush_fc2 : f1_s),
+	.hit(atc_hit), .ent(atc_e), .stale(atc_st),
 	.wr(iatc_wr), .wla(iatc_wla), .wfc2(iatc_wfc2), .went(iatc_went),
 	.flush_all(iatc_flush_all), .flush_page(iatc_flush_page),
 	.flush_nonglobal(iatc_flush_ng)
@@ -301,8 +305,9 @@ logic        f1_bt, f1_bslot;   // the BTB hit at F0, and where the branch ends
 logic  [1:0] f1_bkind;
 logic [30:0] f1_btgt;
 logic        f1_s, f1_dem;
-logic        f1_hit;
+wire         f1_hit = atc_hit;     // the I-ATC's lookup of f1_pc (in F1)
 atce_t       f1_e;
+assign f1_e = atc_e;
 
 // line buffer: the last line filled (it also serves TCI lines)
 logic        lb_v;             // m_line holds the line at lb_pa (the last fill):
@@ -332,7 +337,7 @@ wire [31:0] redir_npc = redir_v ? redir_pc : d_redir_pc;
 //--------------------------------------------------------------------------
 // F1 evaluation
 //--------------------------------------------------------------------------
-logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
+logic        x_ok, x_flt, x_walk, x_retry, x_cach, x_hit, x_lb;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
 logic [31:0] x_chunk;
@@ -342,7 +347,7 @@ logic        f1_tt0, f1_tt1;
 always_comb begin
 	logic tt0, tt1, use_t;
 	logic [21:0] tg;
-	x_ok = 1'b0; x_flt = 1'b0; x_walk = 1'b0;
+	x_ok = 1'b0; x_flt = 1'b0; x_walk = 1'b0; x_retry = 1'b0;
 	x_pa = f1_pc; x_cm = 2'b00; x_upa = 2'b00;
 	tt0 = f1_tt0;
 	tt1 = f1_tt1;
@@ -360,6 +365,7 @@ always_comb begin
 		if (!f1_e.r || (f1_e.s && !f1_s)) x_flt = 1'b1;   // nonresident, supervisor only
 		else x_ok = 1'b1;
 	end
+	else if (atc_st) x_retry = 1'b1;   // the I-ATC read another set: again
 	else x_walk = 1'b1;
 	x_cach = x_ok && ic_en && !x_cm[1];
 	// the tags compare with both candidate addresses, the logical one (a
@@ -391,7 +397,7 @@ wire       bt_room  = ({1'b0, tq_n} + {3'd0, f1_v && f1_bt} + {3'd0, |f2_b} + {3
 wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 2);
 // a snooped invalidation goes first (the snooper has priority, 4.5)
 wire       f0_go    = (st == S_RUN) && !odd && !stop && !redir_any &&
-                      !iatc_flush_page && !inv_busy && !sn_inv && room;
+                      !iatc_flush_pre && !iatc_flush_page && !inv_busy && !sn_inv && room;
 
 assign c_raddr = inv_busy ? inv_i[5:0] : fpc[9:4];
 
@@ -442,7 +448,7 @@ always_ff @(posedge clk) begin
 		fpc   <= '0;
 		fnew  <= 1'b1;
 		st    <= S_RUN;
-		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
+		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0;
 		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0;
 		f1_bt <= 1'b0; f1_bslot <= 1'b0; f1_btgt <= '0; f1_bkind <= '0;
 		fras_tp <= '0; fras_n <= '0;
@@ -556,8 +562,6 @@ always_ff @(posedge clk) begin
 			f1_tt0 <= ttr_hit(itt0, fpc, smode);
 			f1_tt1 <= ttr_hit(itt1, fpc, smode);
 			f1_dem <= fnew;
-			f1_hit <= atc_hit;
-			f1_e   <= atc_e;
 			fnew   <= 1'b0;
 			fpc    <= {fpc[31:2], 2'b00} + 32'd4;
 		end
@@ -608,7 +612,8 @@ always_ff @(posedge clk) begin
 			m_s    <= f1_s;
 			m_dem  <= f1_dem;
 			m_ci   <= x_cm[1];
-			if (x_walk) begin
+			if (x_retry) ;                 // F0 looks the address up again
+			else if (x_walk) begin
 				st     <= S_WALK;
 				iw_req <= 1'b1;
 			end
