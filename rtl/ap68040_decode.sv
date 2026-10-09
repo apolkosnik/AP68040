@@ -226,9 +226,13 @@ endfunction
 // the head's attributes: a ROM (block RAM) read with the head's entry a
 // cycle ahead, so it lines up with pd0 -- not a 276-entry table in logic
 pla_t a0;
-pla_t a0_r;
-always_ff @(posedge clk) a0_r <= ent_attr(pd0_n.ent, 1'b1);
-always_comb a0 = pd0.legal ? a0_r : '0;
+(* romstyle = "M10K" *) logic [$bits(pla_t)-1:0] attr_rom [0:511];
+initial begin
+`include "gen/ap68040_attr_rom.svh"
+end
+logic [$bits(pla_t)-1:0] attr_q;
+always_ff @(posedge clk) attr_q <= attr_rom[pd0_n.ent];
+always_comb a0 = pd0.legal ? pla_t'(attr_q) : '0;
 // synthesis translate_off
 always_ff @(posedge clk)
 	if (nreset && a0 != ent_attr(pd0.ent, pd0.legal)) begin
