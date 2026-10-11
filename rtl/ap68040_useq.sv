@@ -38,9 +38,7 @@ module ap68040_useq
 	// uop FIFO towards the back end: uq0 is the head
 	output logic  [1:0] uq_n,
 	output uop_t        uq0,
-	input  logic        uq_pop,     // the back end takes uq0 this cycle
-	output logic  [4:0] nx_base,    // next cycle's uq0: its base and index
-	output logic  [4:0] nx_idx      // (the register file reads them ahead)
+	input  logic        uq_pop      // the back end takes uq0 this cycle
 );
 
 
@@ -844,8 +842,7 @@ always_ff @(posedge clk) begin
 		uw_v <= nv;
 
 		// uop FIFO: both outcomes formed without the pop (the back end's
-		// stall, a late signal), which selects between them last (uq0_n
-		// below forms the head's successor the same way)
+		// stall, a late signal), which selects between them last
 		if (uq_pop && uq_n != 2'd0) begin
 			uq0  <= (emit && uq_n == 2'd1) ? nu : uq1;
 			uq1  <= (emit && uq_n == 2'd2) ? nu : uq1;
@@ -961,14 +958,5 @@ always_ff @(posedge clk)
 		$finish;
 	end
 // synthesis translate_on
-
-// the uop at the head next cycle (as the FIFO update forms it): the
-// register file's block RAM reads its base and index a cycle ahead
-uop_t uq0_n;
-always_comb
-	uq0_n = (uq_pop && uq_n != 2'd0) ? ((emit && uq_n == 2'd1) ? nu : uq1)
-	                                  : ((emit && uq_n == 2'd0) ? nu : uq0);
-assign nx_base = uq0_n.base;
-assign nx_idx  = uq0_n.idx;
 
 endmodule

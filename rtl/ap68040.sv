@@ -220,11 +220,10 @@ logic [15:0] dm_fssw, dm_st_fssw;
 logic  [1:0] uq_n;
 uop_t        uq0;
 logic        uo_rdy;
-logic  [4:0] nx_base, nx_idx;
 
 ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
 	.clk(clk), .nreset(nreset),
-	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy), .in_base_n(nx_base), .in_idx_n(nx_idx),
+	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
@@ -372,8 +371,7 @@ ap68040_useq useq (
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
 	.smode(sr[13]), .master(sr[12]),
 	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
-	.uq_n(uq_n), .uq0(uq0), .uq_pop(uo_rdy && uq_n != 2'd0),
-	.nx_base(nx_base), .nx_idx(nx_idx)
+	.uq_n(uq_n), .uq0(uq0), .uq_pop(uo_rdy && uq_n != 2'd0)
 );
 
 endmodule
