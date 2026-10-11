@@ -179,7 +179,24 @@ after every step, which caught two changes that saved nothing):
 | 7fbbd9c | 24,712 | the integer register files in M10K (reads a cycle ahead, same-edge writes forwarded): REVERTED (3a4c4bf) -- three seeds -94 ALMs on average (the files -488, the backend's logic +365 around the fixed M10K columns) for about 1 ns worse setup on every seed, the DMU's ATC-to-dq1 path |
 
 Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
-the only change from 1,786,890); bench_fpu unchanged.  Kept at 8 entries:
+the only change from 1,786,890); bench_fpu unchanged.
+
+What the prediction and forwarding features cost, each switched off alone
+(seed 1 fits of f58cc0b; cycles against its 1,786,949 Dhrystone,
+1,496,306 kern, 318,795 bench_insn, 54,430 bench_loop):
+
+| off | ALMs | Dhrystone | kern | bench_insn | bench_loop |
+|---|---:|---:|---:|---:|---:|
+| early results in AG (ag_ee = 0) | -557 | +1.9 % | +13.0 % | +1.7 % | 0 |
+| loop exit predictor (lp_exit = 0) | -448 | +4.4 % | +2.3 % | 0 | +2.5 % |
+| BTB (F1 never takes) | -276 | hangs (dhry) | +23 % | +8.7 % | +92 % |
+| branch history table (static Bcc) | -191 | +11.1 % | +0.3 % | 0 | 0 |
+| the FPU pipeline (PIPE=0, the outside report) | -1,517 | 0 | 0 | 0 | FP +20-82 % |
+
+The integer register files in M10K (7fbbd9c, reverted): -94 ALMs on
+three seeds for ~1 ns of setup.  The full Minimig fit with the old core
+(38,255 ALMs, 91 %) leaves 16,887 outside cpu_wrapper and ~1,400 for
+the shell: at that density the new core must be about 20,000 ALMs.  Kept at 8 entries:
 the loop predictor (4 cost 4.4 % Dhrystone).  Not changed, with the
 measured reason: the DMU tag RAMs' bypass logic (the engine reads a set
 in the cycle another port writes it thousands of times in t_snstress),
