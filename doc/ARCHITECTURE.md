@@ -12,6 +12,23 @@ Architectural ground truth, in order of authority:
 3. The MC68040 User's Manual (MC68040UM): section 3 (MMU), 4 (caches),
    5 (signals), 7 (bus), 8 (exceptions), 9 (FPU).
 
+## Configuration
+
+`ap68040`'s parameters (tb/tb_ap68040.sv sets them from `AP_*` defines;
+bit 0 of the bench's $F2E8 tells a program whether it has the loop
+predictor):
+
+| parameter | default | 0 selects |
+|---|---|---|
+| `FPU_REVISION` | $41 | ($40) the FSAVE frame revision |
+| `FPU_PIPE` | 1 | no arithmetic pipeline: every FPU operation through the state machine |
+| `LOOP_PRED` | 1 | no loop-exit predictor (the history table and the BTB remain) |
+| `EARLY_RES` | 1 | no early results in AG: a base or index waits for EX |
+
+What each costs in ALMs and in cycles is measured in STATUS.md (the area
+round); all three off is the smallest configuration, for a target the
+full core does not fit.
+
 ## Clocking
 
 One clock, `clk`, is the 68040's PCLK.  The bus clock is a clock enable,
@@ -56,11 +73,17 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   a hit goes on, a miss starts the miss engine (table walk through the DMU,
   line fill with critical word first, or a cache-inhibited read) and F0
   rolls back to the missed address.  **F2** predecodes both words (each
-  could start an instruction).  **F3** appends them to the 12-word queue.
+  could start an instruction).  **F3** appends them to the 12-word queue:
+  the words shift; the predecode sits in a ring of two LUT RAM banks (even
+  and odd slots, so F3's two words are one write to each) whose head D1
+  reads from a register, loaded a cycle ahead as D1 consumes.
 * **D1** parses one instruction from the queue head per cycle (the fast
   path, from the predecode: operation word, fixed words, immediate, brief
-  extensions); a full-format extension, an FPU immediate or more than seven
-  words take one cycle per part.  D1 adds PC-relative displacements and
+  extensions; the operation word's decode attributes come from a 512-entry
+  ROM, M10K, generated with the microcode, addressed by the entry number
+  the predecode gives the word that heads the queue next cycle, so D1
+  starts from a register); a full-format extension, an FPU immediate or
+  more than seven words take one cycle per part.  D1 adds PC-relative displacements and
   branch targets, predicts branches and redirects fetch (see below), and
   turns illegal/privileged/TRAP/odd-PC/fetch-fault cases into records that
   carry their exception vector.  Records go to D2 through a 3-entry FIFO
@@ -96,8 +119,10 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   EX still computes and writes every result; simulation checks that the
   two agree (`FAIL: early result`).
 * **DC1/DC2**: the D-ATC/DTT lookup and tag compare (DC1) and the operand
-  from DC2's copy of the set (see the DMU).
-* **EX**: ALU, shifter, bit-field unit, BCD, condition codes, branch
+  from DC2's copy of the way it hit (see the DMU).
+* **EX**: ALU, shifter (one 66-bit right funnel for every right shift and
+  the rotates, one left funnel for LSL/ASL), bit-field unit, BCD,
+  condition codes, branch
   resolution (every prediction is verified here), multiply/divide (holds
   EX), the FPU interface.  EX results go to the front file and are
   captured by younger uops in AG/DC1/DC2 that name the register.
@@ -125,7 +150,7 @@ over three cycles before the routine starts.
   256-entry table of 2-bit counters indexed by PC[8:1] (a counter counts
   disagreement with the static rule, so zeros mean "static"); BRA/BSR
   always; JSR/JMP to absolute and PC-relative addresses; RTS through an
-  8-entry return stack pushed by BSR/JSR.  A taken prediction redirects
+  8-entry return stack (LUT RAM, the top entry read) pushed by BSR/JSR.  A taken prediction redirects
   fetch (four bubbles).
 * Training counts from the table's current value (a second MLAB copy read
   at the training address), one cycle after the branch leaves EX, and not
@@ -145,8 +170,10 @@ over three cycles before the routine starts.
   instruction did to it; a back-end redirect restores it (after the
   instruction, or before it for a refetch), so calls and returns D1
   decoded on a wrong path leave no trace.
-* **The fetch BTB** (256 entries, a slot for each word of a long word,
-  MLAB, indexed by fetch address) remembers
+* **The fetch BTB** (256 entries, a slot for each word of a long word;
+  block RAM with a registered output, read with F0's address and compared
+  with F1's, and an entry written at the edge the read registers is not
+  trusted: that lookup predicts nothing) remembers
   D1's taken predictions: branches, calls (BSR/JSR) and returns (RTS).  A
   hit at F0 ends the chunk at the branch's last word, flags that word, and
   sends F0 to the target from F1 (one bubble): the entry's target, or for a
@@ -163,7 +190,7 @@ over three cycles before the routine starts.
 ## Memory ordering and coherency
 
 * Loads read the cache at DC1/DC2; stores write it at WB.  DC2 keeps its
-  own copy of the set and merges every byte write to that set into it
+  own copy of the line it hit and merges every byte write to it
   (including the two writes the RAM output cannot show yet), so a load
   after a store to its line stays on the fast path; a load behind an older
   store still in EX/WB waits for it in DC2 only if it reads the store's
@@ -186,7 +213,11 @@ over three cycles before the routine starts.
 
 * Data cache: 4 KB, 4 ways of 64 sets of 16-byte lines, physically tagged,
   indexed by PA9-4 (= LA9-4).  Tags and data in M10K; valid and dirty bits
-  in flip-flops with one write port.  Modes from the ATC/TTR CM field:
+  in LUT RAM (the valid bits twice: one copy read at the lookup's set, one
+  at the engine's or the snoop's), so a clear of the whole cache (reset,
+  CINVA) sweeps the 64 sets, one a cycle (E_M_CLR); the instruction
+  cache's valid bits are kept the same way.  Modes from the ATC/TTR CM
+  field:
   copyback, write-through, cache-inhibited serialized and nonserialized.
 * The fast path: a load that hits, within one line, answers from DC2's copy;
   a copyback store that hits writes the RAM in its WB cycle.
@@ -196,8 +227,9 @@ over three cycles before the routine starts.
   store needs no data, and at WB writes its two parts in consecutive
   cycles without the engine (if a snoop took the second line in between,
   the engine writes the second part).  A miss, a walk, a fault, a pending
-  store to either line or a write to either set while the lookup is in
-  flight sends it to the general path.  Cycles a copyback access (user
+  store to either line (lines are matched by their page offset, PA11-4)
+  or a write to either set while the lookup is in flight sends it to the
+  general path.  Cycles a copyback access (user
   mode, tb/asm/bench_mis.s): aligned 1.2, misaligned within a line 1.4,
   across a line 8.3 (load) and 8.5 (store).
 * The engine runs everything else, one job at a time: misses (line fill,
@@ -298,6 +330,19 @@ operation, FMOVE.D (An),FPn 6, FADD.D (An),FPn 6, FMOVE.L Dn,FPn 4;
 independent operations at 3 (an FPU uop acts only once the instruction
 before it has left WB).
 
+The pipeline and the state machine share the datapath: one normalizer (a
+registered select between P4's operand and the state machine's), one sticky
+right shifter, the multiplier (four 32x32 DSP products, registered, summed
+in two adders) and one unpack of the memory operand; the register-ready
+flags and the static pipeline eligibility that dispatch reads are
+registered a cycle ahead from the interface's next values (`okv_next`,
+`sel_x`, `opmode_n`, `op_class_n`, `src_fmt_n`).  FRESTORE writes the
+frame registers directly (`frestore_we`, `frestore_wf`, `frestore_wd`)
+instead of resuming through the state machine.  `FPU_PIPE=0` leaves the
+pipeline out.  tb/build_fpu_pipe.sh with REF=old (or REF=<revision>)
+builds the bench against a committed FPU, both pipelined: the check of a
+refactor.
+
 ## Pins beyond the bus
 
 * IPEND: a request exceeds the mask (on bus clock edges).
@@ -316,14 +361,20 @@ before it has left WB).
 2. Long arithmetic is iterative or pipelined: divide and square root two
    bits per clock, the 64x64 multiply in DSP blocks.
 3. Every redirect comes from registered state (D1's records, WB).
+4. RAMs are written the way Quartus infers them (STATUS.md, the area
+   round): a LUT RAM has one read address and one write statement; a block
+   RAM has a registered output (`ap68040_sdpr`) or is an initialized array
+   (the ROMs, generated); a table read at two addresses stays two LUT RAM
+   copies -- a block-RAM copy with bypass logic costs more ALMs.
 
 ## Source layout
 
 ```
 rtl/            the core (SystemVerilog)
 rtl/fpu/        the FPU datapath
-rtl/gen/        generated tables (decoder, microcode ROM) - do not edit
+rtl/gen/        generated tables (decoder, attribute ROM, microcode ROM) - do not edit
 tools/          ucode.py (microcode and decoder), cputest replay generator
+syn/            Quartus out-of-context fit of the core (fitcore.sh: ALMs and timing per seed)
 tb/             Verilator benches, 68040 bus slave, alternate master
 tb/asm/         self-checking 68040 test programs
 tb/c/           C programs (vbcc), Dhrystone

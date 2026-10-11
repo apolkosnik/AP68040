@@ -122,7 +122,8 @@ the core's stall path), EX's register write no longer waits on the CAS
 compare (CAS writes Dc either way) or on EX's selected taken (the odd-
 target check uses the FPU's), and the FMOVEM slot map is a register.
 
-Area round (branch area-wip, not yet closed at 60 MHz): register retiming
+Area round (branch area-wip; closed at 57 MHz on three seeds in four, at
+60 MHz on one, see the end of the section): register retiming
 is off (it added about 6,000 registers), and the core is 28,900-29,200
 ALMs (69 %) against 77 % with retiming.  What it changes besides the
 retiming: FMUL's 64x64 product takes two cycles (registered partial
@@ -179,7 +180,20 @@ after every step, which caught two changes that saved nothing):
 | 7fbbd9c | 24,712 | the integer register files in M10K (reads a cycle ahead, same-edge writes forwarded): REVERTED (3a4c4bf) -- three seeds -94 ALMs on average (the files -488, the backend's logic +365 around the fixed M10K columns) for about 1 ns worse setup on every seed, the DMU's ATC-to-dq1 path |
 
 Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
-the only change from 1,786,890); bench_fpu unchanged.
+the only change from 1,786,890); bench_fpu unchanged.  The round's FPU
+against the one before it (bef4deb), both pipelined, in tb/tb_fpu_pipe.sv
+(REF=bef4deb tb/build_fpu_pipe.sh wraps an FPU without the round's
+ports): eight seeds of 40,000 commands, registers and FPSR identical at
+every sync point; the round's FPU takes 0.4 % more cycles on that stream
+(the two-cycle multiplier and the shared normalizer).
+
+Timing at the round's end (be879b5's RTL, retiming off, four seeds): at
+57 MHz (17.544 ns, the period chosen when 60 MHz would not close on every
+seed) seeds 2, 3 and 4 meet both corners (+0.57, +0.41, +0.78 ns at 100C)
+and seed 1 misses by 0.29 ns at 100C (meets at -40C); hold is positive on
+all four (+0.14 to +0.23 ns); 24,739-24,796 ALMs.  At 60 MHz seed 1 of
+ab9f58f met both corners (+0.29/+0.40 ns).  A seed moves the worst path
+by about a nanosecond: a build takes the seed that closes.
 
 What the prediction and forwarding features cost, each switched off alone
 (seed 1 fits of f58cc0b; cycles against its 1,786,949 Dhrystone,
@@ -203,8 +217,8 @@ invocation -- it rebuilds the simulator itself).  All three off: 22,766
 ALMs (54 %), 13,470 registers, seed 1 setup -0.11 ns at 60 MHz, the FPU
 4,606 and the backend's own logic 3,680; Dhrystone 1,906,833 (+6.7 %),
 kern +15.6 %, bench_insn +6.2 %, bench_fpu +7.1 %; the regression passes
-except t_loops's misprediction-count cases (they assert the loop exit
-predictor).  Two traps met measuring this: run_tests.sh's own build drops
+(be879b5: t_loops checks its misprediction counts only when the bench's
+$F2E8 bit 0 says the loop predictor is present).  Two traps met measuring this: run_tests.sh's own build drops
 a variant's DEFS unless they are on its command line, and a snapshot
 copied while a build regenerates rtl/gen/ can get an empty microcode ROM
 (the core then synthesizes to 5,425 ALMs).  The full Minimig fit with the old core
