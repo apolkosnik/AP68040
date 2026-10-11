@@ -189,7 +189,7 @@ What the prediction and forwarding features cost, each switched off alone
 |---|---:|---:|---:|---:|---:|
 | early results in AG (ag_ee = 0) | -557 | +1.9 % | +13.0 % | +1.7 % | 0 |
 | loop exit predictor (lp_exit = 0) | -448 | +4.4 % | +2.3 % | 0 | +2.5 % |
-| BTB (F1 never takes) | -276 | hangs (dhry) | +23 % | +8.7 % | +92 % |
+| BTB (F1 never takes) | -276 | +44 % | +23 % | +8.7 % | +92 % |
 | branch history table (static Bcc) | -191 | +11.1 % | +0.3 % | 0 | 0 |
 | the FPU pipeline (PIPE=0, the outside report) | -1,517 | 0 | 0 | 0 | FP +20-82 % |
 
