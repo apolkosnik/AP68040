@@ -176,6 +176,7 @@ after every step, which caught two changes that saved nothing):
 | 035e51d | 24,935 | the ring banks with one write statement each (two read as two ports and stayed logic) |
 | ab9f58f | 24,831 | D1's PC-relative adds one adder per EA (PC16/PCX exclusive), the slow path's two phases one mk_ea; this seed meets 60 MHz at both corners (+0.29/+0.40 ns) |
 | f58cc0b | 24,787 | the FPU's memory operand unpacked on one bus (ten a_m sources fewer): -8 ALMs in the FPU -- its register-input muxes are not reducible this way |
+| 7fbbd9c | 24,712 | the integer register files in M10K (reads a cycle ahead, same-edge writes forwarded): REVERTED (3a4c4bf) -- three seeds -94 ALMs on average (the files -488, the backend's logic +365 around the fixed M10K columns) for about 1 ns worse setup on every seed, the DMU's ATC-to-dq1 path |
 
 Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
 the only change from 1,786,890); bench_fpu unchanged.  Kept at 8 entries:
