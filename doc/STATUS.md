@@ -185,7 +185,9 @@ against the one before it (bef4deb), both pipelined, in tb/tb_fpu_pipe.sv
 (REF=bef4deb tb/build_fpu_pipe.sh wraps an FPU without the round's
 ports): eight seeds of 40,000 commands, registers and FPSR identical at
 every sync point; the round's FPU takes 0.4 % more cycles on that stream
-(the two-cycle multiplier and the shared normalizer).
+(the two-cycle multiplier and the shared normalizer).  The sampled corpus
+(--sample 300:24) on the round's last RTL: 3776/3801, exactly the 25
+known slices.
 
 Timing at the round's end (be879b5's RTL, retiming off, four seeds): at
 57 MHz (17.544 ns, the period chosen when 60 MHz would not close on every
