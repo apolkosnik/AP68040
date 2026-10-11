@@ -45,7 +45,8 @@
 module ap68040_fpif
 	import ap68040_pkg::*;
 #(
-	parameter logic [7:0] FPU_REVISION = 8'h41
+	parameter logic [7:0] FPU_REVISION = 8'h41,
+	parameter bit         FPU_PIPE     = 1
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -241,7 +242,7 @@ logic [31:0] f_rwd;
 logic  [7:0] r_cusavepc;
 logic        r_et15, r_fpt15, r_busy;
 
-ap040_fpu fpu (
+ap040_fpu #(.PIPE(FPU_PIPE)) fpu (
 	.clk(clk), .nreset(nreset), .ce(1'b1),
 	.req(f_req), .op_class(f_class), .opmode(f_opm), .wb_ok(f_wbok),
 	.src_fmt(f_fmt), .src_r(f_srcr), .dst_r(f_dstr),

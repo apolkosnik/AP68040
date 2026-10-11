@@ -24,6 +24,9 @@
 
 module ap68040_decode
 	import ap68040_pkg::*, ap68040_upkg::*;
+#(
+	parameter bit LOOP_PRED = 1          // the loop exit predictor
+)
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -418,7 +421,7 @@ always_comb begin
 		lp_hit[i] = lp_v[i] && (lp_tag[i] == qpc[12:1]);
 	lp_exit = 1'b0;
 	for (int i = 0; i < LPN; i++)
-		if (lp_hit[i] && lp_x[i]) lp_exit = 1'b1;
+		if (LOOP_PRED && lp_hit[i] && lp_x[i]) lp_exit = 1'b1;
 end
 
 always_comb begin

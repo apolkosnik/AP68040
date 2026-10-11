@@ -25,7 +25,9 @@
 module ap68040_backend
 	import ap68040_pkg::*;
 #(
-	parameter logic [7:0] FPU_REVISION = 8'h41   // FSAVE frame revision ($40: 44-byte UNIMP)
+	parameter logic [7:0] FPU_REVISION = 8'h41,   // FSAVE frame revision ($40: 44-byte UNIMP)
+	parameter bit         FPU_PIPE  = 1,
+	parameter bit         EARLY_RES = 1
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -445,7 +447,7 @@ always_comb begin
 			else eb_ok = 1'b0;
 		end
 	end
-	ag_ee = ag_v && e_op(ag_u) && ea_ok && eb_ok;
+	ag_ee = EARLY_RES && ag_v && e_op(ag_u) && ea_ok && eb_ok;
 	m  = (ag_u.sz == SZ_B) ? 32'h0000_00FF : (ag_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
 	// (the size mask applies to the result only: the low bits of each of
 	// these depend on the operands' low bits alone)
@@ -576,7 +578,7 @@ ap68040_muldiv md (
 
 // FPU: OP_FPU uops act once no older uop is in flight (WB empty)
 wire         ex_is_fp = (ex_u.op == OP_FPU);
-ap68040_fpif #(.FPU_REVISION(FPU_REVISION)) fpif (
+ap68040_fpif #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE)) fpif (
 	.clk(clk), .nreset(nreset),
 	.ex_v(ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0), .sub(ex_u.cond),
 	.fuse(ex_u.sz == SZ_W), .eal(ex_u.sz == SZ_B),

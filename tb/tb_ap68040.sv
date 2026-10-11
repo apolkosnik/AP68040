@@ -123,7 +123,18 @@ wire  [31:0] bus_dw   = am_d_oe ? am_d : d_o;            // write data
 wire  [31:0] bus_dr   = d_oe ? d_o : d_mem;              // read data (snoop-supplied)
 assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 
-ap68040 dut (
+// the core's area options (build_sim.sh DEFS="+define+AP_FPU_PIPE=0 ..."):
+// the default is every feature on
+`ifndef AP_FPU_PIPE
+`define AP_FPU_PIPE 1
+`endif
+`ifndef AP_LOOP_PRED
+`define AP_LOOP_PRED 1
+`endif
+`ifndef AP_EARLY_RES
+`define AP_EARLY_RES 1
+`endif
+ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),

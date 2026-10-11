@@ -14,7 +14,11 @@
 module ap68040
 	import ap68040_pkg::*;
 #(
-	parameter logic [7:0] FPU_REVISION = 8'h41   // FSAVE frames: $41, or $40 (44-byte UNIMP)
+	parameter logic [7:0] FPU_REVISION = 8'h41,  // FSAVE frames: $41, or $40 (44-byte UNIMP)
+	// area options (doc/STATUS.md has what each costs in ALMs and cycles)
+	parameter bit         FPU_PIPE     = 1,      // the FPU's arithmetic pipeline (0: the state machine alone)
+	parameter bit         LOOP_PRED    = 1,      // D1's loop exit predictor
+	parameter bit         EARLY_RES    = 1       // AG's early results for younger uops' base and index
 )(
 
 	input  logic        clk,
@@ -221,7 +225,7 @@ logic  [1:0] uq_n;
 uop_t        uq0;
 logic        uo_rdy;
 
-ap68040_backend #(.FPU_REVISION(FPU_REVISION)) be (
+ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
@@ -350,7 +354,7 @@ ap68040_fetch fetch (
 );
 assign b_wdata[1] = '0;
 
-ap68040_decode dec (
+ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
 	.clk(clk), .nreset(nreset), .flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
