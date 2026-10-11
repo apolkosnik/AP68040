@@ -46,6 +46,8 @@
 //   $F2E0 long  (read) split copyback stores whose second line a snoop    //
 //               took between the two parts (the DMU's fallback)          //
 //   $F2E4 long  (read) Bcc/DBcc mispredicted in EX (write 0 clears)      //
+//   $F2E8 long  (read) the core's options: bit 0 the loop exit predictor  //
+//               (t_loops checks its predictions only when it is there)    //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -499,6 +501,8 @@ always_ff @(posedge clk) begin
 	// Bcc/DBcc mispredictions (t_loops)
 	if (rsti_n && dut.be.adv_ex && dut.be.ex_mispred && dut.be.ex_bdb && !dut.be.flush)
 		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
+	// the core's options, for the programs that check what they do
+	mem.mem[16'hF2E8 >> 2] <= {31'd0, 1'(`AP_LOOP_PRED)};
 end
 int          cap;
 

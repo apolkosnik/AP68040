@@ -35,6 +35,7 @@ DONEREG	equ	$F102
 IPLREG	equ	$F110
 IPLDLY	equ	$F148
 MISP	equ	$F2E4		; Bcc/DBcc mispredicted (bench counter)
+FEAT	equ	$F2E8		; the core's options (bench): bit 0 the loop predictor
 
 ntrap	equ	$3600		; TRAP #0 taken
 nirq	equ	$3604		; level 2 interrupts taken
@@ -58,8 +59,11 @@ chkm	macro
 .ok\@:
 	endm
 
-; at most \1 mispredicted since MISP was cleared, else fail \2
+; at most \1 mispredicted since MISP was cleared, else fail \2 (only
+; with the loop exit predictor: without it the exits are not predicted)
 chkmp	macro
+	btst	#0,(FEAT+3).l
+	beq.s	.ok\@
 	cmp.l	#\1,(MISP).l
 	bls.s	.ok\@
 	failt	\2
