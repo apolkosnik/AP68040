@@ -194,7 +194,20 @@ What the prediction and forwarding features cost, each switched off alone
 | the FPU pipeline (PIPE=0, the outside report) | -1,517 | 0 | 0 | 0 | FP +20-82 % |
 
 The integer register files in M10K (7fbbd9c, reverted): -94 ALMs on
-three seeds for ~1 ns of setup.  The full Minimig fit with the old core
+three seeds for ~1 ns of setup.
+
+The three worthwhile cuts are parameters of ap68040 (71e77c0: FPU_PIPE,
+LOOP_PRED, EARLY_RES, all 1 by default; the bench takes them as
+build_sim.sh DEFS="+define+AP_FPU_PIPE=0 ...", on the run_tests.sh
+invocation -- it rebuilds the simulator itself).  All three off: 22,766
+ALMs (54 %), 13,470 registers, seed 1 setup -0.11 ns at 60 MHz, the FPU
+4,606 and the backend's own logic 3,680; Dhrystone 1,906,833 (+6.7 %),
+kern +15.6 %, bench_insn +6.2 %, bench_fpu +7.1 %; the regression passes
+except t_loops's misprediction-count cases (they assert the loop exit
+predictor).  Two traps met measuring this: run_tests.sh's own build drops
+a variant's DEFS unless they are on its command line, and a snapshot
+copied while a build regenerates rtl/gen/ can get an empty microcode ROM
+(the core then synthesizes to 5,425 ALMs).  The full Minimig fit with the old core
 (38,255 ALMs, 91 %) leaves 16,887 outside cpu_wrapper and ~1,400 for
 the shell: at that density the new core must be about 20,000 ALMs.  Kept at 8 entries:
 the loop predictor (4 cost 4.4 % Dhrystone).  Not changed, with the
