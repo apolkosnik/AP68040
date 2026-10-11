@@ -104,6 +104,10 @@ endmodule
 // and a read selects that port's copy.  Two ports writing the same
 // register in one cycle: the higher port number wins.
 //--------------------------------------------------------------------------
+// The copies are block RAM: a read returns the register addressed the
+// cycle BEFORE (ra_n: the address the caller will want next cycle), and a
+// write landing at that read's edge, which the RAM does not return, is
+// forwarded from the registered write (higher port wins, as the table).
 module ap68040_rf #(
 	parameter int NR = 5
 )(
@@ -111,29 +115,44 @@ module ap68040_rf #(
 	input  logic  [2:0] we,
 	input  logic  [4:0] wa [3],
 	input  logic [31:0] wd [3],
-	input  logic  [4:0] ra [NR],
-	output logic [31:0] rd [NR]
+	input  logic  [4:0] ra_n [NR],     // next cycle's read addresses
+	output logic [31:0] rd [NR]        // their registers, next cycle
 );
 	logic [1:0]  lvt [32];
 	logic [31:0] q [3][NR];
+	logic  [4:0] ra_q [NR];
+	logic  [2:0] fw [NR];              // a write at the read's edge, per port
+	logic [31:0] wd_q [3];
 	genvar gw, gr;
 	generate
 		for (gw = 0; gw < 3; gw++) begin : g_w
 			for (gr = 0; gr < NR; gr++) begin : g_r
-				ap68040_lutram #(.AW(5), .DW(32)) bank (
+				ap68040_sdpr #(.AW(5), .DW(32)) bank (
 					.clk(clk), .we(we[gw]), .waddr(wa[gw]), .wdata(wd[gw]),
-					.raddr(ra[gr]), .q(q[gw][gr])
+					.raddr(ra_n[gr]), .q(q[gw][gr])
 				);
 			end
 		end
 	endgenerate
-	initial for (int i = 0; i < 32; i++) lvt[i] = 2'd0;
-	always_ff @(posedge clk)
-		for (int w = 0; w < 3; w++)
+	initial begin
+		for (int i = 0; i < 32; i++) lvt[i] = 2'd0;
+		for (int r = 0; r < NR; r++) begin ra_q[r] = '0; fw[r] = '0; end
+		for (int w = 0; w < 3; w++) wd_q[w] = '0;
+	end
+	always_ff @(posedge clk) begin
+		for (int w = 0; w < 3; w++) begin
 			if (we[w]) lvt[wa[w]] <= 2'(w);
+			wd_q[w] <= wd[w];
+		end
+		for (int r = 0; r < NR; r++) begin
+			ra_q[r] <= ra_n[r];
+			for (int w = 0; w < 3; w++) fw[r][w] <= we[w] && (wa[w] == ra_n[r]);
+		end
+	end
 	always_comb
 		for (int r = 0; r < NR; r++)
-			rd[r] = q[lvt[ra[r]]][r];
+			rd[r] = fw[r][2] ? wd_q[2] : fw[r][1] ? wd_q[1] : fw[r][0] ? wd_q[0] :
+			        q[lvt[ra_q[r]]][r];
 endmodule
 
 //--------------------------------------------------------------------------

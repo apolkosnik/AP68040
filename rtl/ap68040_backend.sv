@@ -33,6 +33,8 @@ module ap68040_backend
 	// uops from the sequencer
 	input  logic        in_v,
 	input  uop_t        in_u,
+	input  logic  [4:0] in_base_n,      // next cycle's in_u: base and index
+	input  logic  [4:0] in_idx_n,       // (the register file reads ahead)
 	output logic        in_rdy,
 
 	// redirect of the front end (registered)
@@ -226,6 +228,7 @@ logic  [4:0] fwa [3], bwa [3];
 logic [31:0] fwd [3], bwd [3];
 logic  [4:0] rra [5];
 logic [31:0] frd [5], brd [5], rrd [5];
+logic  [4:0] rra_n [5];
 logic  [4:0] ccr_f, ccr_b;
 
 // special registers (architectural, written at WB)
@@ -337,17 +340,35 @@ wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata_al[15]}}, dm_ldata_al[15:0]} 
 
 assign ag_hold = ag_interlock;
 
-ap68040_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
-ap68040_rf #(.NR(5)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
+ap68040_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra_n(rra_n), .rd(frd));
+ap68040_rf #(.NR(5)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra_n(rra_n), .rd(brd));
 // AG's base and index are read as the uop enters AG (ports 0/1 address
 // the incoming uop) and kept in registers, so AG's address adders, and the
 // data cache's set index after them, start from flip-flops
+// (block RAM: the files read next cycle's addresses -- the uop at the
+// FIFO head next cycle (the sequencer forms it), and the uop in AG next
+// cycle: the one entering, or AG's own while it holds)
+wire ag_load = !flush && !stall_ag && in_v && !stopped;
+assign rra_n[0] = in_base_n;
+assign rra_n[1] = in_idx_n;
+assign rra_n[2] = ag_load ? in_u.upd2_reg : ag_u.upd2_reg;
+assign rra_n[3] = ag_load ? in_u.a_reg    : ag_u.a_reg;
+assign rra_n[4] = ag_load ? in_u.b_reg    : ag_u.b_reg;
 assign rra[0] = in_u.base;
 assign rra[1] = in_u.idx;
 assign rra[2] = ag_u.upd2_reg;
 assign rra[3] = ag_u.a_reg;
 assign rra[4] = ag_u.b_reg;
 always_comb for (int i = 0; i < 5; i++) rrd[i] = fv[rra[i]] ? frd[i] : brd[i];
+// synthesis translate_off
+// (the file's data this cycle is of the address presented last cycle)
+always_ff @(posedge clk)
+	for (int i = 0; i < 5; i++)
+		if (nreset && (i < 2 ? in_v : ag_v) && rff.ra_q[i] != rra[i]) begin
+			$display("FAIL: register file port %0d read %0d, the stage wants %0d", i, rff.ra_q[i], rra[i]);
+			$finish;
+		end
+// synthesis translate_on
 
 logic [31:0] agb_q, agx_q;     // the base, and the index sign-extended and scaled
 wire  [31:0] ag_base = agb_q;
