@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_useq.sv - D2: micro-sequencer                                     //
 //                                                                          //
@@ -27,11 +27,13 @@ module ap68040_useq
 	input  dinst_t      rq0,
 	input  dinst_t      rq1,
 	output logic        rq_pop,
+	output logic        rq_pop_e,   // an early form: implies rq_pop (D1's room)
 
 	input  logic        smode,
 	input  logic        master,     // M bit
 
 	input  logic        exc_go,
+	input  logic        exc_pend,   // the back end prepares an exception entry: issue nothing
 	input  logic  [3:0] exc_kind,
 	input  logic  [4:0] exc_ssp,
 
@@ -276,12 +278,14 @@ always_comb begin
 				if (src.opw[5]) o.r = dreg(src.opw[11:9]);
 				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = q; end
 			end
-			S_NPC:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.npc; end
+			S_NPC:   begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.pc + {27'd0, src.ilen, 1'b0}; end
 			S_PC:    begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = src.pc; end
 			S_CONST: begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {{16{uw.cval[15]}}, uw.cval}; end
 			S_ZERO:  o.src = OS_ZERO;
 			S_LD:    o.src = OS_MEM;
-			S_CREG:  begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {28'd0, src.ext1[11], src.ext1[2:0]}; end
+			// MOVEC register number, as the special register selector:
+			// $000-$008 -> $00-$08, $800-$808 -> $10-$18
+			S_CREG:  begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[11], src.ext1[3:0]}; end
 			S_BFO: begin
 				if (src.ext1[11]) o.r = dreg(src.ext1[8:6]);
 				else begin o.src = OS_IMM; o.imm_v = 1'b1; o.imm = {27'd0, src.ext1[10:6]}; end
@@ -336,11 +340,13 @@ always_comb begin
 	nu.bhc    = src.bhc;
 	nu.ser    = uw.ser;
 	// FMOVEM / FMOVE of control registers to memory are T0 trace points
+	// FMOVEM / FMOVE of control registers to memory are T0 trace points
 	nu.t0cof  = src.t0 || (src.opw[15:6] == 10'b1111_0010_00 &&
 	                       (src.ext1[15:13] == 3'b101 || src.ext1[15:13] == 3'b111));
 	nu.pc     = src.pc;
-	nu.npc    = src.npc;
+	nu.ilen   = src.ilen;
 	nu.ras    = src.ras;
+	nu.exr     = exc_mode;
 	nu.first  = src_first;
 	nu.last   = uw.last;
 	nu.exc    = (src.exc != 8'd0) ? src.exc : 8'd0;
@@ -607,6 +613,9 @@ always_comb begin
 		logic        pd, pi, lastx, base_in, fb_in, fx_in;
 		logic  [4:0] an, xreg;
 		logic [31:0] off;
+		logic [15:0] low;
+		logic  [3:0] k_an, k_x;
+		logic        is_an, is_x;
 		m  = mv_act ? mv_mask : src.ext1;
 		pd = (src.ea0.m == EM_APD);
 		pi = (src.ea0.m == EM_AIP);
@@ -614,10 +623,21 @@ always_comb begin
 		for (int i = 15; i >= 0; i--) if (m[i]) bi = 4'(i);
 		rn = pd ? (4'd15 - bi) : bi;
 		r  = rn[3] ? areg(rn[2:0], sp_reg) : dreg(rn[2:0]);
-		n_mv_rest = m & ~(16'd1 << bi);
+		// (the lowest set bit cleared: m & ~low, no encoder on the way to
+		// the last-transfer test, which pops the decoder's record)
+		low   = m & (~m + 16'd1);
+		n_mv_rest = m & ~low;
 		lastx = (n_mv_rest == 16'd0);
 		sb = (src.sz == SZ_L) ? 3'd4 : 3'd2;
 		an = areg(src.ea0.r, sp_reg);
+		// whether this transfer's register is An or the index register,
+		// from the mask's lowest set bit directly (not through the encoder
+		// and the register number: a timing path); the register numbers
+		// are one-to-one, so r == an exactly when rn is {1, An}
+		k_an  = pd ? (4'd15 - {1'b1, src.ea0.r}) : {1'b1, src.ea0.r};
+		k_x   = {src.ea0.xa, src.ea0.xr};
+		is_an = low[k_an];
+		is_x  = low[k_x];
 		// A load list that contains a register of the EA (the base, or the
 		// index of an indexed mode) works from a copy of the address in
 		// T11, and the loaded base/index commits only after the last
@@ -638,14 +658,14 @@ always_comb begin
 		nu.last = lastx && !fb_in && !fx_in;
 		if (uw.d == S_MVR) begin
 			nu.d_v = 1'b1; nu.d_reg = r;
-			if (fb_in && r == an)         nu.d_reg = R_T0 + 5'd7;
-			else if (fx_in && r == xreg)  nu.d_reg = R_T0 + 5'd6;
-			else if (pi && r == an)       nu.d_v   = 1'b0;
+			if (fb_in && is_an)           nu.d_reg = R_T0 + 5'd7;
+			else if (fx_in && !pd && is_x) nu.d_reg = R_T0 + 5'd6;
+			else if (pi && is_an)         nu.d_v   = 1'b0;
 		end
 		else begin
 			nu.a_src = OS_REG; nu.a_reg = r;
 			// -(An) storing An itself writes An - size (68020 and later)
-			if (pd && r == an) begin
+			if (pd && is_an) begin
 				nu.op = OP_SUB; nu.sz = SZ_L;
 				nu.a_src = OS_IMM; nu.imm = {29'd0, sb};
 				nu.b_src = OS_REG; nu.b_reg = an;
@@ -657,7 +677,7 @@ always_comb begin
 			logic fxb;
 			fxb = fb_in && mv_fix == 2'd0;
 			p = '0;
-			p.pc = nu.pc; p.npc = nu.npc; p.first = 1'b0;
+			p.pc = nu.pc; p.ilen = nu.ilen; p.exr = nu.exr; p.first = 1'b0;
 			p.op = OP_MOV; p.sz = SZ_L; p.ccr_we = 5'd0;
 			p.a_src = OS_REG; p.a_reg = fxb ? (R_T0 + 5'd7) : (R_T0 + 5'd6);
 			p.b_src = OS_ZERO;
@@ -671,7 +691,7 @@ always_comb begin
 			// first: T11 = the address, then the transfers from T11
 			uop_t p;
 			p = '0;
-			p.pc = nu.pc; p.npc = nu.npc; p.first = nu.first;
+			p.pc = nu.pc; p.ilen = nu.ilen; p.exr = nu.exr; p.first = nu.first;
 			p.ag = 1'b1;
 			p.base_v = nu.base_v; p.base = nu.base;
 			p.idx_v = nu.idx_v; p.idx = nu.idx; p.idx_l = nu.idx_l; p.scale = nu.scale;
@@ -746,7 +766,7 @@ always_comb begin
 	if (n_ptr) begin
 		uop_t p;
 		p = '0;
-		p.pc = nu.pc; p.npc = nu.npc; p.first = nu.first; p.last = 1'b0;
+		p.pc = nu.pc; p.ilen = nu.ilen; p.exr = nu.exr; p.first = nu.first; p.last = 1'b0;
 		p.op = OP_MOV; p.sz = SZ_L; p.msz = SZ_L; p.ccr_we = 5'd0;
 		p.a_src = OS_MEM; p.b_src = OS_ZERO;
 		p.ag = 1'b1;
@@ -766,12 +786,26 @@ end
 // sequencing.  uw_q is read one cycle ahead: the next address is chosen
 // from the current word and the records, and the ROM output registered.
 //--------------------------------------------------------------------------
-wire step = uw_v && room_out && !flush && !exc_go;
+wire step = uw_v && room_out && !flush && !exc_go && !exc_pend;
 wire emit = step && !n_jump;
 wire stay = n_ptr || n_mv_pre || (uw.loop && !nu.last);   // same word again
 wire done = emit && !stay && uw.last;                       // instruction ends
 
 assign rq_pop = done && !exc_mode;
+// The pop from the word's own bits and the record's EA modes, not the uop
+// built from them (D1's room, a timing path): a plain last word -- no
+// jump, no MOVEM loop -- of an instruction with no memory-indirect EA (no
+// pointer load) ends it whenever it steps.  It implies rq_pop; the rare
+// pop it misses only costs D1 a clock.
+assign rq_pop_e = step && !exc_mode && uw.last && (uw.jc == JC_NEVER) && !uw.loop &&
+                  (rq0.ea0.mi == 2'd0) && (rq0.ea1.mi == 2'd0);
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (rq_pop_e && !rq_pop) begin
+		$display("FAIL: useq: the early pop without the pop");
+		$finish;
+	end
+// synthesis translate_on
 
 logic [9:0] na;          // next microcode address
 logic       nv;
@@ -799,7 +833,7 @@ always_comb begin
 		else if (!exc_mode && rq_n[1]) na = rq1.rt;        // next instruction
 		else nv = 1'b0;
 	end
-	else if (!uw_v && !exc_mode && rq_n != 2'd0) begin
+	else if (!uw_v && !exc_mode && !exc_pend && rq_n != 2'd0) begin
 		na = rq0.rt;                                         // first word
 		nv = 1'b1;
 	end

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_predec.sv - predecode of one instruction queue word              //
 //                                                                          //

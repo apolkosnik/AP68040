@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_atc.sv - address translation cache (MC68040UM 3.3)                //
 //                                                                          //
@@ -19,6 +19,13 @@
 
 module ap68040_atc
 	import ap68040_pkg::*;
+#(
+	// an install looks for its page among the set's entries (a data
+	// access's M-bit update rewrites its own entry).  0: no copy for the
+	// search -- the caller says whether the page is there (wsame) and in
+	// which way (the hit vector of the lookup that started the search)
+	parameter bit SAME_SEARCH = 1
+)
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -29,12 +36,24 @@ module ap68040_atc
 	input  logic        fc2,
 	output logic        hit,
 	output atce_t       ent,
+	output logic  [3:0] hv,            // the hit way (one-hot), and every way's
+	output logic [19:0] wpa [4],       // physical page: a caller's tag compares
+	                                   // run against all four in parallel
+	// a second lookup port (the DMU's DC1: its own copy of the entries, so
+	// no address multiplexer in front of it): its set is given registered
+	input  logic [31:0] la_d,
+	input  logic        fc2_d,
+	input  logic  [3:0] set_d,
+	output logic  [3:0] hv_d,
+	output logic [19:0] wpa_d [4],
 
 	// install (one cycle)
 	input  logic        wr,
 	input  logic [31:0] wla,
 	input  logic        wfc2,
 	input  atce_t       went,
+	input  logic        wsame,         // (SAME_SEARCH 0) the page is in the set ...
+	input  logic  [3:0] wsame_hv,      // ... in this way (one-hot)
 
 	// flushes (one cycle each)
 	input  logic        flush_all,      // PFLUSHA / PFLUSHAN
@@ -59,6 +78,10 @@ wire [3:0] wset = p8k ? wla[16:13] : wla[15:12];
 
 slot_t s [4];
 slot_t ws [4];
+// synthesis translate_off
+logic [$bits(slot_t)-1:0] wqs [4];      // SAME_SEARCH 0: the simulation's copy
+// synthesis translate_on
+slot_t sd [4];
 
 genvar w;
 generate
@@ -68,12 +91,31 @@ generate
 			.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
 			.wdata({wfc2, wla[31:12], went}), .raddr(lset), .q(q)
 		);
-		ap68040_lutram #(.AW(4), .DW(SW)) ram_w (
+		if (SAME_SEARCH) begin : g_ws
+			ap68040_lutram #(.AW(4), .DW(SW)) ram_w (
+				.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
+				.wdata({wfc2, wla[31:12], went}), .raddr(wset), .q(wq)
+			);
+		end
+		else begin : g_nows
+			assign wq = '0;
+			// synthesis translate_off
+			// (the copy, in simulation only: an install that finds its page
+			// already there would duplicate it)
+			ap68040_lutram #(.AW(4), .DW(SW)) ram_ws (
+				.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
+				.wdata({wfc2, wla[31:12], went}), .raddr(wset), .q(wqs[w])
+			);
+			// synthesis translate_on
+		end
+		logic [SW-1:0] dq;
+		ap68040_lutram #(.AW(4), .DW(SW)) ram_d (
 			.clk(clk), .we(wr && wway == 2'(w)), .waddr(wset),
-			.wdata({wfc2, wla[31:12], went}), .raddr(wset), .q(wq)
+			.wdata({wfc2, wla[31:12], went}), .raddr(set_d), .q(dq)
 		);
 		assign s[w]  = q;
 		assign ws[w] = wq;
+		assign sd[w] = dq;
 	end
 endgenerate
 
@@ -82,7 +124,12 @@ function automatic logic tag_eq(input slot_t t, input logic [31:0] a, input logi
 	tag_eq = (t.fc2 == f2) && (t.lpn[19:1] == a[31:13]) && (p8 || (t.lpn[0] == a[12]));
 endfunction
 
-logic [3:0] hv;
+always_comb for (int i = 0; i < 4; i++) wpa[i] = s[i].e.pa;
+always_comb
+	for (int i = 0; i < 4; i++) begin
+		hv_d[i]  = v[set_d][i] && tag_eq(sd[i], la_d, fc2_d, p8k);
+		wpa_d[i] = sd[i].e.pa;
+	end
 always_comb begin
 	for (int i = 0; i < 4; i++) hv[i] = v[lset][i] && tag_eq(s[i], la, fc2, p8k);
 	hit = |hv;
@@ -105,14 +152,30 @@ always_comb begin
 	logic found;
 	found = 1'b0;
 	wway  = rr;
-	for (int i = 3; i >= 0; i--)
-		if (v[wset][i] && tag_eq(ws[i], wla, wfc2, p8k)) begin wway = 2'(i); found = 1'b1; end
+	if (SAME_SEARCH) begin
+		for (int i = 3; i >= 0; i--)
+			if (v[wset][i] && tag_eq(ws[i], wla, wfc2, p8k)) begin wway = 2'(i); found = 1'b1; end
+	end
+	else if (wsame) begin
+		found = 1'b1;
+		wway  = wsame_hv[3] ? 2'd3 : wsame_hv[2] ? 2'd2 : wsame_hv[1] ? 2'd1 : 2'd0;
+	end
 	if (!found) begin
-		logic fi;
-		fi = 1'b0;
-		for (int i = 3; i >= 0; i--) if (!v[wset][i]) begin wway = 2'(i); fi = 1'b1; end
+		for (int i = 3; i >= 0; i--) if (!v[wset][i]) wway = 2'(i);
 	end
 end
+
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (!SAME_SEARCH && wr)
+		for (int i = 0; i < 4; i++)
+			if ((v[wset][i] && tag_eq(slot_t'(wqs[i]), wla, wfc2, p8k)) != (wsame && wsame_hv[i])) begin
+				$display("FAIL: ATC: install of %h: the page %s way %0d, the caller says %b/%b",
+				         wla, (v[wset][i] && tag_eq(slot_t'(wqs[i]), wla, wfc2, p8k)) ? "is in" : "is not in",
+				         i, wsame, wsame_hv);
+				$finish;
+			end
+// synthesis translate_on
 
 // ATC entries survive RSTI (MC68040UM 3.6.1): only configuration clears them
 initial begin

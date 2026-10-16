@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_alu_slow.sv - EX-stage two-cycle integer unit: shifts and        //
 // rotates, BCD, PACK/UNPK.  Its outputs are registered by the back end     //
@@ -16,6 +16,8 @@ module ap68040_alu_slow
 	input  logic [31:0] a,
 	input  logic [31:0] b,
 	input  logic  [5:0] cnt,        // shift count: a[5:0], without a's mux
+	input  logic  [5:0] nx_q,       // ROXL/ROXR: the count mod (size + 1), registered
+	output logic  [5:0] nx,         // ... formed here from cnt (for that register)
 	input  logic  [4:0] flags_in,   // X N Z V C
 	output logic [31:0] res,
 	output logic  [4:0] flags_out
@@ -99,11 +101,14 @@ logic [65:0] rv, ro;
 logic  [6:0] ra;
 logic [65:0] lo;
 always_comb begin
-	logic [33:0] seg;
-	logic [33:0] therm;
+	logic [31:0] yv, tm;
+	logic        vl;
 	sh_n  = cnt;
 	sh_nm = sh_n & (nbits - 6'd1);
-	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider)
+	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider):
+	// formed here (nx), registered by the back end in a cycle of its own,
+	// and used from that register (nx_q) -- the subtractions stay off the
+	// shifter's path
 	sh_nx = sh_n;
 	case (nbits)
 		6'd8: begin
@@ -117,6 +122,8 @@ always_comb begin
 		end
 		default: if (sh_nx >= 6'd33) sh_nx = sh_nx - 6'd33;
 	endcase
+	nx    = sh_nx;
+	sh_nx = nx_q;
 	// the right funnel's input and count.  A rotate's input repeats its
 	// period P from bit 0 ({P, P}): shifted right by k (< the period), its
 	// low bits are P rotated right by k
@@ -147,20 +154,29 @@ always_comb begin
 			ra = (op == OP_ROXR) ? {1'b0, sh_nx}
 			                     : ((sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx}));
 		end
+		OP_ASL, OP_LSL: begin
+			// a left shift through the same funnel: the operand above 31
+			// zeros, shifted right by 31 - n (the count inverted, no
+			// subtraction), is the operand shifted left by n; n >= 32
+			// shifts everything out (C of a long shifted by 32: below)
+			rv = {3'd0, bm, 31'd0};
+			ra = sh_n[5] ? 7'd127 : {2'd0, ~sh_n[4:0]};
+		end
 		default: begin   // LSR
 			rv = {33'd0, bm, 1'b0};
 			ra = {1'b0, sh_n};
 		end
 	endcase
 	ro = (op == OP_ASR) ? 66'($signed(rv) >>> ra) : (rv >> ra);
-	lo = {34'd0, bm} << sh_n;
-	// ASL: the bits shifted out and the new sign bit must all be equal
-	case (sz)
-		SZ_B:    seg = lo[40:7];
-		SZ_W:    seg = lo[48:15];
-		default: seg = lo[64:31];
-	endcase
-	therm = (34'd2 << sh_n) - 34'd1;
+	lo = ro;                      // (ASL, LSL: the operand shifted left by n)
+	// ASL: V when the bits shifted out and the new sign bit are not all
+	// equal, i.e. the top count+1 bits of the operand (at the size) differ
+	// somewhere: an adjacent pair among them differs.  yv[i] = x[i] ^ x[i-1],
+	// tm marks the top count positions; no shifter on the path
+	yv = bm ^ {bm[30:0], 1'b0};
+	for (int i = 0; i < 32; i++)
+		tm[i] = (6'(i) < nbits) && ((nbits - 6'd1 - 6'(i)) < sh_n);
+	vl = (yv & tm) != 32'd0;
 	sh_r = bm;
 	sh_c = 1'b0;
 	sh_x = f_x;
@@ -169,10 +185,10 @@ always_comb begin
 		case (op)
 			OP_ASL, OP_LSL: begin
 				sh_r = lo[31:0] & szmask;
-				sh_c = (sh_n <= nbits) && lo[nbits];
+				sh_c = (sh_n <= nbits) && (sh_n[5] ? bm[0] : lo[nbits]);
 				sh_x = sh_c;
 				if (op == OP_ASL)
-					sh_v = (sh_n >= nbits) ? (bm != 0) : !((seg == 0) || (seg == therm));
+					sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
 			end
 			OP_LSR, OP_ASR: begin
 				sh_r = ro[32:1] & szmask;

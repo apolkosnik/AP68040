@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_decode.sv - D1: instruction parse                                 //
 //                                                                          //
@@ -57,6 +57,7 @@ module ap68040_decode
 	output dinst_t      rq0,
 	output dinst_t      rq1,
 	input  logic        rq_pop,
+	input  logic        rq_pop_e,       // implies rq_pop, early (room)
 
 	// Bcc history training (from EX)
 	input  logic        bht_we,
@@ -225,6 +226,12 @@ function automatic logic [2:0] fp_immlen(input logic [15:0] cmd);
 	endcase
 endfunction
 
+// the 68040's control registers: SFC DFC CACR TC ITT0 ITT1 DTT0 DTT1
+// ($000-$007), USP VBR MSP ISP MMUSR URP SRP ($800 $801, $803-$807: no CAAR)
+function automatic logic movec_ok(input logic [11:0] r);
+	movec_ok = (r[11:3] == 9'h000) || (r[11:3] == 9'h100 && r[2:0] != 3'd2);
+endfunction
+
 function automatic logic has_ext(input logic [3:0] i);
 	has_ext = (i != EM_NONE) && (i >= EM_AD16);
 endfunction
@@ -260,7 +267,6 @@ ph_t         ph;
 dinst_t      part;          // record under construction (slow path)
 pd_t         part_pd;
 logic  [3:0] part_len;      // words consumed so far
-dinst_t      rq2;           // third record (internal)
 logic  [2:0] part_imml;     // EA0 immediate length (slow path)
 logic        hold_redir;    // a predicted branch is redirecting fetch
 
@@ -277,6 +283,7 @@ wire        fast  = pd0.legal && !pd0.slow && !full0 && !full1 && (pd0.tot <= 4'
 // record assembly
 //--------------------------------------------------------------------------
 dinst_t      nrec;
+wire  [31:0] nrec_npc = nrec.pc + {27'd0, nrec.ilen, 1'b0};   // the next instruction
 logic        go;            // a record is produced
 logic        go_part;       // a slow-path phase completes (no record yet)
 logic  [3:0] use_n;
@@ -290,6 +297,14 @@ logic        flt;
 // faulting word's address (the format $7 fault address).
 logic  [7:0] f_code;
 logic [31:0] f_addr;
+// A faulted word in the queue is the last one fetch delivers until a
+// redirect (it waits in S_HALT), so an instruction that needs more words
+// than the queue holds is decoded with what is there: its words reach the
+// faulted one, and it takes the fault.  Waiting for the rest would wait
+// forever -- an opword fault at an address with A1 set queues ONE word,
+// shorter than the two-word instruction its zero word decodes as.
+wire   [8:0] q_mask = (9'd1 << qcnt) - 9'd1;
+wire         q_flt  = |(win_flt & q_mask[7:0]);
 always_comb begin
 	logic [2:0] fi;
 	fi = 3'd0;
@@ -365,24 +380,36 @@ ap68040_lutram #(.AW(8), .DW(2)) bht (
 // training counts from the table's current value (a copy read at the
 // training address), not from the value D1 read when it decoded the
 // branch: two passes of a short loop are often decoded before the first
-// one is trained
-// The update is written a cycle later from registers of its own (the read
-// address is not also the write address); a training of the same counter
-// in that cycle takes the value being written.
+// one is trained.  The copy is a block RAM: the training request is
+// registered with its read address, and the clock after it the counter is
+// read, updated and written to both copies.  A write in the clock the RAM
+// registered the read (the request just before, to the same counter) is
+// not in what it returns: that write's value is taken instead.
 logic  [1:0] bht_t, bht_c, bht_nd;
 logic        bw_we;
 logic  [7:0] bw_wa;
 logic  [1:0] bw_wd;
-ap68040_lutram #(.AW(8), .DW(2)) bht_tr (
+logic        tr_v, tr_dis;           // the training request, a clock on
+logic  [7:0] tr_a;
+logic        wq_v;                   // the write of the clock before
+logic  [7:0] wq_a;
+logic  [1:0] wq_d;
+ap68040_sdpr #(.AW(8), .DW(2)) bht_tr (
 	.clk(clk), .we(bw_we), .waddr(bw_wa), .wdata(bw_wd), .raddr(bht_wa), .q(bht_t)
 );
-assign bht_c  = (bw_we && bw_wa == bht_wa) ? bw_wd : bht_t;
-assign bht_nd = bht_dis ? ((bht_c == 2'd3) ? 2'd3 : bht_c + 2'd1)
-                        : ((bht_c == 2'd0) ? 2'd0 : bht_c - 2'd1);
+assign bht_c  = (wq_v && wq_a == tr_a) ? wq_d : bht_t;
+assign bht_nd = tr_dis ? ((bht_c == 2'd3) ? 2'd3 : bht_c + 2'd1)
+                       : ((bht_c == 2'd0) ? 2'd0 : bht_c - 2'd1);
+assign bw_we  = tr_v;
+assign bw_wa  = tr_a;
+assign bw_wd  = bht_nd;
 always_ff @(posedge clk) begin
-	bw_we <= nreset && bht_we;
-	bw_wa <= bht_wa;
-	bw_wd <= bht_nd;
+	tr_v   <= nreset && bht_we;
+	tr_a   <= bht_wa;
+	tr_dis <= bht_dis;
+	wq_v   <= bw_we;
+	wq_a   <= bw_wa;
+	wq_d   <= bw_wd;
 end
 // (a LUT RAM: one push, one read at the top and one at the pointer the
 // fetch resynchronizes to; never cleared -- an entry is read only below
@@ -449,8 +476,8 @@ always_comb begin
 		il = (ph == PH_EA0) ? part_imml : 3'd0;
 		l  = ea_len(i, win[0], il);
 		nrec = part;
-		if ({1'b0, l} <= qcnt) begin
-			use_n = {1'b0, l};
+		if ({1'b0, l} <= qcnt || q_flt) begin
+			use_n = ({1'b0, l} <= qcnt) ? {1'b0, l} : qcnt;   // (q_flt: what is queued)
 			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
 			begin
 				// (one instance for both phases: the same words and base)
@@ -474,7 +501,7 @@ always_comb begin
 				go  = 1'b1;
 				nph = PH_IDLE;
 			end
-			nrec.npc = part.pc + {27'd0, part_len + {1'b0, l}, 1'b0};
+			nrec.ilen = 4'(part_len + {1'b0, l});
 			if (flt) begin
 				nrec.exc    = f_code;
 				nrec.target = f_addr;
@@ -486,7 +513,7 @@ always_comb begin
 		// the stream starts at an odd address: address error
 		go       = 1'b1;
 		nrec.pc  = qpc;
-		nrec.npc = qpc;
+		nrec.ilen = 4'd0;
 		nrec.exc = 8'd3;
 		nrec.rt  = UA_DEC_EXC;
 	end
@@ -521,9 +548,9 @@ always_comb begin
 			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
 		else if (fast) begin
-			if (pd0.tot <= qcnt) begin
+			if (pd0.tot <= qcnt || q_flt) begin
 				go    = 1'b1;
-				use_n = pd0.tot;
+				use_n = (pd0.tot <= qcnt) ? pd0.tot : qcnt;
 				flt   = |(win_flt & ((9'd1 << pd0.tot) - 9'd1));
 				nrec.ea0 = mk_ea(pd0.i0, opw[2:0], {1'b0, fb},
 				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
@@ -534,14 +561,14 @@ always_comb begin
 				                 win[fp1], win[3'(fp1 + 1)], 16'd0, 16'd0, 16'd0);
 			end
 		end
-		else if ({1'b0, pd0.b} <= qcnt) begin
+		else if ({1'b0, pd0.b} <= qcnt || q_flt) begin
 			// slow path, first phase: operation word, fixed words, immediate;
 			// the EAs without extension words are complete already
 			nrec.ea0 = mk_ea(pd0.i0, opw[2:0], 4'd0, 3'd0, 32'd0,
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
 			nrec.ea1 = mk_ea(pd0.i1, opw[11:9], 4'd0, 3'd0, 32'd0,
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
-			use_n = {1'b0, pd0.b};
+			use_n = ({1'b0, pd0.b} <= qcnt) ? {1'b0, pd0.b} : qcnt;
 			flt   = |(win_flt & ((8'd1 << pd0.b) - 8'd1));
 			if (flt) begin
 				go = 1'b1;                   // stop at the faulted part
@@ -552,7 +579,7 @@ always_comb begin
 			end
 		end
 
-		nrec.npc = qpc + {27'd0, use_n, 1'b0};
+		nrec.ilen = use_n;
 		nrec.rt  = (jcond(a0.jc0, pd0.i0, pd0.i1, win[1], pd0.sz, opw[2:0])) ? a0.jt0 :
 		           (a0.jc0 != JC_NEVER) ? a0.rt + 10'd1 : a0.rt;
 		// fixed operand forms: (Ay)+,(Ax)+ and -(Ay),-(Ax); MOVE16
@@ -582,12 +609,11 @@ always_comb begin
 				nrec.exc = 8'd8;
 			else if (a0.rt == UA_TRAP)
 				nrec.exc = 8'd32 + {4'd0, opw[3:0]};
-			else if ((a0.rt == UA_MOVEC_RD || a0.rt == UA_MOVEC_WR) &&
-			         !((win[1][11:3] == 9'h000) ||
-			           (win[1][11:3] == 9'h100 && win[1][2:0] != 3'd2)))
-				// 68040 control registers: $000-$007 and $800-$807 except CAAR
+			// a control register number the 68040 does not have: illegal
+			// (MC68040UM 8.2.4)
+			else if ((a0.rt == UA_MOVEC_RD || a0.rt == UA_MOVEC_WR) && !movec_ok(win[1][11:0]))
 				nrec.exc = 8'd4;
-			else if (a0.rt == UA_ILLEGAL || a0.rt == UA_BKPT)
+			else if (a0.rt == UA_ILLEGAL)
 				nrec.exc = 8'd4;
 		end
 		if (flt) nrec.exc = f_code;
@@ -721,7 +747,9 @@ always_comb begin
 	ras_o    = ras_top[31:1];
 end
 
-wire room  = (rq_n != 2'd3);
+// (two records; a full FIFO has room in the clock the sequencer pops one,
+// or D1 would wait a clock behind every pop: 28% on Dhrystone)
+wire room  = (rq_n != 2'd2) || rq_pop_e;
 wire stall = flush || hold_redir || d_redir_v || !room;
 wire fire  = (go || go_part) && !stall;
 wire push  = fire && go;
@@ -804,7 +832,6 @@ always_ff @(posedge clk) begin
 		rq_n       <= 2'd0;
 		rq0        <= '0;
 		rq1        <= '0;
-		rq2        <= '0;
 		ph         <= PH_IDLE;
 		part       <= '0;
 		part_pd    <= '0;
@@ -854,7 +881,7 @@ always_ff @(posedge clk) begin
 		// cost the entry it overwrote -- the oldest, or one a recovery
 		// would restore -- which only costs a prediction: EX checks every
 		// return
-		if (rcall) ras[ras_tp + 3'd1] <= nrec.npc;
+		if (rcall) ras[ras_tp + 3'd1] <= nrec_npc;
 		if (push && nrec_q.exc == 8'd0) begin
 			if (rcall) begin
 				ras_tp <= ras_tp + 3'd1;
@@ -866,25 +893,17 @@ always_ff @(posedge clk) begin
 			end
 		end
 
-		// three records, so that D1 (which sees only the registered count)
-		// and D2 can both move one a cycle: D2 chains into rq1 while D1
-		// fills behind it
+		// two records
 		case ({push, pop})
-			2'b01: begin rq0 <= rq1; rq1 <= rq2; rq_n <= rq_n - 2'd1; end
+			2'b01: begin rq0 <= rq1; rq_n <= rq_n - 2'd1; end
 			2'b10: begin
-				case (rq_n)
-					2'd0:    rq0 <= nrec_q;
-					2'd1:    rq1 <= nrec_q;
-					default: rq2 <= nrec_q;
-				endcase
+				if (rq_n == 2'd0) rq0 <= nrec_q;
+				else              rq1 <= nrec_q;
 				rq_n <= rq_n + 2'd1;
 			end
 			2'b11: begin
-				case (rq_n)
-					2'd1:    rq0 <= nrec_q;
-					2'd2:    begin rq0 <= rq1; rq1 <= nrec_q; end
-					default: begin rq0 <= rq1; rq1 <= rq2; rq2 <= nrec_q; end
-				endcase
+				if (rq_n == 2'd1) rq0 <= nrec_q;
+				else begin rq0 <= rq1; rq1 <= nrec_q; end
 			end
 			default: ;
 		endcase
@@ -909,7 +928,7 @@ always_ff @(posedge clk) begin
 				// the fetch already took this branch: fine if D1 agrees
 				if (!(nrec.pred && teq)) begin
 					d_redir_v  <= 1'b1;
-					d_redir_pc <= nrec.pred ? ntarget : nrec.npc;
+					d_redir_pc <= nrec.pred ? ntarget : nrec_npc;
 					// (a loop exit keeps the entry: the next pass takes it)
 					btb_we     <= !lp_ovr;
 					btb_wv     <= nrec.pred && btb_ok;

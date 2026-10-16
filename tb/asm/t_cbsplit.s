@@ -402,6 +402,9 @@ ucont:
 .s5:
 
 ;----------------------------- 30 write-only operations do not read
+	cpusha	dc			; (a dirty BUF line would be pushed by the
+					; first cache-inhibited write that hits it,
+					; MC68040UM 4.6.2: pushes are counted too)
 	bsr	arm			; supervisor data: noncachable (DTT1)
 	clr.l	(BUF).l
 	clr.w	(BUF+4).l

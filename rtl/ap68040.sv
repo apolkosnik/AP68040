@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                               //
 //                                                                          //
 // ap68040.sv - top level: the 68040 bus (MC68040UM section 7)               //
 //                                                                          //
@@ -16,9 +16,12 @@ module ap68040
 #(
 	parameter logic [7:0] FPU_REVISION = 8'h41,  // FSAVE frames: $41, or $40 (44-byte UNIMP)
 	// area options (doc/STATUS.md has what each costs in ALMs and cycles)
-	parameter bit         FPU_PIPE     = 1,      // the FPU's arithmetic pipeline (0: the state machine alone)
-	parameter bit         LOOP_PRED    = 1,      // D1's loop exit predictor
-	parameter bit         EARLY_RES    = 1       // AG's early results for younger uops' base and index
+	parameter bit         FPU_PIPE     = 0,      // the FPU's arithmetic pipeline (0: the state machine alone)
+	parameter bit         LOOP_PRED    = 0,      // D1's loop exit predictor
+	parameter bit         EARLY_RES    = 0,      // AG's early results for younger uops' base and index
+	parameter bit         DC1_ATC      = 0,      // DC1's own ATC port and tag compare (timing)
+	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
+	parameter int         DIV_STEPS    = 4       // divide steps per cycle (4 or 2)
 )(
 
 	input  logic        clk,
@@ -73,10 +76,17 @@ module ap68040
 	output logic        dbg_halted
 );
 
-// reset synchronizer
-logic [1:0] rst_q;
-always_ff @(posedge clk) rst_q <= {rst_q[0], rsti_n};
-wire nreset = rst_q[1];
+// reset synchronizer: two bus clocks, so the reset and the release of the
+// bus pins it begins start on a bus clock edge.  Once RSTI negates the
+// processor stays in reset for another 128 bus clocks (MC68040UM 7.10.1).
+logic [1:0] rst_q = 2'b00;
+logic [7:0] rst_hold = 8'd128;
+always_ff @(posedge clk) begin
+	if (bclk_en) rst_q <= {rst_q[0], rsti_n};
+	if (!rst_q[1])                         rst_hold <= 8'd128;
+	else if (bclk_en && rst_hold != 8'd0)  rst_hold <= rst_hold - 8'd1;
+end
+wire nreset = rst_q[1] && (rst_hold == 8'd0);
 
 // CDIS and MDIS act at the next internal boundary: two bus-clock samples
 // (the multiplexed bus mode CDIS selects at reset is not provided)
@@ -114,12 +124,17 @@ always_ff @(posedge clk) begin
 	end
 end
 
-// interrupt level synchronizer (two bus-clock samples)
-logic [2:0] ipl_s1, ipl_s2;
+// interrupt level synchronizer: IPL2-IPL0 are sampled on consecutive bus
+// clock edges, and a level is valid once two consecutive samples agree
+// (MC68040UM 7.8.1: "held constant for two consecutive clock periods")
+// -- the three pins settle at different times when the level changes, so
+// a single sample can show a level no device raised
+logic [2:0] ipl_s1 = 3'd0, ipl_s2 = 3'd0, ipl_v = 3'd0;
 always_ff @(posedge clk)
 	if (bclk_en) begin
 		ipl_s1 <= ~ipl_n;
 		ipl_s2 <= ipl_s1;
+		if (ipl_s1 == ipl_s2) ipl_v <= ipl_s2;
 	end
 
 //--------------------------------------------------------------------------
@@ -140,14 +155,17 @@ logic          b_ravec, b_rtci;
 logic  [1:0]   b_errbeat;
 logic          b_idle;
 logic          rsto_req, rsto_busy;
+logic          be_fstop;
+logic          b_drop;
 
 ap68040_biu #(.NC(NC)) biu (
 	.clk(clk), .nreset(nreset), .bclk_en(bclk_en),
-	.req(b_req), .breq(b_breq), .wdata(b_wdata),
+	// (client 1, the fetch, is held while stopped, halted or resetting)
+	.req(b_req & ~{be_fstop || rsto_busy, 1'b0}), .breq(b_breq), .wdata(b_wdata),
 	.gnt(b_gnt), .done(b_done), .err(b_err),
 	.rvalid(b_rvalid), .rclient(b_rclient), .rdata(b_rdata), .rbeat(b_rbeat),
 	.ravec(b_ravec), .rtci(b_rtci), .errbeat(b_errbeat), .idle(b_idle), .own(b_own),
-	.unlock(kill_now),
+	.unlock(lk_abandon), .halt(dbg_halted), .more({1'b0, 1'b0}), .drop({1'b0, b_drop}),
 	.rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.a_o(a_o), .a_oe(a_oe), .d_i(d_i), .d_o(b_d_o), .d_oe(b_d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
@@ -188,22 +206,23 @@ assign d_oe = sn_d_oe || b_d_oe;
 //--------------------------------------------------------------------------
 logic        redir_v, flush, fe_flush;
 logic [31:0] redir_pc;
-logic        exc_go;
+logic        exc_go, exc_pend;
 logic  [3:0] exc_kind;
 logic  [4:0] exc_ssp;
 logic        ucond_v, ucond;
 logic [15:0] sr;
 logic [31:0] vbr, cacr;
 logic  [2:0] sfc, dfc;
-logic        kill_now, adv_ag;
+logic        kill_now, adv_ag, lk_abandon;
 logic [31:0] dtt0, dtt1, itt0, itt1, tc;
 logic        q_odd;
-logic        dm_hold1, mt_v, mt_ng, mt_wr, mt_done;
+logic        dm_hold1, mt_v, mt_ng, mt_wr, mt_done, mt_fault;
 logic  [2:0] mt_op, mt_fc;
 logic  [1:0] mt_scope, mt_caches;
-logic [31:0] mt_addr, mt_mmusr, urp, srp, dm_st_faddr;
+logic [31:0] mt_addr, mt_mmusr, mt_faddr, urp, srp, dm_st_faddr;
+logic [15:0] mt_fssw;
 logic  [2:0] iack_lvl;
-logic        dm_iack;
+logic  [1:0] dm_ack;
 
 logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
@@ -225,16 +244,17 @@ logic  [1:0] uq_n;
 uop_t        uq0;
 logic        uo_rdy;
 
-ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES)) be (
+ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES),
+                  .SKID(SKID), .DIV_STEPS(DIV_STEPS)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
-	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
+	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .dm_older(dm_older),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
@@ -246,19 +266,20 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.dm_st_fault(dm_st_fault), .dm_st_fssw(dm_st_fssw),
 	.dm_hold1(dm_hold1), .mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope),
 	.mt_caches(mt_caches), .mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng),
-	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .dm_st_faddr(dm_st_faddr),
+	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault),
+	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .dm_st_faddr(dm_st_faddr),
 	.urp(urp), .srp(srp),
-	.ipl(ipl_s2), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
-	.kill_now(kill_now), .adv_ag(adv_ag),
+	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
+	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted), .fetch_stop(be_fstop)
 );
 
-ap68040_dmu dmu (
+ap68040_dmu #(.DC1_ATC(DC1_ATC)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
-	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_iack(dm_iack), .iack_lvl(iack_lvl),
+	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
 	.dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
@@ -268,7 +289,8 @@ ap68040_dmu dmu (
 	.st_fault(dm_st_fault), .st_fssw(dm_st_fssw), .st_faddr(dm_st_faddr),
 	.mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope), .mt_caches(mt_caches),
 	.mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng), .mt_wr(mt_wr),
-	.mt_done(mt_done), .mt_mmusr(mt_mmusr),
+	.mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault), .mt_fssw(mt_fssw),
+	.mt_faddr(mt_faddr),
 	.cacr(cacr), .tc(tc), .urp(urp), .srp(srp),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1),
 	.cdis(cdis), .mdis(mdis), .tw_busy(tw_busy),
@@ -280,7 +302,7 @@ ap68040_dmu dmu (
 	.iatc_flush_fc2(iatc_flush_fc2), .iatc_wr(iatc_wr), .iatc_wla(iatc_wla),
 	.iatc_wfc2(iatc_wfc2), .iatc_went(iatc_went),
 	.b_req(b_req[0]), .b_breq(b_breq[0]), .b_wdata(b_wdata[0]),
-	.b_gnt(b_gnt[0]), .b_done(b_done[0]), .b_err(b_err[0]),
+	.b_gnt(b_gnt[0]), .b_done(b_done[0]), .b_err(b_err[0]), .b_drop(b_drop),
 	.b_rvalid(b_rvalid && b_rclient == 1'b0), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
 	.b_ravec(b_ravec), .b_rtci(b_rtci),
 	.sn_req(sn_req), .sn_pa(sn_pa), .sn_look(sn_look), .sn_hit(sn_hit),
@@ -323,13 +345,14 @@ logic        d_redir_v;
 logic [31:0] d_redir_pc;
 logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
-logic        rq_pop;
+logic        rq_pop, rq_pop_e;
 
 ap68040_fetch fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
-	.stop(1'b0), .smode(sr[13]),
+	// no fetches while stopped or halted, nor while RSTO is asserted
+	.stop(be_fstop || rsto_busy), .smode(sr[13]),
 	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1), .cdis(cdis), .mdis(mdis),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
@@ -362,7 +385,7 @@ ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
 	.pd0(pd0), .pd0_n(pd0_n), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
-	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
+	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
@@ -372,9 +395,9 @@ ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
 
 ap68040_useq useq (
 	.clk(clk), .nreset(nreset), .flush(fe_flush),
-	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop),
+	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
 	.smode(sr[13]), .master(sr[12]),
-	.exc_go(exc_go), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
+	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.uq_n(uq_n), .uq0(uq0), .uq_pop(uo_rdy && uq_n != 2'd0)
 );
 

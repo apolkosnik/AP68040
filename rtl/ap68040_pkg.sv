@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_pkg.sv - shared types and encodings                               //
 //--------------------------------------------------------------------------//
@@ -101,6 +101,7 @@ localparam logic [2:0] MFC_DFC  = 3'd2;  // MOVES write
 localparam logic [2:0] MFC_SUP  = 3'd3;  // supervisor data (exception stacking)
 localparam logic [2:0] MFC_IACK = 3'd4;  // interrupt acknowledge (TT=3)
 localparam logic [2:0] MFC_EAP  = 3'd5;  // microcode: the EA's space (D2 maps it)
+localparam logic [2:0] MFC_BKPT = 3'd6;  // breakpoint acknowledge read (TT=3, TM=0, A=0)
 
 // control flow
 // internal exception codes of instruction fetch faults (uop.exc); real
@@ -202,7 +203,7 @@ typedef struct packed {
 
 typedef struct packed {
 	logic [31:0] pc;        // address of the 68040 instruction
-	logic [31:0] npc;       // address of the next sequential instruction
+	logic  [3:0] ilen;     // the instruction's length in words (npc = pc + 2 ilen)
 	ras_snap_t   ras;       // see ras_snap_t
 	logic        first;     // first uop of the instruction
 	logic        last;      // last uop: the instruction completes with it
@@ -255,6 +256,8 @@ typedef struct packed {
 	logic  [1:0] bhc;       // D1 read (trained in EX)
 	// exceptions and control
 	logic  [7:0] exc;       // decode-time exception vector, 0 = none
+	logic        exr;        // an exception routine's uop: pc/npc are not an
+	                        // instruction's (never refetched from them)
 	logic        ser;       // serialize: flush and refetch npc after WB
 	logic        t0cof;     // the instruction is on the 68040 T0 trace list
 	logic        b_upd;     // operand B is this uop's own (An)+/-(An) register:
@@ -307,7 +310,7 @@ typedef struct packed {
 
 typedef struct packed {
 	logic [31:0] pc;
-	logic [31:0] npc;
+	logic  [3:0] ilen;     // the instruction's length in words (npc = pc + 2 ilen)
 	logic [15:0] opw;
 	logic [15:0] ext1;
 	logic [15:0] ext2;

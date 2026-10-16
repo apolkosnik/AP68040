@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                               //
 //                                                                          //
 // ap68040_biu.sv - bus interface unit (MC68040UM section 7)                 //
 //                                                                          //
@@ -10,14 +10,24 @@
 //     three long-word transfers (7.4.2, 7.4.4); A3:A2 of a burst are       //
 //     incremented by the slave and wrap inside the line                   //
 //   * TA+TEA retry of a byte/word/long transfer and of the first beat of  //
-//     a line; a retry on a later beat is a bus error (7.6.2)              //
+//     a line; a retry on a later beat is a bus error (7.6.2).  A retry    //
+//     with BG negated gives the bus up first and reruns the transfer once //
+//     the bus is back (7.6.2, figure 7-33); a locked sequence keeps the   //
+//     bus through its retries (7.6.2)                                      //
 //   * TEA bus error, reported with the beat it hit (7.6.1)                //
-//   * locked sequences: the arbiter stays with the locking requester       //
-//     from its first LOCK transfer until the LOCKE transfer completes      //
-//   * bus arbitration BR/BG/BB (7.8): ownership is taken when BG is        //
-//     asserted and BB is free; a negated BG gives the bus up at the end   //
-//     of the transfer in progress, unless a locked sequence is open        //
-//   * RSTO for 512 bus clocks (RESET instruction, 7.10)                    //
+//   * locked sequences (7.4.1): LOCK from the first locked transfer to    //
+//     the end of the LOCKE transfer, the arbiter staying with the locking //
+//     requester; a bus error on a locked transfer, or the processor       //
+//     abandoning the sequence (unlock: an exception), ends it             //
+//   * bus arbitration BR/BG/BB (7.8): BR is asserted while an internal    //
+//     request is pending and negated as the last one needed starts        //
+//     (7.8.1); ownership is taken when BG is asserted and BB is free; a   //
+//     negated BG gives the bus up at the end of the transfer in progress, //
+//     unless a locked sequence is open                                     //
+//   * RSTO for 512 bus clocks (RESET instruction, 7.10), from the end of  //
+//     the transfer in progress                                            //
+//   * a halted processor (double bus fault, 8.2.1) starts no bus cycle:   //
+//     a retry waiting then ends in error, and BR is negated (7.6.2)       //
 //                                                                          //
 // Every bus output is a flip-flop that changes only in a clk cycle with    //
 // bclk_en high; inputs are sampled only in such cycles.                    //
@@ -34,6 +44,9 @@
 //               which long word of a line (0 = the first transferred)      //
 //   tci         TCI sampled with the first beat, valid with the first      //
 //               rvalid                                                     //
+//   more[c]     another transfer of the client waits behind this one (BR) //
+//   drop[c]     a retry waiting for the bus is not wanted any more (a     //
+//               push whose line a snoop took): done, not rerun            //
 // Line write data: wdata[c][127:96] is the long word at A3:A2 = 0, ...,    //
 // wdata[c][31:0] at A3:A2 = 3.  Single writes take wdata[c][31:0] already  //
 // placed on the byte lanes D31-D0.                                         //
@@ -66,11 +79,14 @@ module ap68040_biu
 	output logic              idle,     // no transaction latched or running
 	output logic              own,      // we are the bus master (BB ours)
 
-	input  logic              unlock,   // abandon an open locked sequence
+	input  logic              unlock,   // the processor abandons an open locked sequence
+	input  logic              halt,     // the processor halted: no bus cycle, BR negated
+	input  logic [NC-1:0]     more,     // another transfer of the client waits behind this one
+	input  logic [NC-1:0]     drop,     // a retry waiting for the bus is not wanted any more
 
 	// RESET instruction
 	input  logic              rsto_req,  // pulse
-	output logic              rsto_busy,
+	output logic              rsto_busy, // RSTO asserted, or waiting for the transfer to end
 
 	// 68040 bus
 	output logic [31:0]       a_o,
@@ -108,7 +124,8 @@ typedef enum logic [2:0] {
 	S_IDLE,     // owner (or not), no transfer
 	S_C1,       // TS asserted this bus clock
 	S_DATA,     // waiting for TA/TEA, burst beats
-	S_GAP       // a burst-inhibited line restarts the next long word
+	S_GAP,      // a burst-inhibited line restarts the next long word
+	S_RETRY     // a retry with the bus given up: rerun once it is back
 } state_t;
 
 state_t      st;
@@ -155,15 +172,23 @@ endfunction
 
 wire  [1:0] cur_a32  = cur.addr[3:2] + beat;   // long word now on the bus
 wire        is_line  = (cur.siz == SIZ_LINE);
+wire        first    = (beat == 2'd0) && !inhibited;
 wire        ta       = !ta_n;
 wire        tea      = !tea_n;
+// the termination this bus clock (table 7-5): TA normal, TEA bus error,
+// TA with TEA a retry (a bus error after the first beat of a line)
+wire        t_err    = tea && !(ta && first);
+wire        t_retry  = tea && ta && first;
+wire        t_ok     = ta && !tea;
 
-// ownership: BG asserted and the bus free, or already ours and BG still
-// asserted (or a locked sequence open: it keeps the bus)
-wire        can_own  = (owner && (!bg_n || locked)) || (!bg_n && bb_n_i);
+// keep the bus: BG asserted, or a locked sequence open (it keeps the bus
+// through its retries too, 7.6.2)
+wire        keep_bus = !bg_n || locked;
+// ownership: already ours and kept, or BG asserted and the bus free
+wire        can_own  = (owner && keep_bus) || (!bg_n && bb_n_i);
 
 logic [9:0] rsto_cnt;
-logic       rsto_pend;   // a RESET request waiting for a bus clock
+logic       rsto_pend;   // RESET: RSTO once the transfer in progress ends
 logic       unlock_pend;
 
 always_ff @(posedge clk) begin
@@ -213,64 +238,65 @@ always_ff @(posedge clk) begin
 	else begin
 		if (rsto_req) rsto_pend <= 1'b1;
 		if (unlock) unlock_pend <= 1'b1;
-		if ((unlock || unlock_pend) && st == S_IDLE) begin
+		if ((unlock || unlock_pend) && (st == S_IDLE || st == S_RETRY)) begin
+			// an abandoned locked sequence: LOCK and LOCKE go too (the pins
+			// change on a bus clock edge: wait for one)
 			locked      <= 1'b0;
 			unlock_pend <= 1'b0;
+			if (bclk_en) begin lock_n <= 1'b1; locke_n <= 1'b1; end
+			else unlock_pend <= 1'b1;
 		end
 		if (bclk_en) begin
+			logic start, lk_now;
+			start  = 1'b0;
+			// the sequence stays open for a transfer starting now unless the
+			// processor has just abandoned it
+			lk_now = locked && !unlock && !unlock_pend;
+
 			// RESET instruction: RSTO for 512 bus clocks
 			if (rsto_cnt != 0) begin
 				rsto_cnt <= rsto_cnt - 1'd1;
 				if (rsto_cnt == 10'd1) rsto_n <= 1'b1;
 			end
 
-			// bus request: asserted while there is work and the bus is
-			// not ours; negated once we own it
-			br_n <= !((pick_v || st != S_IDLE) && !owner);
-
 			case (st)
-			S_IDLE: begin
+			S_IDLE, S_RETRY: begin
 				ts_n <= 1'b1;
-				if (pick_v && can_own) begin
-					// start a transfer
-					owner   <= 1'b1;
-					bb_n_o  <= 1'b0;
-					bb_oe   <= 1'b1;
-					cur     <= breq[pick_c];
-					cur_c   <= pick_c;
-					gnt[pick_c] <= 1'b1;
-					beat    <= 2'd0;
-					inhibited <= 1'b0;
-					if (breq[pick_c].lock) begin
-						locked <= !breq[pick_c].locke;
-						lock_c <= pick_c;
+				if (st == S_RETRY && drop[cur_c]) begin
+					st <= S_IDLE;
+					done[cur_c] <= 1'b1;
+					finish_cycle();
+				end
+				else if (st == S_RETRY && halt) begin
+					// halted: no bus cycle is rerun
+					st <= S_IDLE;
+					err[cur_c] <= 1'b1;
+					errbeat    <= 2'd0;
+					finish_cycle();
+				end
+				else if ((pick_v || st == S_RETRY) && !halt && can_own) begin
+					start = 1'b1;
+					if (st == S_IDLE) begin
+						cur   <= breq[pick_c];
+						cur_c <= pick_c;
+						gnt[pick_c] <= 1'b1;
+						// a locked transfer opens or continues the sequence;
+						// the LOCKE transfer keeps it until it terminates
+						// normally (finish_cycle), so its retry holds the bus
+						if (breq[pick_c].lock) begin
+							locked <= 1'b1;
+							lock_c <= pick_c;
+						end
 					end
-					a_o     <= breq[pick_c].addr;
-					a_oe    <= 1'b1;
-					rw_n    <= breq[pick_c].rd;
-					siz     <= breq[pick_c].siz;
-					tt      <= breq[pick_c].tt;
-					tm      <= breq[pick_c].tm;
-					tln     <= breq[pick_c].tln;
-					upa     <= breq[pick_c].upa;
-					ciout_n <= !breq[pick_c].ci;
-					lock_n  <= !breq[pick_c].lock;
-					locke_n <= !(breq[pick_c].lock && breq[pick_c].locke);
-					d_o     <= (breq[pick_c].siz == SIZ_LINE) ?
-					           line_word(wdata[pick_c], breq[pick_c].addr[3:2]) :
-					           wdata[pick_c][31:0];
-					d_oe    <= !breq[pick_c].rd;
-					ts_n    <= 1'b0;
-					tip_n   <= 1'b0;
-					st      <= S_C1;
 				end
 				else begin
 					tip_n <= 1'b1;
 					d_oe  <= 1'b0;
-					// keep driving the bus only while we own it
-					if (owner && bg_n && !locked) begin
+					// keep driving the bus only while we own it: BB is driven
+					// negated for one bus clock, then released with the rest
+					if (owner && (!keep_bus || halt)) begin
 						owner  <= 1'b0;
-						bb_n_o <= 1'b1;   // negate, then release next clock
+						bb_n_o <= 1'b1;
 					end
 					else if (!owner) begin
 						bb_oe <= 1'b0;
@@ -290,57 +316,70 @@ always_ff @(posedge clk) begin
 				siz   <= SIZ_L;
 				d_o   <= line_word(cur_wd, cur_a32);
 				ts_n  <= 1'b0;
+				tip_n <= 1'b0;
 				st    <= S_C1;
 			end
 
 			S_DATA: begin
-				if (ta && tea) begin
-					// retry: legal on a single transfer and on the first
-					// beat of a line, otherwise a bus error
-					if (beat == 2'd0 && !inhibited) begin
-						ts_n <= 1'b0;
-						st   <= S_C1;
-					end
-					else begin
-						err[cur_c] <= 1'b1;
-						errbeat    <= beat;
-						locked     <= locked && !cur.locke;
-						d_oe       <= 1'b0;
-						st         <= S_IDLE;
-					end
-				end
-				else if (tea) begin
+				if (t_err) begin
 					err[cur_c] <= 1'b1;
 					errbeat    <= beat;
-					// a bus error ends a locked sequence: the requester
-					// takes an access error and will not complete it
-					locked     <= 1'b0;
+					// a bus error on a locked transfer ends the sequence: the
+					// requester takes an access error and will not complete it
+					if (cur.lock) begin
+						locked  <= 1'b0;
+						lock_n  <= 1'b1;
+						locke_n <= 1'b1;
+					end
 					d_oe       <= 1'b0;
 					st         <= S_IDLE;
+					finish_cycle();
 				end
-				else if (ta) begin
+				else if (t_retry) begin
+					// rerun the transfer from its start; with BG negated (and
+					// no locked sequence open) the bus goes first.  A halted
+					// processor starts no bus cycle: the transfer ends in
+					// error instead (a prefetch nobody uses)
+					if (halt) begin
+						err[cur_c] <= 1'b1;
+						errbeat    <= beat;
+						d_oe       <= 1'b0;
+						st         <= S_IDLE;
+						finish_cycle();
+					end
+					else if (!keep_bus) begin
+						d_oe <= 1'b0;
+						st   <= S_RETRY;
+					end
+					else begin
+						a_o   <= cur.addr;
+						d_o   <= (cur.siz == SIZ_LINE) ? line_word(cur_wd, cur.addr[3:2]) : cur_wd[31:0];
+						ts_n  <= 1'b0;
+						st    <= S_C1;
+					end
+				end
+				else if (t_ok) begin
 					if (cur.rd) begin
 						rvalid  <= 1'b1;
 						rclient <= cur_c;
 						rdata   <= d_i;
 						rbeat   <= cur_a32;
 						ravec   <= !avec_n;
-						if (beat == 2'd0) rtci <= !tci_n;
+						if (beat == 2'd0 && !inhibited) rtci <= !tci_n;
 					end
 					if (!is_line || beat == 2'd3) begin
 						done[cur_c] <= 1'b1;
-						if (cur.lock && cur.locke) locked <= 1'b0;
 						d_oe <= 1'b0;
 						st   <= S_IDLE;
+						finish_cycle();
 					end
 					else begin
 						beat <= beat + 1'd1;
-						if (beat == 2'd0 && !tbi_n) begin
+						if ((beat == 2'd0 && !inhibited && !tbi_n) || inhibited) begin
+							// TBI with the first TA: the rest as long-word
+							// transfers (7.4.2, 7.4.4)
 							inhibited <= 1'b1;
 							st        <= S_GAP;
-						end
-						else if (inhibited) begin
-							st <= S_GAP;
 						end
 						else begin
 							// burst: the slave advances A3:A2
@@ -353,14 +392,67 @@ always_ff @(posedge clk) begin
 			default: st <= S_IDLE;
 			endcase
 
-			if (rsto_req || rsto_pend) begin
+			if (start) begin
+				// drive the transfer (S_IDLE: the request picked; S_RETRY: cur)
+				busreq_t r;
+				logic [127:0] w;
+				r = (st == S_RETRY) ? cur : breq[pick_c];
+				w = (st == S_RETRY) ? cur_wd : wdata[pick_c];
+				owner     <= 1'b1;
+				bb_n_o    <= 1'b0;
+				bb_oe     <= 1'b1;
+				beat      <= 2'd0;
+				inhibited <= 1'b0;
+				a_o       <= r.addr;
+				a_oe      <= 1'b1;
+				rw_n      <= r.rd;
+				siz       <= r.siz;
+				tt        <= r.tt;
+				tm        <= r.tm;
+				tln       <= r.tln;
+				upa       <= r.upa;
+				// (an acknowledge cycle -- interrupt, breakpoint -- has CIOUT
+				// negated, 7.5.1, 7.5.2)
+				ciout_n   <= !r.ci || (r.tt == TT_ACK);
+				lock_n    <= !(r.lock || lk_now);
+				locke_n   <= !(r.lock && r.locke);
+				d_o       <= (r.siz == SIZ_LINE) ? line_word(w, r.addr[3:2]) : w[31:0];
+				d_oe      <= !r.rd;
+				ts_n      <= 1'b0;
+				tip_n     <= 1'b0;
+				st        <= S_C1;
+			end
+
+			// RESET: RSTO once no transfer is in progress or starting (the
+			// fetch is held from the request on)
+			if (rsto_pend && st == S_IDLE && !start) begin
+				rsto_pend <= 1'b0;
 				rsto_n    <= 1'b0;
 				rsto_cnt  <= 10'd512;
-				rsto_pend <= 1'b0;
+			end
+
+			// BR (7.8.1): asserted while an internal request waits to start,
+			// whoever owns the bus, and negated with the TS of the last one
+			// needed; negated while halted
+			begin
+				logic [NC-1:0] pend;
+				pend = (req & ~gnt) | more;      // (a request lasts a clock past its grant)
+				if (start && st == S_IDLE) pend[pick_c] = 1'b0;
+				br_n <= halt || !((|pend) || (st == S_RETRY && !start && !drop[cur_c]));
 			end
 		end
 	end
 end
+
+// a transfer ended (normally or with a bus error): LOCK/LOCKE negate after
+// the LOCKE transfer
+task automatic finish_cycle();
+	if (cur.lock && cur.locke) begin
+		locked  <= 1'b0;
+		lock_n  <= 1'b1;
+		locke_n <= 1'b1;
+	end
+endtask
 
 assign idle      = (st == S_IDLE);
 assign own       = owner;

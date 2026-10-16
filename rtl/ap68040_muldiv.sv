@@ -5,14 +5,15 @@
 // ap040_muldiv.v, which the cputest corpus validated)                       //
 //                                                                          //
 // MUL: 32x32 -> 64, signed or unsigned, one registered DSP product         //
-// DIV: 64/32 -> q32,r32 restoring, 4 bits per cycle; ovf when the true     //
+// DIV: 64/32 -> q32,r32 restoring, DSTEPS bits per cycle; ovf when the true//
 //      quotient does not fit 32 bits.  Signed quotients truncate toward    //
 //      zero, the remainder takes the dividend's sign.                       //
 // kill abandons a running operation (pipeline flush).                       //
 //--------------------------------------------------------------------------//
 
-module ap68040_muldiv
-(
+module ap68040_muldiv #(
+	parameter int DSTEPS = 4          // divide steps (quotient bits) per cycle: 4 or 2
+) (
 	input             clk,
 	input             nreset,
 	input             kill,
@@ -64,7 +65,8 @@ function [96:0] div_step;
 	end
 endfunction
 
-wire [96:0] div4 = div_step(div_step(div_step(div_step(acc, den), den), den), den);
+wire [96:0] div4 = (DSTEPS == 4) ? div_step(div_step(div_step(div_step(acc, den), den), den), den)
+                                 : div_step(div_step(acc, den), den);
 
 wire [63:0] q_raw = div_r ? acc[63:0] : prod;
 wire [31:0] r_raw = acc[95:64];
@@ -99,7 +101,7 @@ always @(posedge clk) begin
 			if (is_div) begin
 				den   <= abs_a;
 				acc   <= {33'd0, abs_d};
-				count <= 7'd16;
+				count <= 7'(64 / DSTEPS);
 				neg_q <= sign_op && (op_hi[31] ^ op_a[31]);
 				neg_r <= sign_op && op_hi[31];
 			end

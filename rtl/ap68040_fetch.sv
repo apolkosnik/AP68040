@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_fetch.sv - instruction fetch: I-ATC, instruction cache and the   //
 // instruction queue                                                        //
@@ -14,7 +14,8 @@
 // I-ATC (3.3): 64 entries like the D-ATC, translating supervisor and user //
 // program space; ITT0/ITT1 transparent translation.  An ATC miss asks the //
 // DMU's engine for a table walk; the walk installs the entry here         //
-// (iatc_wr) and the fetch looks again.                                    //
+// (iatc_wr) -- a failed search too, as a nonresident entry (3.3) -- and   //
+// the fetch looks again.                                                   //
 //                                                                          //
 // Pipeline, one aligned long word (two words) per cycle -- D1 decodes at  //
 // most one instruction a cycle, and the queue absorbs long ones:         //
@@ -126,7 +127,7 @@ module ap68040_fetch
 	input  logic        b_rtci
 );
 
-localparam int QN = 12;          // 16 measured no faster
+localparam int QN = 8;            // (12: about 2% faster, 100 ALMs more)
 
 wire tc_e  = tc[15] && !mdis;
 wire tc_p  = tc[14];
@@ -250,12 +251,14 @@ logic  [2:0] fras_tp;
 logic  [3:0] fras_n;
 logic        atc_hit;
 atce_t       atc_e;
-ap68040_atc iatc (
+ap68040_atc #(.SAME_SEARCH(0)) iatc (
 	.clk(clk), .nreset(nreset), .p8k(tc_p),
 	.la(iatc_flush_page ? iatc_flush_la : fpc),
 	.fc2(iatc_flush_page ? iatc_flush_fc2 : smode),
-	.hit(atc_hit), .ent(atc_e),
+	.hit(atc_hit), .ent(atc_e), .hv(), .wpa(),
+	.la_d(32'd0), .fc2_d(1'b0), .set_d(4'd0), .hv_d(), .wpa_d(),
 	.wr(iatc_wr), .wla(iatc_wla), .wfc2(iatc_wfc2), .went(iatc_went),
+	.wsame(1'b0), .wsame_hv(4'd0),
 	.flush_all(iatc_flush_all), .flush_page(iatc_flush_page),
 	.flush_nonglobal(iatc_flush_ng)
 );
@@ -264,23 +267,22 @@ ap68040_atc iatc (
 // cache arrays: tags and data in block RAM (read address registered in
 // F0), valid bits in flip-flops
 //--------------------------------------------------------------------------
-// line valid, per set and way: LUT RAMs written at the edge and read
-// without a clock -- one copy at F1's set, one at the fill's set or the
-// invalidation's (they never run at once).  Clearing every line (CINVA,
-// a snooped clear, reset) runs the invalidation over the 64 sets
-(* ramstyle = "MLAB, no_rw_check" *) logic ivf0 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivf1 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivf2 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivf3 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivo0 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivo1 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivo2 [64];
-(* ramstyle = "MLAB, no_rw_check" *) logic ivo3 [64];
+// line valid, per set and way: a word of the four ways per set in LUT
+// RAMs written at the edge and read without a clock -- one copy at F1's
+// set, one at the fill's set or the invalidation's (they never run at
+// once).  The second is read at the set every write goes to, so it forms
+// the word written (the ways not written keep their bits).  Clearing every
+// line (CINVA, a snooped clear, reset) runs the invalidation over the sets
+(* ramstyle = "MLAB, no_rw_check" *) logic [3:0] ivf [64];
+(* ramstyle = "MLAB, no_rw_check" *) logic [3:0] ivo [64];
 wire   [3:0]   ivf_q, ivo_q;
 logic  [5:0]   ivo_ra;
 logic          inv_rst;         // the invalidation is reset's clear
 // synthesis translate_off
-logic  [3:0]   iv [64];         // (simulation: the flip-flop model, checked)
+logic  [3:0]   iv [64];          // (simulation: the flip-flop model, checked)
+// synthesis translate_off
+initial for (int i = 0; i < 64; i++) iv[i] = 4'd0;
+// synthesis translate_on
 // synthesis translate_on
 logic  [1:0]   rr;
 logic  [5:0]   c_raddr;
@@ -292,6 +294,7 @@ logic [127:0]  cd [4];
 logic [23:0]   ct [4];
 
 logic [127:0] m_line;            // the line being filled (and the line buffer)
+logic  [3:0] m_got;              // ... the long words of it that arrived
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
@@ -332,6 +335,7 @@ logic        f1_hit;
 atce_t       f1_e;
 
 // line buffer: the last line filled (it also serves TCI lines)
+logic        m_tci;            // the fill in progress was answered with TCI
 logic        lb_v;             // m_line holds the line at lb_pa (the last fill):
 logic [27:0] lb_pa;            // it is also the cache's write data
 
@@ -363,9 +367,13 @@ logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
 logic [31:0] x_chunk;
+logic  [3:0] x_mj;
 // the ITT matches are formed in F0 (the TTRs change only by MOVEC, which
 // serializes and refetches), so F1 starts from them
 logic        f1_tt0, f1_tt1;
+// ... and whether translation is on (TCR.E, MDIS), taken with them: F1's
+// translation and its tag compare select both start from flip-flops
+logic        f1_tce;
 always_comb begin
 	logic tt0, tt1, use_t;
 	logic [21:0] tg;
@@ -378,7 +386,7 @@ always_comb begin
 		x_cm  = tt0 ? itt0[6:5] : itt1[6:5];
 		x_upa = tt0 ? itt0[9:8] : itt1[9:8];
 	end
-	else if (!tc_e)
+	else if (!f1_tce)
 		x_ok = 1'b1;               // cachable (MC68040UM 3.1.2)
 	else if (f1_hit) begin
 		x_pa  = {f1_e.pa[19:1], tc_p ? f1_pc[12] : f1_e.pa[0], f1_pc[11:0]};
@@ -393,18 +401,21 @@ always_comb begin
 	// TTR or no translation) and the ATC's, and the translation selects
 	// the outcome: it stays off the front of the compare (the ATC's
 	// address matters only with a hit, x_cach is clear without one)
-	use_t  = !(tt0 || tt1) && tc_e;
+	use_t  = !(tt0 || tt1) && f1_tce;
 	tg     = {f1_e.pa[19:1], tc_p ? f1_pc[12] : f1_e.pa[0], f1_pc[11:10]};
 	x_hit  = 1'b0;
 	x_way  = 2'd0;
-	for (int i = 3; i >= 0; i--)
-		if (ivf_q[i] && (use_t ? (ct[i][21:0] == tg) : (ct[i][21:0] == f1_pc[31:10]))) begin
-			x_hit = 1'b1; x_way = 2'(i);
-		end
+	for (int i = 3; i >= 0; i--) begin
+		x_mj[i] = ivf_q[i] && (use_t ? (ct[i][21:0] == tg) : (ct[i][21:0] == f1_pc[31:10]));
+		if (x_mj[i]) begin x_hit = 1'b1; x_way = 2'(i); end
+	end
 	x_hit  = x_hit && x_cach;
 	x_lb   = x_cach && lb_v && (use_t ? (lb_pa == {tg, f1_pc[9:4]}) : (lb_pa == f1_pc[31:4]));
-	x_chunk = x_lb ? m_line[127 - 32 * f1_pc[3:2] -: 32]
-	               : cd[x_way][127 - 32 * f1_pc[3:2] -: 32];
+	// (the chunk by the one-hot match, AND-OR: no encoded way on the path;
+	// at most one way holds a line)
+	x_chunk = '0;
+	for (int i = 0; i < 4; i++) if (x_mj[i]) x_chunk = x_chunk | cd[i][127 - 32 * f1_pc[3:2] -: 32];
+	if (x_lb) x_chunk = m_line[127 - 32 * f1_pc[3:2] -: 32];
 end
 wire f1_go      = f1_v && !redir_any;
 wire f1_deliver = f1_go && (x_hit || x_lb);
@@ -470,7 +481,7 @@ always_ff @(posedge clk) begin
 		fnew  <= 1'b1;
 		st    <= S_RUN;
 		f1_v  <= 1'b0; f1_pc <= '0; f1_s <= 1'b0; f1_dem <= 1'b0; f1_hit <= 1'b0; f1_e <= '0;
-		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0;
+		f1_tt0 <= 1'b0; f1_tt1 <= 1'b0; f1_tce <= 1'b0;
 		f1_btok <= 1'b0;
 		fras_tp <= '0; fras_n <= '0;
 		f2_b  <= '0; f2_t <= '0; f3_b <= '0; f3_t <= '0;
@@ -480,23 +491,21 @@ always_ff @(posedge clk) begin
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
 		for (int i = 0; i < 2; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
-		lb_v  <= 1'b0; lb_pa <= '0;
+		lb_v  <= 1'b0; lb_pa <= '0; m_tci <= 1'b0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
 		m_alloc <= 1'b0; m_way <= '0; m_line <= '0;
 		iw_req <= 1'b0;
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
-		// (reset clears every line: the invalidation runs over the sets)
-		inv_busy <= 1'b1; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
+		// (reset leaves the cache alone, 5.3: its valid bits have their
+		// power-up values from their initial blocks)
+		inv_busy <= 1'b0; inv_hold <= 1'b0; inv_ph <= 1'b0; inv_i <= '0;
 		inv_sn <= 1'b0; inv_scope <= 2'd3; inv_pa <= '0; inv_lbh <= 1'b0;
-		inv_rst <= 1'b1;
+		inv_rst <= 1'b0;
 		sn_ihit <= 1'b0;
 		ic_inv_done <= 1'b0;
 		sn_inv_done <= 1'b0;
-		// synthesis translate_off
-		for (int i = 0; i < 64; i++) iv[i] <= 4'd0;
-		// synthesis translate_on
 		for (int i = 0; i < QN; i++) qw[i] <= '0;
 		qh  <= '0;
 		qp0 <= '0;
@@ -601,6 +610,7 @@ always_ff @(posedge clk) begin
 			f1_s   <= smode;
 			f1_tt0 <= ttr_hit(itt0, fpc, smode);
 			f1_tt1 <= ttr_hit(itt1, fpc, smode);
+			f1_tce <= tc_e;
 			f1_dem <= fnew;
 			f1_hit <= atc_hit;
 			f1_e   <= atc_e;
@@ -669,8 +679,10 @@ always_ff @(posedge clk) begin
 				logic [3:0] vv;
 				vv = ivf_q;
 				st      <= S_FILL;
+				m_got   <= 4'd0;
 				lb_v    <= 1'b0;          // its beats go into m_line
 				m_alloc <= 1'b1;
+				m_tci   <= 1'b0;
 				m_way   <= !vv[0] ? 2'd0 : !vv[1] ? 2'd1 : !vv[2] ? 2'd2 : !vv[3] ? 2'd3 : rr;
 				b_req_r <= 1'b1;
 			end
@@ -699,7 +711,8 @@ always_ff @(posedge clk) begin
 			if (b_rvalid) begin
 				ln[127 - 32 * b_rbeat -: 32] = b_rdata;
 				m_line <= ln;
-				if (b_rtci) m_alloc <= 1'b0;
+				m_got[b_rbeat] <= 1'b1;
+				if (b_rtci) begin m_alloc <= 1'b0; m_tci <= 1'b1; end
 			end
 			if (busy && b_done) begin
 				busy  <= 1'b0;
@@ -712,20 +725,72 @@ always_ff @(posedge clk) begin
 					iw_set = m_pa[9:4]; iw_m[m_way] = 1'b1; iw_v = 1'b1;
 					if (ivo_q == 4'hF) rr <= rr + 2'd1;     // (ivo_ra: m_pa's set)
 				end
-				lb_v  <= 1'b1;
 				lb_pa <= m_pa[31:4];
 				st    <= S_RUN;
+				if (m_tci || (b_rvalid && b_rtci)) begin
+					// a TCI line is not kept (5.7.1: sequential access only
+					// until the burst's last long word arrives): the long word
+					// being fetched goes straight to the decoder, the next one
+					// is fetched anew (unless a redirect takes the stream)
+					lb_v <= 1'b0;
+					if (!stale && !redir_any) begin
+						logic [31:0] lw, nla;
+						lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+						nla = {m_la[31:2], 2'b00} + 32'd4;
+						if (m_la[1]) begin
+							f2_n    <= 2'd1;
+							f2_w[0] <= lw[15:0];
+						end
+						else begin
+							f2_n    <= 2'd2;
+							f2_w[0] <= lw[31:16];
+							f2_w[1] <= lw[15:0];
+						end
+						f2_f  <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
+						m_la  <= nla;
+						m_pa  <= {m_pa[31:2], 2'b00} + 32'd4;
+						m_dem <= 1'b0;
+						fpc   <= nla;
+						fnew  <= 1'b0;
+					end
+				end
+				else lb_v <= 1'b1;
 			end
 			if (busy && b_err) begin
 				busy  <= 1'b0;
 				stale <= 1'b0;
-				if (!stale) begin
+				if (stale) st <= S_RUN;
+				else if (m_got[m_pa[3:2]]) begin
+					// a later beat failed, the long word being fetched had
+					// arrived (the burst starts with it): it is used, the line
+					// is not allocated, and no exception (MC68060UM 7.9.1,
+					// 5.7.1).  The next long word is fetched anew.
+					logic [31:0] lw, nla;
+					lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+					nla = {m_la[31:2], 2'b00} + 32'd4;
+					if (m_la[1]) begin
+						f2_n    <= 2'd1;
+						f2_w[0] <= lw[15:0];
+					end
+					else begin
+						f2_n    <= 2'd2;
+						f2_w[0] <= lw[31:16];
+						f2_w[1] <= lw[15:0];
+					end
+					f2_f  <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
+					m_la  <= nla;
+					m_pa  <= {m_pa[31:2], 2'b00} + 32'd4;
+					m_dem <= 1'b0;
+					fpc   <= nla;
+					fnew  <= 1'b0;
+					st    <= S_RUN;
+				end
+				else begin
 					f2_n <= m_la[1] ? 2'd1 : 2'd2;
 					for (int i = 0; i < 2; i++) f2_w[i] <= 16'd0;
 					f2_f <= 1'b1; f2_d <= m_dem; f2_a <= 1'b0;
 					st   <= S_HALT;
 				end
-				else st <= S_RUN;
 			end
 		end
 		S_CI: begin
@@ -769,7 +834,7 @@ always_ff @(posedge clk) begin
 				end
 				else st <= S_RUN;
 			end
-			else if (!busy && !b_req_r && !b_gnt && !redir_any &&
+			else if (!busy && !b_req_r && !b_gnt && !redir_any && !stop &&
 			         {1'b0, cnt} + {4'd0, f2_n} + {4'd0, f3_n} <= 6'(QN - 2))
 				b_req_r <= 1'b1;        // the next long word of the stream
 		end
@@ -875,12 +940,16 @@ always_ff @(posedge clk) begin
 	if (nreset && frw) fras[frwa] <= frwd;
 	// the valid RAMs' one write (both copies)
 	if (nreset) begin
-		if (iw_m[0]) begin ivf0[iw_set] <= iw_v; ivo0[iw_set] <= iw_v; end
-		if (iw_m[1]) begin ivf1[iw_set] <= iw_v; ivo1[iw_set] <= iw_v; end
-		if (iw_m[2]) begin ivf2[iw_set] <= iw_v; ivo2[iw_set] <= iw_v; end
-		if (iw_m[3]) begin ivf3[iw_set] <= iw_v; ivo3[iw_set] <= iw_v; end
+		if (iw_m != 4'd0) begin
+			ivf[iw_set] <= (ivo_q & ~iw_m) | (iw_m & {4{iw_v}});
+			ivo[iw_set] <= (ivo_q & ~iw_m) | (iw_m & {4{iw_v}});
+		end
 		// synthesis translate_off
 		for (int j = 0; j < 4; j++) if (iw_m[j]) iv[iw_set][j] <= iw_v;
+		if (iw_m != 4'd0 && iw_set != ivo_ra) begin
+			$display("FAIL: fetch: a valid write at set %0d, the second copy read at %0d", iw_set, ivo_ra);
+			$finish;
+		end
 		// synthesis translate_on
 	end
 end
@@ -888,12 +957,9 @@ end
 // the valid copies' reads: F1's set; the invalidation's, else the fill's
 wire [5:0] inv_s = (inv_scope == 2'd1) ? inv_pa[9:4] : 6'(inv_i - 7'd1);
 always_comb ivo_ra = inv_busy ? inv_s : m_pa[9:4];
-assign ivf_q = {ivf3[f1_pc[9:4]], ivf2[f1_pc[9:4]], ivf1[f1_pc[9:4]], ivf0[f1_pc[9:4]]};
-assign ivo_q = {ivo3[ivo_ra], ivo2[ivo_ra], ivo1[ivo_ra], ivo0[ivo_ra]};
-initial for (int i = 0; i < 64; i++) begin
-	ivf0[i] = 1'b0; ivf1[i] = 1'b0; ivf2[i] = 1'b0; ivf3[i] = 1'b0;
-	ivo0[i] = 1'b0; ivo1[i] = 1'b0; ivo2[i] = 1'b0; ivo3[i] = 1'b0;
-end
+assign ivf_q = ivf[f1_pc[9:4]];
+assign ivo_q = ivo[ivo_ra];
+initial for (int i = 0; i < 64; i++) begin ivf[i] = 4'd0; ivo[i] = 4'd0; end
 // synthesis translate_off
 always_ff @(posedge clk)
 	if (nreset && !inv_rst && (ivf_q != iv[f1_pc[9:4]] || ivo_q != iv[ivo_ra])) begin

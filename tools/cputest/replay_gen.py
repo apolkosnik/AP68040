@@ -393,9 +393,13 @@ def generate(header_path: str, dat_path: str, out_path: str,
                 for base, addr, old, new, size in cur["mem"]:
                     a = resolve_addr(hdr, base, addr)
                     setup_patches.append(Patch(a, value_bytes(new, size)))
-                    # CT_MEMWRITE setup records enter WinUAE's access
-                    # history and are restored at the end of this test.
-                    setup_cleanup.append(Patch(a, value_bytes(old, size)))
+                    # Not restored at the end of the test: main.c's
+                    # restoreahist() would, but the generator that computed
+                    # the oracle never undoes setup writes (cputest.cpp only
+                    # resets ahcnt_current/ahcnt_written per test), so later
+                    # tests' expectations assume they stayed (BasicFPU
+                    # FMOVE.D 0002 t100 reads what t86's setup left).
+                    # (setup_cleanup stays empty)
                 for off, data in cur["opbytes"]:
                     setup_patches.append(Patch(hdr.opcode_memory_addr + off,
                                                data))

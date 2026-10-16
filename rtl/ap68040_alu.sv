@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_alu.sv - EX-stage single-cycle integer unit: arithmetic, logic,  //
 // bit operations, condition codes (shifts and BCD: ap68040_alu_slow)       //

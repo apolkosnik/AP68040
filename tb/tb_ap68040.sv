@@ -136,7 +136,14 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `ifndef AP_EARLY_RES
 `define AP_EARLY_RES 1
 `endif
-ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES)) dut (
+`ifndef AP_SKID
+`define AP_SKID 0
+`endif
+`ifndef AP_DC1_ATC
+`define AP_DC1_ATC 0
+`endif
+ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
+          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
@@ -268,14 +275,14 @@ int ej [6];
 int ejk [16];   // DC2 jobs by {mem, hit, split}
 initial begin for (int i = 0; i < 6; i++) ej[i] = 0; for (int i = 0; i < 16; i++) ejk[i] = 0; end
 always_ff @(posedge clk) if (rsti_n) begin
-	if (dut.dmu.e_st == dut.dmu.E_S_START) begin
+	if (dut.dmu.sim_es_s) begin
 		ej[0]++;
 		ejk[{dut.dmu.m2.r.mem, dut.dmu.m2.x.hit, dut.dmu.m2.split}]++;
 	end
-	if (dut.dmu.e_st == dut.dmu.E_W_START) ej[1]++;
-	if (dut.dmu.e_st == dut.dmu.E_M_START) ej[2]++;
-	if (dut.dmu.e_st == dut.dmu.E_TW_START) ej[3]++;
-	if (dut.dmu.e_st != dut.dmu.E_IDLE) ej[4]++;
+	if (dut.dmu.sim_es_w) ej[1]++;
+	if (dut.dmu.sim_es_m) ej[2]++;
+	if (dut.dmu.sim_es_tw) ej[3]++;
+	if (!dut.dmu.sim_es_i) ej[4]++;
 	if (dut.dmu.m2.r.v && dut.dmu.m2.fast && dut.dmu.hzf) ej[5]++;
 end
 // snoops: lookups by where the line was (cache, push buffer, queued push,

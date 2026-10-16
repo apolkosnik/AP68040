@@ -94,7 +94,8 @@ DSEL = {n: i for i, n in enumerate(['CONST', 'IMM', 'NIMM', 'QUICK', 'NQUICK',
                                     'IMMC', 'SZB'])}
 MEM = {None: 0, 'LD': 1, 'ST': 2, 'RMW': 3}
 # EAP: the instruction's EA space (program space for PC-relative / #imm)
-MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3, 'IACK': 4, 'EAP': 5}
+# BKPT: the breakpoint acknowledge read (TT=3, TM=0, A=0)
+MFC = {None: 0, 'SFC': 1, 'DFC': 2, 'SUP': 3, 'IACK': 4, 'EAP': 5, 'BKPT': 6}
 BR = {None: 0, 'COND': 1, 'IMM': 2, 'EA': 3, 'A': 4, 'B': 5}
 # condition sources: opword cc (11:8), the opcode entry's, the extension
 # word's ({ext[10], ext[11]}: 64-bit, signed), or a constant
@@ -305,8 +306,8 @@ R('UNLK',   U(op='MOV', sz='L', a='LD', ag='POPR', agb='AY', agw='SP', msz='L',
               mem='LD', d='AY', last=1))
 
 # status register
-R('MOVE_FROM_SR',  U(op='SPR', sz='W', const=0x10, b='EA0R', d='EA0', last=1))
-R('MOVE_FROM_CCR', U(op='SPR', sz='W', const=0x11, b='EA0R', d='EA0', last=1))
+R('MOVE_FROM_SR',  U(op='SPR', sz='W', const=0x20, b='EA0R', d='EA0', last=1))
+R('MOVE_FROM_CCR', U(op='SPR', sz='W', const=0x21, b='EA0R', d='EA0', last=1))
 R('MOVE_TO_CCR',   U(op='CCRLOG', cond=3, a='EA0', ccr='XNZVC', last=1))
 R('MOVE_TO_SR',    U(op='SRLOG', cond=3, a='EA0', ccr='XNZVC', last=1))
 R('CCR_LOG',       U(op='CCRLOG', cond='EC', a='IMM', ccr='XNZVC', last=1))
@@ -314,9 +315,14 @@ R('SR_LOG',        U(op='SRLOG', cond='EC', a='IMM', ccr='XNZVC', last=1))
 R('MOVE_TO_USP',   U(op='MOV', sz='L', a='AY', d='USP', last=1))
 R('MOVE_FROM_USP', U(op='MOV', sz='L', a='USP', d='AY', last=1))
 
-# TRAP #n, ILLEGAL and BKPT raise their exception from D1
+# TRAP #n and ILLEGAL raise their exception from D1.  BKPT runs the
+# breakpoint acknowledge cycle (MC68040UM 7.5.2: TT=3, TM=0, A=0, a byte
+# read; TA or TEA both end it) and then takes the illegal instruction
+# exception (MISC 9)
 R('TRAP',  U(last=1))
-R('BKPT',  U(last=1))
+R('BKPT',  U(op='MOV', sz='B', msz='B', a='LD', mem='LD', mfc='BKPT', ag='BASED', agb='ZERO',
+             const=0),
+           U(op='MISC', cond=9, last=1))
 R('NOP',   U(op='MISC', cond=0, ser=1, last=1))
 R('RESET', U(op='MISC', cond=1, ser=1, last=1))
 R('STOP',  U(op='MISC', cond=2, a='IMM', ser=1, last=1))
@@ -457,14 +463,14 @@ R('CHK2',
 # CM set the MOVEM at the frame's PC continues from the stacked EA (MISC 6
 # arms it; MC68040UM 8.4.6.5).
 R('RTE',
-  U(op='MOV', sz='W', msz='W', a='LD', d='T1', ag='BASED', agb='SP', const=0),
-  U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2),
-  U(op='MOV', sz='W', msz='W', a='LD', d='T3', ag='BASED', agb='SP', const=6),
+  U(op='MOV', sz='W', msz='W', a='LD', d='T1', ag='BASED', agb='SP', const=0, mfc='SUP'),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2, mfc='SUP'),
+  U(op='MOV', sz='W', msz='W', a='LD', d='T3', ag='BASED', agb='SP', const=6, mfc='SUP'),
   U(op='RTEF', sz='W', a='T3', d='T0'),
   U(ag='ADDT0', agb='SP', agw='SP'),
-  U(op='MOV', sz='L', msz='L', a='LD', d='T4', ag='BASED', agb='SP', const=-52, cond=11),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T4', ag='BASED', agb='SP', const=-52, cond=11, mfc='SUP'),
   U(op='MOV', sz='L', msz='W', a='LD', b='ZERO', d='T5', ag='BASED', agb='SP', const=-48,
-    cond=11),
+    cond=11, mfc='SUP'),
   U(op='MISC', cond=6, sz='L', a='T4', b='T5'),
   U(op='RTE', sz='W', a='T1', b='T2', last=1))
 # RTR: CCR = (SP)+ word, PC = (SP)+ long

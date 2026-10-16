@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_ram.sv - memory primitives written for Quartus inference          //
 //                                                                          //
@@ -63,21 +63,40 @@ module ap68040_tdp #(
 	input  logic          we_a,
 	input  logic [DW-1:0] wd_a,
 	output logic [DW-1:0] q_a,
+	output logic [DW-1:0] qa_raw,    // ... the RAM's word, and the write laid
+	output logic          qa_bv,     // over it (qa_bv: q_a is qa_bd), for a
+	output logic [DW-1:0] qa_bd,     // caller comparing both in parallel
 	input  logic [AW-1:0] addr_b,
 	input  logic          we_b,
 	input  logic [DW-1:0] wd_b,
 	output logic [DW-1:0] q_b
 );
+	// A read returns the word as written at the edge that registered its
+	// address (a write to the same word at that edge included).  The RAM
+	// itself reads the old word; the write is laid over it by a compare of
+	// registered addresses and one multiplexer (Quartus's inferred bypass
+	// put three logic levels in front of the users' compares; a compare of
+	// the incoming address would put it behind the address's own logic).
 	(* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
-	logic [AW-1:0] ra, rb;
+	logic [DW-1:0] qa_r, qb_r, wa_d, wb_d;
+	logic [AW-1:0] ra, rb, wa_q, wb_q;
+	logic          wa_v, wb_v;
 	always_ff @(posedge clk) begin
 		if (we_a) mem[addr_a] <= wd_a;
 		if (we_b) mem[addr_b] <= wd_b;
-		ra <= addr_a;
-		rb <= addr_b;
+		qa_r <= mem[addr_a];
+		qb_r <= mem[addr_b];
+		ra   <= addr_a;
+		rb   <= addr_b;
+		wa_v <= we_a; wa_q <= addr_a; wa_d <= wd_a;
+		wb_v <= we_b; wb_q <= addr_b; wb_d <= wd_b;
 	end
-	assign q_a = mem[ra];
-	assign q_b = mem[rb];
+	// (port B's write wins a same-word collision, as in the old order)
+	assign q_a    = (wb_v && wb_q == ra) ? wb_d : (wa_v && wa_q == ra) ? wa_d : qa_r;
+	assign qa_raw = qa_r;
+	assign qa_bv  = (wb_v && wb_q == ra) || (wa_v && wa_q == ra);
+	assign qa_bd  = (wb_v && wb_q == ra) ? wb_d : wa_d;
+	assign q_b = (wb_v && wb_q == rb) ? wb_d : (wa_v && wa_q == rb) ? wa_d : qb_r;
 endmodule
 
 module ap68040_lutram #(
@@ -105,7 +124,8 @@ endmodule
 // register in one cycle: the higher port number wins.
 //--------------------------------------------------------------------------
 module ap68040_rf #(
-	parameter int NR = 5
+	parameter int NR = 5,
+	parameter int NW = 3              // write ports (2 or 3): the later wins
 )(
 	input  logic        clk,
 	input  logic  [2:0] we,
@@ -115,10 +135,10 @@ module ap68040_rf #(
 	output logic [31:0] rd [NR]
 );
 	logic [1:0]  lvt [32];
-	logic [31:0] q [3][NR];
+	logic [31:0] q [NW][NR];
 	genvar gw, gr;
 	generate
-		for (gw = 0; gw < 3; gw++) begin : g_w
+		for (gw = 0; gw < NW; gw++) begin : g_w
 			for (gr = 0; gr < NR; gr++) begin : g_r
 				ap68040_lutram #(.AW(5), .DW(32)) bank (
 					.clk(clk), .we(we[gw]), .waddr(wa[gw]), .wdata(wd[gw]),
@@ -129,7 +149,7 @@ module ap68040_rf #(
 	endgenerate
 	initial for (int i = 0; i < 32; i++) lvt[i] = 2'd0;
 	always_ff @(posedge clk)
-		for (int w = 0; w < 3; w++)
+		for (int w = 0; w < NW; w++)
 			if (we[w]) lvt[wa[w]] <= 2'(w);
 	always_comb
 		for (int r = 0; r < NR; r++)
