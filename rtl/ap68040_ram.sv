@@ -182,3 +182,28 @@ module ap68040_sdpr #(
 		q <= mem[raddr];
 	end
 endmodule
+
+//--------------------------------------------------------------------------
+// ap68040_pdrom: the predecoder's table (tools/ucode.py emit_pdrom), one
+// word per operation word bits 15:3, in block RAM with two read ports
+// (the fetch unit's two words a cycle); the words read a cycle after their
+// addresses
+//--------------------------------------------------------------------------
+module ap68040_pdrom
+	import ap68040_upkg::*;
+(
+	input  logic        clk,
+	input  logic [12:0] a0,
+	input  logic [12:0] a1,
+	output pdw_t        q0,
+	output pdw_t        q1
+);
+	(* romstyle = "M10K" *) logic [31:0] pd_rom [0:8191];
+	initial begin
+`include "gen/ap68040_pd_rom.svh"
+	end
+	always_ff @(posedge clk) begin
+		q0 <= pdw_t'(pd_rom[a0]);
+		q1 <= pdw_t'(pd_rom[a1]);
+	end
+endmodule

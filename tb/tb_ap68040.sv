@@ -157,7 +157,7 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `define AP_SKID 0
 `endif
 `ifndef AP_DC1_ATC
-`define AP_DC1_ATC 0
+`define AP_DC1_ATC 1
 `endif
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
           .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (

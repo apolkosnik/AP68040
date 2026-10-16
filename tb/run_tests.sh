@@ -11,6 +11,8 @@ WORK=${WORK:-$(cd .. && pwd)/obj}; export WORK
 JOBS=${JOBS:-$(( $(nproc) / 2 ))}
 ./build_asm.sh $PROGS
 ./build_sim.sh > build/sim_build.log 2>&1 || { tail -30 build/sim_build.log; exit 1; }
+# the exhaustive decoder check (every operation word)
+./build_decode.sh | grep -q "DECODE PASS" || { echo "DECODE FAIL"; exit 1; }
 SIM=$WORK/obj_prog/tb_ap68040
 CFGS=(
 	""

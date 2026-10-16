@@ -25,6 +25,22 @@ if [ "$PHYS" = ON ]; then
 fi
 echo "set_instance_assignment -name VIRTUAL_PIN ON -to *"
 [ -n "$SEED" ] && echo "set_global_assignment -name SEED $SEED"
+# MISTER=1: the Minimig-AGA_MiSTer project's fitter settings (physical
+# synthesis with retiming, sparse register packing), for the ALM count the
+# core shows in that build
+if [ "$MISTER" = 1 ]; then
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC ON"
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC_FOR_AREA ON"
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON"
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON"
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON"
+  echo "set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT EXTRA"
+  echo "set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW"
+  echo "set_global_assignment -name QII_AUTO_PACKED_REGISTERS \"SPARSE AUTO\""
+  echo "set_global_assignment -name FITTER_EFFORT \"STANDARD FIT\""
+  echo "set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED"
+fi
+[ -n "$EXTRA" ] && echo "$EXTRA"
 for f in "$@"; do
   case "$f" in
     *.sv|*.svh) echo "set_global_assignment -name SYSTEMVERILOG_FILE $(readlink -f $f)";;

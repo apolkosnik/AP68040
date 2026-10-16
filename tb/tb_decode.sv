@@ -1,7 +1,9 @@
 // Exhaustive decoder check: every operation word through the generated
 // parallel decoder, against tools/ucode.py's model of the hardware rule
 // (most specific pattern, then that entry's EA legality), which
-// tools/check_isa.py checks against WinUAE.
+// tools/check_isa.py checks against WinUAE; and the table predecoder
+// (ap68040_predec, block RAM) against the pattern-decoder one.
+// Built and run by tb/build_decode.sh.
 module tb_decode;
 	import ap68040_pkg::*, ap68040_upkg::*;
 	`include "gen/ap68040_dec_pla.svh"
@@ -37,8 +39,28 @@ module tb_decode;
 				if (bad < 20) $display("op %04x: got %03x expected %03x", op, got, expect_t[op]);
 			end
 		end
+		// the table predecoder against the pattern-decoder one, every word
+		for (int op = 0; op < 65536; op++) begin
+			t_op = 16'(op);
+			t_w  = pdw_t'(pd_rom[t_op[15:3]]);
+			#1;
+			if (t_pd !== t_pd_ref) begin
+				bad++;
+				if (bad < 20) $display("op %04x: table predecode %h, the pattern decoder's %h", op, t_pd, t_pd_ref);
+			end
+		end
 		if (bad == 0) $display("DECODE PASS: 65536 operation words");
 		else $display("DECODE FAIL: %0d mismatches", bad);
 		$finish;
 	end
+	// the predecoders under test
+	logic [15:0] t_op;
+	pdw_t        t_w;
+	pd_t         t_pd, t_pd_ref;
+	logic [31:0] pd_rom [0:8191];
+	initial begin
+`include "gen/ap68040_pd_rom.svh"
+	end
+	ap68040_predec     pdt (.op(t_op), .w(t_w), .pd(t_pd));
+	ap68040_predec_pla pdp (.op(t_op), .pd(t_pd_ref));
 endmodule

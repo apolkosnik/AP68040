@@ -48,7 +48,7 @@
 //--------------------------------------------------------------------------//
 
 module ap68040_fetch
-	import ap68040_pkg::*;
+	import ap68040_pkg::*, ap68040_upkg::*;
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -188,23 +188,36 @@ always_comb begin
 end
 assign bt_tgt = {tq[0], 1'b0};
 
-// F2: the words of a chunk, predecoded into F3; F3: appended this cycle
+// F2: the words of a chunk, their table words read (ap68040_pdrom, the
+// words a cycle after their addresses); F3: predecoded from the table
+// words and appended this cycle
 logic  [1:0]  f2_n;
 logic [15:0]  f2_w [2];
 logic         f2_f, f2_d, f2_a;
-pd_t          f2_p [2];
 logic  [1:0]  f2_b;            // the word ends a BTB-taken branch
 logic [30:0]  f2_t;
 logic  [1:0]  f3_n;
 logic [15:0]  f3_w [2];
+pdw_t         f3_r [2];        // the table's words for f3_w
 pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
 logic  [1:0]  f3_b;
 logic [30:0]  f3_t;
+ap68040_pdrom pdrom (.clk(clk), .a0(f2_w[0][15:3]), .a1(f2_w[1][15:3]), .q0(f3_r[0]), .q1(f3_r[1]));
 genvar gp;
 generate
 	for (gp = 0; gp < 2; gp++) begin : g_pd
-		ap68040_predec pd (.op(f2_w[gp]), .pd(f2_p[gp]));
+		ap68040_predec pd (.op(f3_w[gp]), .w(f3_r[gp]), .pd(f3_p[gp]));
+		// synthesis translate_off
+		// (the table form against the parallel pattern decoder)
+		pd_t pd_ref;
+		ap68040_predec_pla pdr (.op(f3_w[gp]), .pd(pd_ref));
+		always_ff @(posedge clk)
+			if (nreset && f3_n > 2'(gp) && f3_p[gp] !== pd_ref) begin
+				$display("FAIL: fetch: the table predecode of %04x is %h, the pattern decoder's %h", f3_w[gp], f3_p[gp], pd_ref);
+				$finish;
+			end
+		// synthesis translate_on
 	end
 endgenerate
 
@@ -490,7 +503,7 @@ always_ff @(posedge clk) begin
 		f2_n  <= '0; f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
-		for (int i = 0; i < 2; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
+		for (int i = 0; i < 2; i++) f3_w[i] <= '0;
 		lb_v  <= 1'b0; lb_pa <= '0; m_tci <= 1'b0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
@@ -594,7 +607,7 @@ always_ff @(posedge clk) begin
 		f3_n  <= f2_n;
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
 		f3_b  <= f2_b; f3_t <= f2_t;
-		for (int i = 0; i < 2; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
+		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
 		f2_n  <= '0;
 		f2_b  <= '0;
 
