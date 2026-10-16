@@ -393,6 +393,8 @@ task automatic run_round();
 	wrv(MBOX + 32'h044, 8'd2, frm_addr);
 	wrv(MBOX + 32'h048, 8'd2, i_msp);
 	wrv(MBOX + 32'h04C, 8'd2, CAPV);
+	// (a round that does not use the FPU: its FP state not loaded or saved)
+	wrv(MBOX + 32'h050, 8'd1, (flags & F_FPU) ? 32'd0 : 32'd1);
 	for (int i = 0; i < 8; i++) begin
 		wrv(MBOX + 32'h060 + 12 * i, 8'd2, {i_fe[i][15:0], 16'd0});
 		wrv(MBOX + 32'h064 + 12 * i, 8'd2, i_fm[i][63:32]);

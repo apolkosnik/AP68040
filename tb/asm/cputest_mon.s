@@ -10,6 +10,10 @@
 ; frame under test and must not be touched -- then tells the bench (a
 ; bus-visible write of EVT) and waits for its command: resume through RTE
 ; (a trace stacked on a primary exception) or stop (the round's result).
+;
+; The monitor runs its own code from the instruction cache (CACR.IE, the
+; data cache off, so the mailbox traffic reaches the bus): CACR is the
+; test's whenever the test runs -- 0 at its entry, its own on a resume.
 
 MBOX	equ	$42120000
 GO	equ	MBOX+$000	; word: bench -> monitor, start a round
@@ -18,6 +22,8 @@ IN_USP	equ	MBOX+$040
 IN_FRM	equ	MBOX+$044	; ISP for the entry RTE (the frame)
 IN_MSP	equ	MBOX+$048
 IN_VBR	equ	MBOX+$04C
+NOFP	equ	MBOX+$050	; word: nonzero, the round does not use the FPU:
+				; its FP state is neither loaded nor saved
 IN_FP	equ	MBOX+$060	; FP0-FP7, FMOVEM.X layout, 96 bytes
 IN_FC	equ	MBOX+$0C0	; FPCR FPSR FPIAR
 EVT	equ	MBOX+$100	; word: monitor -> bench, an exception entry
@@ -65,9 +71,17 @@ capture:
 	move.l	d0,(CAP_CR+16).l
 	movec	dtt1,d0
 	move.l	d0,(CAP_CR+20).l
-	cpusha	bc
-	moveq	#0,d0
+	; (the data cache pushed and invalidated; the instruction cache only
+	; if the test enabled it -- else it holds the monitor's lines alone)
+	cpusha	dc
+	move.l	(CAP_CR).l,d0
+	btst	#15,d0
+	beq.s	cicok
+	cinva	ic
+cicok:
+	move.l	#$00008000,d0		; the monitor's code from the I-cache
 	movec	d0,cacr
+	moveq	#0,d0
 	movec	d0,tc
 	movec	d0,itt0
 	movec	d0,itt1
@@ -76,9 +90,12 @@ capture:
 	pflusha
 	; the FPU: FSAVE first, so a pending exception the test left is kept
 	; in the frame (not taken by the FMOVEMs) and comes back on a resume
+	tst.w	(NOFP).l
+	bne.s	cnofp
 	fsave	(CAP_FS).l
 	fmovem.x	fp0-fp7,(CAP_FP).l
 	fmovem.l	fpcr/fpsr/fpiar,(CAP_FC).l
+cnofp:
 	move.l	usp,a0
 	move.l	a0,(CAP_USP).l
 	move.l	a7,(CAP_SP).l
@@ -91,7 +108,10 @@ cwait:
 	clr.w	(CMD).l
 	cmp.w	#1,d0
 	bne.s	stop
+	tst.w	(NOFP).l
+	bne.s	rnofp
 	frestore	(CAP_FS).l
+rnofp:
 	move.l	(CAP_CR+4).l,d0
 	movec	d0,tc
 	move.l	(CAP_CR+8).l,d0
@@ -116,6 +136,8 @@ stop:
 idle:
 	move.w	#$2700,sr
 	lea	(MSTACK).l,sp
+	move.l	#$00008000,d0		; the monitor's code from the I-cache
+	movec	d0,cacr
 irdy:
 	move.w	#1,(RDY).l
 iwait:
@@ -123,7 +145,6 @@ iwait:
 	beq.s	iwait
 	clr.w	(GO).l
 	moveq	#0,d0
-	movec	d0,cacr
 	movec	d0,tc
 	movec	d0,itt0
 	movec	d0,itt1
@@ -132,15 +153,20 @@ iwait:
 	movec	d0,sfc
 	movec	d0,dfc
 	pflusha
+	tst.w	(NOFP).l
+	bne.s	inofp
 	frestore	(nullf).l		; reset the FPU: no state left over
 	fmovem.l	(IN_FC).l,fpcr/fpsr/fpiar
 	fmovem.x	(IN_FP).l,fp0-fp7
+inofp:
 	move.l	(IN_USP).l,a0
 	move.l	a0,usp
 	move.l	(IN_MSP).l,a0
 	movec	a0,msp
 	move.l	(IN_VBR).l,a0
 	movec	a0,vbr
+	moveq	#0,d0			; CACR as the test enters: 0
+	movec	d0,cacr
 	movem.l	(IN_D).l,d0-d7/a0-a6
 	move.l	(IN_FRM).l,a7
 	rte

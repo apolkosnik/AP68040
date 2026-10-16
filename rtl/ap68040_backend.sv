@@ -29,7 +29,7 @@ module ap68040_backend
 	parameter bit         FPU_PIPE  = 1,
 	parameter bit         EARLY_RES = 1,
 	parameter bit         SKID      = 1,      // the skid register in front of AG
-	parameter int         DIV_STEPS = 4       // divide steps per cycle
+	parameter int         DIV_STEPS = 2       // divide steps per cycle
 )(
 	input  logic        clk,
 	input  logic        nreset,

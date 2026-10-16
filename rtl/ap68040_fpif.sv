@@ -213,7 +213,9 @@ logic  [2:0] f_class, f_fmt, f_srcr, f_dstr, f_fmsel;
 logic  [7:0] f_okvn;          // the FPU's register-ready flags, next cycle
 logic        f_aok, f_bok;    // ... of the next source and destination
 logic  [6:0] f_opm;
-logic [95:0] f_din, f_fmwd;
+// (f_din also carries FMOVEM's register data: an operation's instruction
+// waits until the FPU has taken its operand, so FMOVEM's writes come later)
+logic [95:0] f_din;
 logic        f_dnice;          // f_din is an ordinary operand (the FPU pipeline)
 logic  [1:0] f_crsel;
 logic [31:0] f_crwd, f_iapc;
@@ -253,7 +255,7 @@ ap040_fpu #(.PIPE(FPU_PIPE)) fpu (
 	.cr_sel(f_crsel), .cr_we(f_crwe), .cr_wdata(f_crwd), .cr_rdata(f_crrd),
 	.bsun_req(f_bsun), .bsun_enable(f_bsun_en),
 	.ia_we(f_iawe), .ia_wdata(f_iapc),
-	.fm_sel(f_fmsel), .fm_we(f_fmwe), .fm_wdata(f_fmwd), .fm_rdata(f_fmrd),
+	.fm_sel(f_fmsel), .fm_we(f_fmwe), .fm_wdata(f_din), .fm_rdata(f_fmrd),
 	.fpu_used(f_used), .pbusy(f_pbusy), .pdone(f_pdone),
 	.okv_next(f_okvn), .sel_x(1'b1), .aok_x(f_aok), .bok_x(f_bok),
 	.opmode_n(n_opm), .op_class_n(n_class), .src_fmt_n(n_fmt),
@@ -276,6 +278,9 @@ ap040_fpu #(.PIPE(FPU_PIPE)) fpu (
 // state
 //--------------------------------------------------------------------------
 logic [15:0] opw_q, ext_q;     // the instruction's words (latched by CHK)
+logic        fsr_q;            // ... it is FSAVE or FRESTORE (for END's hold)
+logic [31:0] lst_q;            // ... FMOVEM's LIST result for a static list: its
+                               // bytes, negated for -(An)
 logic        bg;               // a released operation is running
 logic        pend;             // its enabled exception, for the next FPU instruction
 logic  [7:0] pend_vec;
@@ -415,6 +420,24 @@ function automatic logic [1:0] crsel_of(input logic [1:0] k);   // the FPU's cr_
 	crsel_of = (k == 2'd0) ? 2'd2 : (k == 2'd1) ? 2'd1 : 2'd0;
 endfunction
 
+// LIST's result from the instruction's words as CHK latches them
+function automatic logic [31:0] lst_of(input logic [15:0] ow, input logic [15:0] xw);
+	logic [3:0] n;
+	logic [6:0] b;
+	n = 4'd0;
+	for (int i = 0; i < 8; i++) n = n + {3'd0, xw[i]};
+	b = 7'(n) * 7'd12;
+	lst_of = (ow[5:3] == 3'd4) ? -{25'd0, b} : {25'd0, b};
+endfunction
+// ... and for a dynamic list (Dn): from the operand, the words latched
+function automatic logic [31:0] lst_dyn(input logic [15:0] ow, input logic [7:0] l);
+	logic [3:0] n;
+	logic [6:0] b;
+	n = 4'd0;
+	for (int i = 0; i < 8; i++) n = n + {3'd0, l[i]};
+	b = 7'(n) * 7'd12;
+	lst_dyn = (ow[5:3] == 3'd4) ? -{25'd0, b} : {25'd0, b};
+endfunction
 // FMOVEM list and adjustment (LIST, combinational for its result)
 logic [7:0] l_now;
 logic [6:0] l_bytes;
@@ -494,11 +517,20 @@ wire chk_pend = pend && !chk_fs;     // (CHK's) FSAVE/FRESTORE: their own rules
 // the latched result; END of an instruction with no store exception
 // pending and not FSAVE/FRESTORE does nothing (a fault of an older uop
 // discards it with the rest)
-wire nosafe = (sub == FC_GET) || (sub == FC_END && !sx_v && !is_fsave && !is_frest);
+// (END's instruction is the latched one: fsr_q, not the opcode decode)
+wire nosafe = (sub == FC_GET) || (sub == FC_END && !sx_v && !fsr_q);
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && sub == FC_END && fsr_q != (is_fsave || is_frest)) begin
+		$display("FAIL: fpif: fsr_q %b, the instruction's FSAVE/FRESTORE %b", fsr_q, is_fsave || is_frest);
+		$finish;
+	end
+// synthesis translate_on
 
+logic [31:0] res_g;            // the result as the hold logic forms it (checked, then unused)
 always_comb begin
 	hold    = 1'b0;
-	res     = 32'd0;
+	res_g   = 32'd0;
 	dkill   = 1'b0;
 	taken   = 1'b0;
 	xvec    = 8'd0;
@@ -552,16 +584,16 @@ always_comb begin
 					if (!done_q) hold = 1'b1;
 					if (ea_dn) begin
 						case (fmt)
-							3'd4:    res = {bv[31:16], f_dout[95:80]};
-							3'd6:    res = {bv[31:8], f_dout[95:88]};
-							default: res = f_dout[95:64];
+							3'd4:    res_g = {bv[31:16], f_dout[95:80]};
+							3'd6:    res_g = {bv[31:8], f_dout[95:88]};
+							default: res_g = f_dout[95:64];
 						endcase
 						dkill = sx_kill;
 					end
 					else case (fmt)
-						3'd4:    res = {16'd0, f_dout[95:80]};
-						3'd6:    res = {24'd0, f_dout[95:88]};
-						default: res = f_dout[95:64];
+						3'd4:    res_g = {16'd0, f_dout[95:80]};
+						3'd6:    res_g = {24'd0, f_dout[95:88]};
+						default: res_g = f_dout[95:64];
 					endcase
 				end
 				else if (go && f_unimp) begin
@@ -577,7 +609,7 @@ always_comb begin
 				end
 				else if (!(go && (f_accepted || f_done || f_pdone))) hold = 1'b1;
 			end
-			FC_GET: res = (imm[1:0] == 2'd1) ? get_q[63:32] : get_q[31:0];
+			FC_GET: res_g = (imm[1:0] == 2'd1) ? get_q[63:32] : get_q[31:0];
 			FC_END: begin
 				if (sx_v) begin
 					xvec = sx_vec; xfmt = sx_fmt; xnext = 1'b1; xaddr = sx_addr;
@@ -585,13 +617,13 @@ always_comb begin
 				end
 			end
 			FC_CRR: begin
-				res   = f_crrd;
+				res_g = f_crrd;
 				dkill = !cr_slots[imm[1:0]];
 				if (!crr_wait) hold = 1'b1;
 			end
-			FC_LIST: res = (ea_pd) ? -{25'd0, l_bytes} : {25'd0, l_bytes};
+			FC_LIST: res_g = (ea_pd) ? -{25'd0, l_bytes} : {25'd0, l_bytes};
 			FC_MVR: begin
-				res = mv_rev ? f_fmrd[31:0] : f_fmrd[95:64];
+				res_g = mv_rev ? f_fmrd[31:0] : f_fmrd[95:64];
 				if (!mvr_wait) hold = 1'b1;
 			end
 			FC_COND, FC_DBCC: begin
@@ -603,7 +635,7 @@ always_comb begin
 					xvec = VEC_BSUN;
 				end
 				else if (sub == FC_DBCC) begin
-					res   = {bv[31:16], bv[15:0] - 16'd1};
+					res_g = {bv[31:16], bv[15:0] - 16'd1};
 					dkill = c;
 					taken = !c && (bv[15:0] != 16'd0);
 				end
@@ -611,7 +643,7 @@ always_comb begin
 				else if (is_ftrap) begin
 					if (c) begin xvec = VEC_TRAPCC; xfmt = 4'd2; xnext = 1'b1; end
 				end
-				else res = {bv[31:8], {8{c}}};      // FScc
+				else res_g = {bv[31:8], {8{c}}};      // FScc
 			end
 			FC_SV0: begin
 				if (bg) hold = 1'b1;
@@ -620,14 +652,14 @@ always_comb begin
 					// pending exception's frame
 					xvec = pend_vec;
 				end
-				res = ea_pd ? -{25'd0, kbytes(sv_now)} : {25'd0, kbytes(sv_now)};
+				res_g = ea_pd ? -{25'd0, kbytes(sv_now)} : {25'd0, kbytes(sv_now)};
 			end
-			FC_SVW: res = (sv_kind == 2'd3) ? busy_word(imm[6:2]) :
+			FC_SVW: res_g = (sv_kind == 2'd3) ? busy_word(imm[6:2]) :
 			              (sv_kind == 2'd2) ? unimp_word(imm[6:2]) :
 			              (sv_kind == 2'd1) ? IDLE_HDR : 32'd0;
 			FC_RS0: begin
 				if (bg) hold = 1'b1;
-				res = {25'd0, kbytes(rs_kind_of(av))};
+				res_g = {25'd0, kbytes(rs_kind_of(av))};
 				// an unknown frame is a format error at the FRESTORE
 				if (!rs_ok) xvec = VEC_FMTERR;
 			end
@@ -635,6 +667,46 @@ always_comb begin
 		endcase
 	end
 end
+
+// the result, by the sub-operation only: EX takes it when the uop
+// completes, so it need not wait for the hold's conditions (ex_v, safe,
+// the pipeline): those stay off the result's path to the register file
+always_comb begin
+	res = 32'd0;
+	case (sub)
+		FC_DISP: if (ocl == 3'b011) begin
+			if (ea_dn) case (fmt)
+				3'd4:    res = {bv[31:16], f_dout[95:80]};
+				3'd6:    res = {bv[31:8], f_dout[95:88]};
+				default: res = f_dout[95:64];
+			endcase
+			else case (fmt)
+				3'd4:    res = {16'd0, f_dout[95:80]};
+				3'd6:    res = {24'd0, f_dout[95:88]};
+				default: res = f_dout[95:64];
+			endcase
+		end
+		FC_GET:  res = (imm[1:0] == 2'd1) ? get_q[63:32] : get_q[31:0];
+		FC_CRR:  res = f_crrd;
+		FC_LIST: res = ext_q[11] ? lst_dyn(opw_q, av[7:0]) : lst_q;
+		FC_MVR:  res = mv_rev ? f_fmrd[31:0] : f_fmrd[95:64];
+		FC_DBCC: res = {bv[31:16], bv[15:0] - 16'd1};
+		FC_COND: res = {bv[31:8], {8{fp_cond(is_bcc ? opw[5:0] : ext[5:0], f_cc)}}};   // FScc
+		FC_SV0:  res = ea_pd ? -{25'd0, kbytes(sv_now)} : {25'd0, kbytes(sv_now)};
+		FC_SVW:  res = (sv_kind == 2'd3) ? busy_word(imm[6:2]) :
+		               (sv_kind == 2'd2) ? unimp_word(imm[6:2]) :
+		               (sv_kind == 2'd1) ? IDLE_HDR : 32'd0;
+		FC_RS0:  res = {25'd0, kbytes(rs_kind_of(av))};
+		default: ;
+	endcase
+end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && res_g != res && res_g != 32'd0) begin
+		$display("FAIL: fpif result %h, the gated one %h (sub %0d)", res, res_g, sub);
+		$finish;
+	end
+// synthesis translate_on
 
 //--------------------------------------------------------------------------
 // sequential
@@ -680,7 +752,7 @@ end
 
 always_ff @(posedge clk) begin
 	if (!nreset) begin
-		opw_q <= '0; ext_q <= '0;
+		opw_q <= '0; ext_q <= '0; fsr_q <= 1'b0; lst_q <= '0;
 		bg <= 1'b0; pend <= 1'b0; pend_vec <= '0; fresh <= 1'b0;
 		go <= 1'b0; done_q <= 1'b0; eaa <= '0; eav <= 1'b0;
 		sx_v <= 1'b0; sx_vec <= '0; sx_fmt <= '0; sx_addr <= '0; sx_kill <= 1'b0;
@@ -691,7 +763,7 @@ always_ff @(posedge clk) begin
 		f_fsave_ack <= 1'b0; f_rest_idle <= 1'b0; f_rest_unimp <= 1'b0; f_pendcap <= 1'b0;
 		f_class <= '0; f_fmt <= '0; f_srcr <= '0; f_dstr <= '0; f_fmsel <= '0; f_opm <= '0;
 		f_aok <= 1'b0; f_bok <= 1'b0;
-		f_din <= '0; f_dnice <= 1'b0; f_fmwd <= '0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
+		f_din <= '0; f_dnice <= 1'b0; f_crsel <= '0; f_crwd <= '0; f_iapc <= '0;
 		f_rwe <= 1'b0; f_rwf <= '0; f_rwd <= '0; r_cusavepc <= '0;
 		r_et15 <= 1'b0; r_fpt15 <= 1'b0; r_busy <= 1'b0;
 	end
@@ -724,6 +796,8 @@ always_ff @(posedge clk) begin
 			FC_CHK: if (fuse && !go && !(bg && !f_end) && !chk_pend && !chk_x) begin
 				// FPm to FPn: CHK's latching and DISP's request at once
 				opw_q   <= opw;
+				fsr_q   <= is_fsave || is_frest;
+				lst_q   <= lst_of(opw, ext);
 				ext_q   <= ext;
 				eav     <= 1'b0;
 				sx_v    <= 1'b0;
@@ -745,6 +819,8 @@ always_ff @(posedge clk) begin
 			end
 			else if (adv) begin
 				opw_q <= opw;
+				fsr_q <= is_fsave || is_frest;
+				lst_q <= lst_of(opw, ext);
 				ext_q <= ext;
 				// (an immediate operand has no address: its frames, EA 0)
 				eav   <= eal && !ea_imm;
@@ -838,7 +914,7 @@ always_ff @(posedge clk) begin
 				if (cur_on) begin
 					f_fmsel <= cur_reg;
 					f_fmwe  <= 1'b1;
-					f_fmwd  <= {av, bv, latch};
+					f_din   <= {av, bv, latch};
 				end
 				slot <= slot + 3'd1;
 			end

@@ -21,6 +21,20 @@
 //   $F150 word  IPL = bits 2:0, falls to bits 6:4 after bits 15:8 clocks  //
 //   $F154 word  arm a one-shot bus error on an instruction fetch at the   //
 //               written address (0 disarms)                               //
+//   $F156 word  every instruction fetch of the long word at the written   //
+//               address ends in TEA (0 turns it off; kept through RSTI and  //
+//               a timed reset ($F168), dropped by the reset that answers  //
+//               a halted processor)                                       //
+//   $F158 word  the number of times the bench answers a halted processor  //
+//               (double bus fault: PST $5, no bus cycle, BR negated for   //
+//               64 clocks) with a reset: the run ends at the next halt;    //
+//               $F15A (read) counts those resets                          //
+//   $F168 word  reset the processor this many clocks later (RSTI for 12  //
+//               clocks), counted in $F15A with the halt resets           //
+//   $F16E word  IPL skew: bits 2:0 the IPL bits that change one clock    //
+//               after the others (from now on), bits 6:4 a level raised   //
+//               after bits 15:8 clocks (t_iplglitch); +iplskew=<mask>     //
+//               sets the lagging bits for a whole run                     //
 //   $F160 word  (read) bench capability word, +cap=<n> (default 7); bit   //
 //               5 is set when BCLK runs at half PCLK (+bclk2)             //
 //   $F200 + 32k (k = 0..3): alternate-master transfer k: +0 address,     //
@@ -83,6 +97,9 @@ logic  [2:0] tm;
 logic        ta_n, tea_n, tci_n, tbi_n, avec_n;
 logic        br_n, bb_n_o, bb_oe, rsto_n;
 logic  [2:0] ipl_lvl;
+// (the bits in ipl_lagm a clock late: ipl_old is the level a clock ago)
+logic  [2:0] ipl_lagm, ipl_lagm_def, ipl_old;
+wire   [2:0] ipl_sk   = (ipl_lvl & ~ipl_lagm) | (ipl_old & ipl_lagm);
 logic [31:0] dbg_pc;
 logic        dbg_retire, dbg_halted;
 
@@ -154,7 +171,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(tln), .upa(upa),
 	.ciout_n(ciout_n), .lock_n(lock_n), .locke_n(locke_n),
 	.ts_n(ts_n), .tip_n(tip_n), .ta_n(ta_n), .tea_n(tea_n),
-	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_lvl), .avec_n(avec_n),
+	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted)
@@ -163,6 +180,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 // slave
 logic  [1:0] wait_mode, tbi_mode;
 int          retry_pct;
+int          iplskew;
 logic        tea_req;
 logic        xfer_v, xfer_rd;
 logic [31:0] xfer_addr;
@@ -187,6 +205,57 @@ m68040_bus_slave #(.AW(20)) mem (
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
 	.ev_siz(ev_siz), .ev_tt(ev_tt), .ev_tm(ev_tm), .ev_err(ev_err)
 );
+
+//--------------------------------------------------------------------------
+// reset (MC68040UM 7.10, C.4): RSTO (the RESET instruction) only once the
+// bus cycle in progress is done -- no processor bus cycle starts or ends
+// while it is asserted, TIP is not asserted with it; once RSTI negates
+// the processor stays in reset for 128 bus clocks more (figure C-2, after
+// the two synchronizer clocks): no TS of its own before then
+//--------------------------------------------------------------------------
+always_ff @(posedge clk)
+	if (rsti_n && !rsto_n && bclk_en && a_oe && !ts_n) begin
+		errors <= errors + 1;
+		$display("FAIL: bus cycle with RSTO asserted (cycle %0d, a=%h)", cycles, a_o);
+	end
+always_ff @(posedge clk)
+	if (rsti_n && !rsto_n && ((ev && !am_drive) || (bclk_en && a_oe && !tip_n))) begin
+		errors <= errors + 1;
+		$display("FAIL: a bus cycle overlaps RSTO (cycle %0d, %s)", cycles,
+		         (ev && !am_drive) ? "a transfer ended" : "TIP asserted");
+	end
+int rst_age;                  // bus clocks since RSTI negated
+always_ff @(posedge clk)
+	if (!rsti_n) rst_age <= 0;
+	else begin
+		if (bclk_en && rst_age < 1000) rst_age <= rst_age + 1;
+		if (a_oe && !ts_n && rst_age < 128) begin
+			errors <= errors + 1;
+			$display("FAIL: TS %0d bus clocks after RSTI negated, inside the 128-clock internal reset (cycle %0d)",
+			         rst_age, cycles);
+		end
+	end
+
+//--------------------------------------------------------------------------
+// a halted processor (double bus fault, MC68040UM 7.6.3): it shows PST $5,
+// starts no bus cycle and does not ask for the bus until RSTI restarts it
+//--------------------------------------------------------------------------
+int halts, halt_bad;
+task automatic halt_reset();
+	int bad;
+	bad = 0;
+	repeat (2) @(posedge clk);          // (PST is registered)
+	for (int i = 0; i < 64; i++) begin
+		if (pst != 4'h5 || (!ts_n && a_oe) || !br_n) bad++;
+		@(posedge clk);
+	end
+	if (bad != 0) begin
+		halt_bad++;
+		$display("FAIL: halted processor: PST %h, bus not quiet (%0d clocks)", pst, bad);
+	end
+	rsti_n = 1'b0;
+	repeat (8) @(posedge clk);
+endtask
 
 //--------------------------------------------------------------------------
 // program load
@@ -425,10 +494,32 @@ task automatic prof_report();
 	end
 endtask
 logic        berr_armed, wberr_arm, fberr_armed;
+logic [15:0] halt_arm = 16'd0;   // (kept through the bench's resets)
+logic [15:0] trst_cnt;           // $F168 countdown
+// $F156: (not cleared by RSTI; the reset of a halted processor drops it)
+logic        fbk_on = 1'b0;
+logic [15:0] fbk_addr = 16'd0;
+wire         fbk_wr = ev && !ev_rd && !ev_err && ev_tt == 2'd0 && !am_drive &&
+                      (ev_addr[15:0] & 16'hFFFE) == 16'hF156;
+wire  [15:0] fbk_w  = ev_word(ev_addr, ev_data);
+logic        was_halted = 1'b0;
+always_ff @(posedge clk) begin
+	if (rsti_n) was_halted <= dbg_halted;
+	if (!rsti_n && was_halted) fbk_on <= 1'b0;
+	else if (fbk_wr) begin fbk_on <= (fbk_w != 16'd0); fbk_addr <= fbk_w; end
+end
+// $F168: reset the processor the written number of clocks later
+always_ff @(posedge clk)
+	if (!rsti_n) trst_cnt <= '0;
+	else if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && ev_addr[15:0] == 16'hF168)
+		trst_cnt <= ev_word(ev_addr, ev_data);
+	else if (trst_cnt != 16'd0) trst_cnt <= trst_cnt - 16'd1;
 logic [15:0] fberr_addr;
 logic [15:0] ipl_delay;
 logic  [7:0] ipl_pulse, ipl_step;
 logic  [2:0] ipl_next;
+logic  [7:0] ipl_skw;         // $F16E raise countdown
+logic  [2:0] ipl_skw_lvl;
 logic  [1:0] irq_exc_armed;   // $F144
 logic  [2:0] fetch_stall;     // hold the next instruction fetch this many clocks
 logic        fetch_hold;
@@ -522,6 +613,9 @@ always_comb begin
 		if (fberr_armed && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
 		    xfer_addr[15:2] == fberr_addr[15:2])
 			tea_req = 1'b1;
+		if (fbk_on && (xfer_tm == 3'd2 || xfer_tm == 3'd6) && !am_drive &&
+		    xfer_addr[31:2] == {16'd0, fbk_addr[15:2]})
+			tea_req = 1'b1;
 		if (wberr_arm && (xfer_tm == 3'd3 || xfer_tm == 3'd4))
 			tea_req = 1'b1;
 	end
@@ -529,8 +623,12 @@ end
 
 always_ff @(posedge clk) begin
 	cycles <= cycles + 1;
+	ipl_old <= ipl_lvl;
 	if (!rsti_n) begin
 		ipl_lvl     <= 3'd0;
+		ipl_lagm    <= ipl_lagm_def;
+		ipl_skw     <= '0;
+		ipl_skw_lvl <= '0;
 		berr_armed  <= 1'b1;     // the first access to $F140 is rejected (old bench)
 		wberr_arm   <= 1'b0;
 		fberr_armed <= 1'b0;
@@ -670,6 +768,10 @@ always_ff @(posedge clk) begin
 			ipl_step <= ipl_step - 1'd1;
 			if (ipl_step == 8'd1) ipl_lvl <= ipl_next;
 		end
+		if (ipl_skw != 0) begin
+			ipl_skw <= ipl_skw - 1'd1;
+			if (ipl_skw == 8'd1) ipl_lvl <= ipl_skw_lvl;
+		end
 		if (ev && ev_err) begin
 			// one-shot injections clear themselves
 			if (ev_addr[15:0] == 16'hF140) berr_armed <= 1'b0;
@@ -720,6 +822,8 @@ always_ff @(posedge clk) begin
 				16'hF14C: begin ipl_lvl <= w[2:0]; ipl_pulse <= w[15:8]; end
 				16'hF150: begin ipl_lvl <= w[2:0]; ipl_next <= w[6:4]; ipl_step <= w[15:8]; end
 				16'hF154: begin fberr_armed <= (w != 16'd0); fberr_addr <= w; end
+				16'hF158: halt_arm <= w;
+				16'hF16E: begin ipl_lagm <= w[2:0]; ipl_skw_lvl <= w[6:4]; ipl_skw <= w[15:8]; end
 				16'hF2C0: pins_r <= w[1:0];
 				16'hF2C4: begin
 					rs_en    <= w[15];
@@ -896,12 +1000,16 @@ initial begin
 	tbi_mode = tbiv[1:0];
 	if (!$value$plusargs("retry=%d", retry_pct)) retry_pct = 0;
 	bclk2 = $test$plusargs("bclk2");
+	if (!$value$plusargs("iplskew=%d", iplskew)) iplskew = 0;
+	ipl_lagm_def = iplskew[2:0];
 	trace = $test$plusargs("trace");
 	ptrace = $test$plusargs("ptrace");
 	prof = $test$plusargs("prof");
 	result = 0;
 	errors = 0;
 	cycles = 0;
+	halts = 0;
+	halt_bad = 0;
 	stamp_prev = 0;
 	insn_prev = 0;
 	load_prog();
@@ -910,10 +1018,27 @@ initial begin
 	mem.mem[16'hF164 >> 2] = 32'd0;
 	repeat (8) @(posedge clk);
 	rsti_n = 1'b1;
-	while (result == 0 && cycles < timeout && !dbg_halted) @(posedge clk);
+	while (result == 0 && cycles < timeout) begin
+		if (trst_cnt == 16'd1) begin
+			// the program's timed reset ($F168): RSTI for 12 clocks
+			rsti_n = 1'b0;
+			repeat (12) @(posedge clk);
+			halts++;
+			mem.mem[16'hF158 >> 2] = {mem.mem[16'hF158 >> 2][31:16], 16'(halts)};
+			rsti_n = 1'b1;
+		end
+		if (dbg_halted) begin
+			if (halts >= int'(halt_arm)) break;
+			halt_reset();
+			halts++;
+			mem.mem[16'hF158 >> 2] = {mem.mem[16'hF158 >> 2][31:16], 16'(halts)};
+			rsti_n = 1'b1;
+		end
+		@(posedge clk);
+	end
 	if (prof) prof_report();
 	if (pcprof) pcprof_dump();
-	if (result == 1 && errors == 0)
+	if (result == 1 && errors == 0 && halt_bad == 0)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)
 		$display("FAIL %s: %s at pc=%h, last test %0d", prog,
