@@ -20,7 +20,8 @@ module ap68040_alu_slow
 	output logic  [5:0] nx,         // ... formed here from cnt (for that register)
 	input  logic  [4:0] flags_in,   // X N Z V C
 	output logic [31:0] res,
-	output logic  [4:0] flags_out
+	output logic  [4:0] flags_out,
+	output logic        sim_c       // (simulation: the carry as the funnel forms it)
 );
 
 wire f_x = flags_in[4];
@@ -178,38 +179,62 @@ always_comb begin
 		tm[i] = (6'(i) < nbits) && ((nbits - 6'd1 - 6'(i)) < sh_n);
 	vl = (yv & tm) != 32'd0;
 	sh_r = bm;
-	sh_c = 1'b0;
-	sh_x = f_x;
 	sh_v = 1'b0;
 	if (sh_n != 6'd0) begin
 		case (op)
 			OP_ASL, OP_LSL: begin
 				sh_r = lo[31:0] & szmask;
-				sh_c = (sh_n <= nbits) && (sh_n[5] ? bm[0] : lo[nbits]);
-				sh_x = sh_c;
 				if (op == OP_ASL)
 					sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
 			end
-			OP_LSR, OP_ASR: begin
-				sh_r = ro[32:1] & szmask;
-				sh_c = ro[0];
-				sh_x = sh_c;
-			end
-			OP_ROL, OP_ROR: begin
-				sh_r = ro[31:0] & szmask;
-				sh_c = (op == OP_ROL) ? sh_r[0] : sh_r[nbits - 6'd1];
-			end
-			default: begin   // ROXL, ROXR
-				sh_x = ro[nbits];
-				sh_r = ro[31:0] & szmask;
-				sh_c = sh_x;
-			end
+			OP_LSR, OP_ASR: sh_r = ro[32:1] & szmask;
+			default:        sh_r = ro[31:0] & szmask;   // rotates
 		endcase
 	end
-	else if (op == OP_ROXL || op == OP_ROXR) begin
-		// count 0: C = X, X unchanged
-		sh_c = f_x;
+	// The carry (the last bit moved out) and X come from the operand bit
+	// at that step's index -- one 32:1 multiplexer on the operand, the
+	// index a subtraction from the count -- not from the funnel: C and X
+	// are needed in the op's first cycle (N and Z come from the registered
+	// result in the second), and the funnel with the flag multiplexers
+	// behind it does not close at 60 MHz.  The funnel's own carry (sim_c)
+	// is checked against it in simulation.
+	//   LSL/ASL by n (1..size):  bit size-n;  n > size: 0
+	//   LSR by n:                bit n-1;     n > size: 0;  ASR: the sign
+	//   ROL by k = n mod size:   bit size-k (k = 0: bit 0)
+	//   ROR by k:                bit k-1     (k = 0: bit size-1)
+	//   ROXL by m = n mod (size+1): bit size-m;  ROXR: bit m-1;  m = 0: X
+	//   count 0: C = 0 (ROXL/ROXR: X); X unchanged (shifts: X = C)
+	begin : direct_c
+		logic [5:0] ck, ci;
+		logic       left, rox, rot, c_bit;
+		rox  = (op == OP_ROXL) || (op == OP_ROXR);
+		rot  = (op == OP_ROL) || (op == OP_ROR);
+		left = (op == OP_ASL) || (op == OP_LSL) || (op == OP_ROL) || (op == OP_ROXL);
+		ck   = rox ? sh_nx : rot ? sh_nm : sh_n;
+		ci   = left ? (nbits - ck) : (ck - 6'd1);
+		if (rot && sh_nm == 6'd0) ci = (op == OP_ROL) ? 6'd0 : (nbits - 6'd1);
+		c_bit = bm[ci[4:0]];
+		if (sh_n == 6'd0)             sh_c = rox ? f_x : 1'b0;
+		else if (rox)                 sh_c = (sh_nx == 6'd0) ? f_x : c_bit;
+		else if (rot)                 sh_c = c_bit;
+		else if (sh_n > nbits)        sh_c = (op == OP_ASR) ? b_msb : 1'b0;
+		else                          sh_c = c_bit;
+		sh_x = (sh_n != 6'd0 && !rot) ? sh_c : f_x;
 	end
+end
+// (simulation) the carry from the funnel, the form the direct one replaces
+always_comb begin
+	sim_c = 1'b0;
+	if (sh_n != 6'd0) begin
+		case (op)
+			OP_ASL, OP_LSL: sim_c = (sh_n <= nbits) && (sh_n[5] ? bm[0] : lo[nbits]);
+			OP_LSR, OP_ASR: sim_c = ro[0];
+			OP_ROL:         sim_c = ro[0];
+			OP_ROR:         sim_c = ro[nbits - 6'd1];
+			default:        sim_c = ro[nbits];   // ROXL, ROXR
+		endcase
+	end
+	else if (op == OP_ROXL || op == OP_ROXR) sim_c = f_x;
 end
 
 always_comb begin
@@ -227,8 +252,11 @@ always_comb begin
 		OP_PACK: res = {b[31:8], pack_r};
 		OP_UNPK: res = {b[31:16], unpk_r};
 		OP_ASL, OP_ASR, OP_LSL, OP_LSR, OP_ROL, OP_ROR, OP_ROXL, OP_ROXR: begin
+			// (N and Z: the back end forms them from the registered result
+			// in the op's second cycle; nothing of the funnel reaches the
+			// flags here)
 			res = merge(sh_r, b, szmask);
-			flags_out = {sh_x, msb_of(sh_r, sz), (sh_r & szmask) == 32'd0, sh_v, sh_c};
+			flags_out = {sh_x, 1'b0, 1'b0, sh_v, sh_c};
 		end
 		default: ;
 	endcase

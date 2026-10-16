@@ -919,11 +919,20 @@ exo_t xf, xs, xs_q;
 
 logic [31:0] sl_res;
 logic  [4:0] sl_flags;
+logic        sl_sim_c;
 ap68040_alu_slow alu_s (
 	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
 	.nx_q(rox_nx_q), .nx(rox_nx),
-	.res(sl_res), .flags_out(sl_flags)
+	.res(sl_res), .flags_out(sl_flags), .sim_c(sl_sim_c)
 );
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && ex_shift && (!ex_pre || ex_pb) && sl_flags[0] !== sl_sim_c) begin
+		$display("FAIL: the shift's direct carry %b, the funnel's %b (op %0d, sz %0d, count %0d, b %h, pc %h)",
+		         sl_flags[0], sl_sim_c, ex_u.op, ex_u.sz, ex_a[5:0], ex_bv, ex_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 // synthesis translate_off
 always_ff @(posedge clk)
 	if (nreset && ex_v && wb_v && ew_same != (ex_u.pc == wb_u.pc)) begin
