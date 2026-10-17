@@ -953,14 +953,34 @@ assign dm_hold1 = sn_frz || steal || steal_q || (m1.v && m1_stale) ||
                   (e_st != E_IDLE && e_st != E_W_START &&
                    e_st != E_W_PART && e_st != E_W_DONE);
 
+// the table walk's descriptor line in the cache: the hit and its way, from
+// the tags read at the walk's set (E_TW_DLK reads the descriptor from it,
+// E_TW_UPD pushes or invalidates it before the update)
+logic        tw_hw_h;
+logic  [1:0] tw_hw_w;
+always_comb begin
+	tw_hw_h = 1'b0; tw_hw_w = 2'd0;
+	for (int i = 0; i < 4; i++)
+		if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin tw_hw_h = 1'b1; tw_hw_w = 2'(i); end
+end
+// the data RAM's way for the engine's readers, one select (and one line
+// multiplexer) for all of them: the snooper's way while it has the cache
+// (the engine is frozen then), the walk's descriptor way, the fill's or
+// push's victim way, else the job's way
+wire  [1:0]  dq_wsel = sn_frz ? sn_way :
+                       (e_st == E_TW_DLK || e_st == E_TW_UPD) ? tw_hw_w :
+                       (e_st == E_FILL_W || e_st == E_PUSHV_W) ? f_way : e_x.way;
+wire [127:0] dq_w    = dq_rn[dq_wsel];
 // the engine's operand bytes, one extractor for its states: E_SP_3 the
 // rest of a split load from the stolen read, E_S_ACT from the line a fill
-// delivered (bo_line), E_S_RD2 from the read way
+// delivered (bo_line), E_S_RD2 from the read way, E_TW_DLK the descriptor
+// from the walk's line
 wire  [2:0]  sp_n0    = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
 wire         etk_sp   = (e_st == E_SP_3);
-wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_rn[e_x.way];
-wire  [3:0]  etk_o    = etk_sp ? 4'd0 : e_va[3:0];
-wire  [2:0]  etk_n    = etk_sp ? 3'(nbytes(m2.r.msz) - sp_n0) : e_n;
+wire         etk_tw   = (e_st == E_TW_DLK);
+wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_w;
+wire  [3:0]  etk_o    = etk_tw ? tw_da[3:0] : etk_sp ? 4'd0 : e_va[3:0];
+wire  [2:0]  etk_n    = etk_tw ? 3'd4 : etk_sp ? 3'(nbytes(m2.r.msz) - sp_n0) : e_n;
 wire [31:0]  etk      = take(etk_line, etk_o, etk_n);
 
 always_ff @(posedge clk) begin
@@ -1439,7 +1459,7 @@ always_ff @(posedge clk) begin
 		end
 		E_S_RDW: e_st <= E_S_RD2;
 		E_S_RD2: begin
-			if (m2.r.msz == SZ_Q) mv_line <= dq_rn[e_x.way];
+			if (m2.r.msz == SZ_Q) mv_line <= dq_w;
 			else e_acc <= (e_acc << (8 * e_n)) | etk;
 			e_st <= E_S_NEXT;
 		end
@@ -1758,7 +1778,7 @@ always_ff @(posedge clk) begin
 		E_FILL_W: begin
 			if (lve_q[f_way] && ld_q[f_way]) begin     // (ld_ra, lv_ra: f_set)
 				pv_v     <= 1'b1;
-				pv_line  <= dq_rn[f_way];
+				pv_line  <= dq_w;
 				pv_lpa   <= {tq_b[f_way], f_set};
 				pv_dirty <= 1'b1;
 				pv_tln   <= f_way;
@@ -1850,7 +1870,7 @@ always_ff @(posedge clk) begin
 		E_PUSHV_W: begin
 			if (lve_q[f_way] && ld_q[f_way]) begin     // (ld_ra, lv_ra: f_set)
 				pv_v     <= 1'b1;
-				pv_line  <= dq_rn[f_way];
+				pv_line  <= dq_w;
 				pv_lpa   <= {tq_b[f_way], f_set};
 				pv_dirty <= 1'b1;
 				pv_tln   <= f_way;
@@ -1969,12 +1989,8 @@ always_ff @(posedge clk) begin
 		end
 		E_TW_DESCW: e_st <= E_TW_DLK;
 		E_TW_DLK: begin
-			logic h; logic [1:0] w;
-			h = 1'b0; w = 2'd0;
-			for (int i = 0; i < 4; i++)
-				if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin h = 1'b1; w = 2'(i); end
-			if (h && dc_en) begin
-				tw_d <= take(dq_rn[w], tw_da[3:0], 3'd4);
+			if (tw_hw_h && dc_en) begin
+				tw_d <= etk;                  // (the extractor: the walk's line)
 				e_st <= E_TW_EVAL;
 			end
 			else begin
@@ -2071,9 +2087,7 @@ always_ff @(posedge clk) begin
 			nd    = tw_d | 32'h8 | (setm ? 32'h10 : 32'h0);
 			// (back from the push: e_ret is this state, the caller in e_wret)
 			caller = (e_ret == E_TW_UPD) ? e_wret : e_ret;
-			h = 1'b0; w = 2'd0;
-			for (int i = 0; i < 4; i++)
-				if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin h = 1'b1; w = 2'(i); end   // (lv_ra: tw_da)
+			h = tw_hw_h; w = tw_hw_w;         // (lv_ra: tw_da)
 			e_wret <= caller;
 			if (h && ld_q[w]) begin
 				// a dirty copy: pushed (E_PUSHV invalidates it), then back here
@@ -2369,7 +2383,7 @@ always_ff @(posedge clk)
 
 // snoop: the line found, valid with sn_look (the RAM still reads the
 // snooped set in the first H cycle)
-assign sn_line = (sn_src == 2'd0) ? dq_rn[sn_way] : (sn_src == 2'd1) ? pv_line : bo_line;
+assign sn_line = (sn_src == 2'd0) ? dq_w : (sn_src == 2'd1) ? pv_line : bo_line;
 
 assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) ||
                  (e_st == E_TW_DLK) || (e_st == E_TW_DBUS) || (e_st == E_TW_EVAL) ||
