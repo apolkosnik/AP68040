@@ -454,6 +454,7 @@ end
 always_comb begin
 	logic [31:0] disp;
 	logic        nredir;
+	logic        pcrel, fdb;          // a PC-relative branch target (FDBcc's base is PC+4)
 	nrec    = '0;
 	go      = 1'b0;
 	go_part = 1'b0;
@@ -466,6 +467,8 @@ always_comb begin
 	lp_ovr  = 1'b0;
 	jsr_k   = 1'b0;
 	disp    = '0;
+	pcrel   = 1'b0;
+	fdb     = 1'b0;
 	nph     = ph;
 
 	if (ph != PH_IDLE) begin
@@ -556,8 +559,10 @@ always_comb begin
 				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
 				                 qpc + {28'd0, fb, 1'b0},
 				                 win[fb], win[3'(fb + 1)], 16'd0, 16'd0, 16'd0);
+				// (EA1 is MOVE's destination, data alterable: never
+				// PC-relative, so it takes no PC base and no adder)
 				nrec.ea1 = mk_ea(pd0.i1, opw[11:9], {1'b0, fp1}, 3'd0,
-				                 qpc + {28'd0, fp1, 1'b0},
+				                 32'd0,
 				                 win[fp1], win[3'(fp1 + 1)], 16'd0, 16'd0, 16'd0);
 			end
 		end
@@ -632,7 +637,7 @@ always_comb begin
 			disp = (opw[7:0] == 8'h00) ? sx16(win[1]) :
 			       (opw[7:0] == 8'hFF) ? {win[1], win[2]} :
 			       {{24{opw[7]}}, opw[7:0]};
-			ntarget = qpc + 32'd2 + disp;
+			pcrel   = 1'b1;
 			teq     = (disp == bt_d2);
 			nrec.bst = disp[31];
 			nrec.bhc = bht_q;
@@ -660,7 +665,7 @@ always_comb begin
 		end
 		else if (a0.rt == UA_DBCC) begin
 			disp    = sx16(win[1]);
-			ntarget = qpc + 32'd2 + disp;
+			pcrel   = 1'b1;
 			teq     = (disp == bt_d2);
 			nrec.bst = disp[31];
 			lp_br   = disp[31];
@@ -669,16 +674,19 @@ always_comb begin
 		end
 		else if (a0.rt == UA_FBCC) begin
 			disp    = opw[6] ? {win[1], win[2]} : sx16(win[1]);
-			ntarget = qpc + 32'd2 + disp;
+			pcrel   = 1'b1;
 			teq     = (disp == bt_d2);
 			nredir  = (opw[5:0] == 6'h0F) || disp[31];
 		end
 		else if (a0.rt == UA_FDBCC) begin
 			disp    = sx16(win[2]);
-			ntarget = qpc + 32'd4 + disp;
+			pcrel   = 1'b1;
+			fdb     = 1'b1;
 			teq     = (disp == bt_d2 - 32'd2);
 			nredir  = disp[31];
 		end
+		// (one adder for every PC-relative branch target)
+		if (pcrel) ntarget = qpc + disp + {29'd0, fdb, !fdb, 1'b0};
 		if (a0.rt == UA_FPU_GEN && nrec.ea0.m == EM_IMM)
 			nrec.ea0.bd = qpc + 32'd4;
 		nrec.target = flt ? f_addr : ntarget;

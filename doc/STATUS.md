@@ -7,10 +7,10 @@
 | M0 | the AP68060 tree converted back to the 68040 (631f440): MSP/ISP, format $7 frames with the restart model, MOVEM continuation, T0/T1 trace, the 040 MOVEC set, CACR/TC, PTEST/MMUSR, nonresident ATC entries, table walks through the data cache, 4 KB caches, the 040 snooper, BIU and bus protocol, 128-clock reset, IPL sampling, PST codes, FPU revision $41 frames; the 060 round's pipeline work kept | done |
 | M1 | regression: 29 programs x 5 bus configurations, the exhaustive decode bench | done |
 | M2 | cputest corpus replay (tb/tb_cputest.sv): the sampled corpus | done: 3,778 of 3,801 slices, the rest the known generator defects |
-| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done at 92ea705: +0.37 / +0.22 / +0.65 ns at the 100C slow corner (the timing section) |
-| M4 | area: under 20,000 ALMs with every feature | not reached: 21,436 at the conversion, 20,761 - 20,822 at 92ea705 (the synthesis estimate is 19,869; the fitter's packing adds the rest); the levers left are in the area section |
+| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done: +0.33 / +0.05 / +0.16 ns at the 100C slow corner after the area round (the timing section) |
+| M4 | area: under 20,000 ALMs with every feature | done: 19,443 - 19,519 ALMs on three seeds (21,436 at the conversion); the area section |
 | M5 | the AP68060's tests under the 68040's rules: level 7 interrupts, IPL skew, an interrupt among snoop invalidations, nested exceptions and double faults, RESET and the halted bus, the cache cases (t_irq7, t_iplglitch, t_snirq, t_xnest, t_halt, t_cache2) | done |
-| M6 | performance | Dhrystone 2.1: 948 cycles/iteration, 36.0 DMIPS at 60 MHz (0.600 DMIPS/MHz); Whetstone 469,922 cycles/loop, 12.77 MWIPS |
+| M6 | performance | Dhrystone 2.1: 964 cycles/iteration, 35.4 DMIPS at 60 MHz (0.590 DMIPS/MHz); Whetstone 469,922 cycles/loop, 12.77 MWIPS (948 cycles/iteration with DIV_STEPS 4) |
 
 ## Regression
 
@@ -89,6 +89,31 @@ nanosecond, so a change is judged on three):
 | 1a48b50 | 20,728 - 20,763 | -0.22 / +0.03 / -0.34 | datatype and unimplemented-instruction frames captured in one state from the shadow registers (-531 ALUTs by measurement of the capture paths); imm_b a signed word; the normalizer's select into a_m and the walk's compare from the valid-copy RAM into the hit update are the failing paths |
 | 1434241 | 20,733 - 20,781 | +0.49 / +0.18 / +0.05 | the normalizer's count registered before its shift: 60 MHz on every seed |
 | 92ea705 | 20,761 - 20,822 | +0.37 / +0.22 / +0.65 | the table walk's line compare registered throughout the walk: the walk's update state off the hit update; the remaining worst paths are the TC register into the engine's hit decision, the fetch queue's word into D1's record, and the ATC's address into the engine's physical address |
+| area round | 19,443 - 19,519 | +0.33 / +0.05 / +0.16 | below |
+
+The area round (synthesis estimates, ALMs needed, each change against the
+one before; the fit lands about 800 above the estimate):
+
+| change | ALMs |
+|---|---:|
+| DIV_STEPS 2 at the top level as well (the top's default had stayed 4: every earlier fit had the four-step divider) | -78 |
+| FPU: the add, multiply, divide and square-root results through one window select into a_m and grs | -36 |
+| FPU: one incrementer for F_ROUND and the single/double register stores | -43 |
+| DMU: the ATC's lookup set (later its page and FC2) registered, the steal lagging a cycle; DC1_ATC 0 (no second ATC copy, no 16-way compare) | -222 |
+| D1: one adder for every PC-relative branch target; MOVE's destination EA without a PC base | -79 |
+| FPU: single and double stores (and F_PACKS) in one form, the single's fields the double's upper bits | -286 |
+| bit fields: one right rotator for BFINS's source, the extracted field and the register write-back | -116 |
+| fetch: the instruction cache's data RAM by long word, fills written beat by beat | -91 |
+| fetch: no line buffer -- the tag written as the fill starts, the fetched long word kept for TCI and failed fills | -198 |
+| timing: the shift kind registered with the EX uop; DC1's tag compare from the raw tag RAM output, its transparency registered; the register file's write classified per source; the fetch walk's registers loaded in E_IDLE | +31 |
+
+Measured and not taken in the round: the fetch BTB off (-205 ALMs, but
+Dhrystone 964 -> 1,345 cycles); D1's return stack (-37) and history table
+(-34) off; the snooper's line copy replaced by a word port (no ALMs, and
+the DMU frozen longer); the integer stores in one form (-1).  What remains
+measurable: CHK2/CMP2's bound compares (117 ALMs if removed), the FPU's
+gradual underflow (64), DC2's store merges (54), the MOVE16 line buffer
+(up to 127).
 
 What the options cost, synthesis estimates (syn/mapvar.sh, ALMs needed
 and combinational ALUTs) of the same RTL with one option on; their
@@ -98,7 +123,7 @@ results -1.9 %, the loop predictor -4.4 %; FP workloads with the pipeline
 
 | option on | ALMs (estimate) | ALUTs |
 |---|---:|---:|
-| none (the default) | 19,869 | 28,088 |
+| none (the default, before the area round) | 19,869 | 28,088 |
 | FPU_PIPE | +714 | +1,417 |
 | LOOP_PRED | +427 | +753 |
 | EARLY_RES | +519 | +783 |
@@ -114,7 +139,7 @@ table walk's locked update sequencing.
 
 With the Minimig project's fitter settings (physical synthesis with
 retiming, sparse register packing; `MISTER=1 syn/fitcore.sh`) the same
-RTL fits about 100 ALMs larger and the retiming moves the worst paths:
+RTL fitted about 100 ALMs larger before the area round, and about 580 larger after it (20,079 ALMs at seed 1, +0.14 ns): its sparse register packing undoes much of the round's gain, and the retiming moves the worst paths:
 that build's closure is its own matter.
 
 ## Timing
@@ -136,6 +161,20 @@ the TC register into the miss engine's hit decision, the fetch queue's
 word into D1's record, the ATC's address into the engine's physical
 address, the EX operand into the result register, and the valid bit into
 the register file's live-value table.
+
+In the area round, with DC1 reading the shared ATC port: the steal's
+address multiplexer in front of the entries (the set, then the page and
+FC2, registered with a cycle's lag: the engine reads the port a cycle or
+more after taking it, and DC1 is held the cycle after a steal); the TTR
+match into DC1's tag compare (the registered transparency selects); the
+tag RAM's write bypass into DC1's hit (DC1 compares the raw output: tags
+are written only by the engine, and DC1's lookup is stale then); the EX
+opcode decode into the slow ALU's amount select (the shift kind
+registered); the FPU state into the register file's class flags (each
+source classified, then selected); the WB kill into the fetch walk's
+registers (loaded in E_IDLE).  After it the paths nearest the limit are
+the engine's bus state into the EX-stage record's hit, DC2's address into the engine's
+hit, and the EX opcode into DC1's operand forwarding.
 
 ## Known corpus failures
 

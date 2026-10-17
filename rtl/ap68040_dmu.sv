@@ -55,7 +55,7 @@ module ap68040_dmu
 #(
 	// DC1's own ATC read port and tag compare beside xlate (65 MHz timing;
 	// 0: DC1's hit and way are xlate's, the port is not built)
-	parameter bit DC1_ATC = 1
+	parameter bit DC1_ATC = 0
 )
 (
 	input  logic        clk,
@@ -359,6 +359,12 @@ wire        la_ag    = adv_ag && !sn_rset && !steal;
 
 // tags: port A for lookups (DC1 or stolen), port B for engine reads/writes
 logic [21:0] tq_a [4];
+// the tags as the RAM read them, without the same-edge write laid over:
+// DC1's compare.  Tags are written only by the engine's fill (tw_b), and a
+// DC1 lookup with the engine busy is stale (m1_stale) and not used, so the
+// bypass's compare and multiplexer stay off DC1's hit
+logic [21:0] tq_r [4];
+logic        m1_stale;          // DC1's lookup is not to be used (below)
 logic [21:0] tq_b [4];
 logic        tw_b;
 logic  [5:0] tset_b;
@@ -428,7 +434,7 @@ generate
 		ap68040_tdp #(.AW(6), .DW(22)) tag (
 			.clk(clk),
 			.addr_a(la_set_n), .we_a(1'b0), .wd_a(22'd0), .q_a(tq_a[gw]),
-			.qa_raw(), .qa_bv(), .qa_bd(),
+			.qa_raw(tq_r[gw]), .qa_bv(), .qa_bd(),
 			.addr_b(tset_b), .we_b(tw_b && tway_b == 2'(gw)), .wd_b(twd_b), .q_b(tq_b[gw])
 		);
 		ap68040_sdp_be #(.AW(6), .NB(16), .OREG(0)) dat (
@@ -492,6 +498,17 @@ atce_t       atc_e;
 logic  [3:0] atc_hv, atc_hvd;
 logic [19:0] atc_wpa [4], atc_wpad [4];
 logic  [3:0] m1_aset;            // DC1's ATC set, registered with its address
+// The main ATC port's set, a flip-flop: DC1's (m1_aset) one cycle, the
+// stolen address's the cycle after the engine stole the port.  The engine
+// reads the port a cycle or more after it sets st_la, and DC1 is held the
+// cycle after a steal ends (steal_q): neither uses the lagging cycle.
+// (its fanout capped: it reaches every way's entry array, and the
+// fitter duplicates it per way rather than routing one copy to all)
+(* altera_attribute = "-name MAX_FANOUT 14" *) logic [3:0] atc_set_q;
+// ... and the page and FC2 its tags are compared with, registered the same
+// way (no multiplexer between the steal flag and the compare)
+logic [31:12] atc_la_q;
+logic         atc_fc2_q;
 logic        atc_wr;
 logic [31:0] atc_wla;
 logic        atc_wfc2;
@@ -500,9 +517,9 @@ logic        atc_fall, atc_fpage, atc_fng;
 
 logic        tw_upd;              // the search updates an entry (first write: M)
 logic  [3:0] tw_hw;               // ... in this way (the ATC's hit vector then)
-ap68040_atc #(.SAME_SEARCH(0)) datc (
+ap68040_atc #(.SAME_SEARCH(0), .EXT_SET(1)) datc (
 	.clk(clk), .nreset(nreset), .p8k(tc_p),
-	.la(steal ? st_la : m1.a), .fc2(steal ? st_fc2 : m1.smode),
+	.la({atc_la_q, 12'd0}), .fc2(atc_fc2_q), .set_m(atc_set_q),
 	.hit(atc_hit), .ent(atc_e), .hv(atc_hv), .wpa(atc_wpa),
 	.la_d(m1.a), .fc2_d(m1.smode), .set_d(m1_aset), .hv_d(atc_hvd), .wpa_d(atc_wpad),
 	.wr(atc_wr), .wla(atc_wla), .wfc2(atc_wfc2), .went(atc_went),
@@ -592,7 +609,7 @@ always_comb begin
 	logic        transp;
 	logic [21:0] tq [4];
 	logic  [3:0] mj;
-	tq[0] = tq_a[0]; tq[1] = tq_a[1]; tq[2] = tq_a[2]; tq[3] = tq_a[3];
+	tq[0] = tq_r[0]; tq[1] = tq_r[1]; tq[2] = tq_r[2]; tq[3] = tq_r[3];
 	transp = m1_tp;
 	for (int j = 0; j < 4; j++) begin
 		logic ma;
@@ -602,16 +619,19 @@ always_comb begin
 				ma = 1'b1;
 		mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:10]) : ma);
 	end
-	if (DC1_ATC) begin
-		d1_hit = |mj;
-		d1_way = mj[3] ? 2'd3 : mj[2] ? 2'd2 : mj[1] ? 2'd1 : 2'd0;
-		d1_mj  = mj;
+	if (!DC1_ATC) begin
+		// the main port's entry (its hit and page), compared with each way's
+		// tag beside the untranslated address: the registered transparency
+		// selects, so the TTR compare and the translation's address select
+		// stay off the tag compare
+		logic [21:0] tpa;
+		tpa = {atc_e.pa[19:1], tc_p ? m1.a[12] : atc_e.pa[0], m1.a[11:10]};
+		for (int j = 0; j < 4; j++)
+			mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:10]) : (atc_hit && tq[j] == tpa));
 	end
-	else begin
-		d1_hit = x_dc1r.hit;
-		d1_way = x_dc1r.way;
-		d1_mj  = x_dc1r.hit ? (4'd1 << x_dc1r.way) : 4'd0;
-	end
+	d1_hit = |mj;
+	d1_way = mj[3] ? 2'd3 : mj[2] ? 2'd2 : mj[1] ? 2'd1 : 2'd0;
+	d1_mj  = mj;
 end
 // synthesis translate_off
 // (the engine's state for the bench's profile: a parameterized module's
@@ -628,7 +648,8 @@ always_ff @(posedge clk) begin
 	           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lvd_q);
 	// (while the engine steals the ATC's main port, xlate sees its address,
 	// not DC1's: DC1 waits then)
-	if (nreset && !steal && m1.ack == 2'd0 && (xo.hit != x_dc1.hit || (xo.hit && xo.way != x_dc1.way)))
+	if (nreset && !steal && m1.ack == 2'd0 && m1.v && !m1_stale &&
+	    (xo.hit != x_dc1.hit || (xo.hit && xo.way != x_dc1.way)))
 	begin
 		$display("FAIL: DMU: the parallel tag compare says hit=%b way=%0d, xlate hit=%b way=%0d",
 		         x_dc1.hit, x_dc1.way, xo.hit, xo.way);
@@ -640,10 +661,8 @@ end
 always_comb begin
 	x_dc1 = x_dc1r;
 	// (the same hit and way, from the parallel compare)
-	if (DC1_ATC) begin
-		x_dc1.hit = d1_hit && x_dc1.ok && !x_dc1.flt;
-		x_dc1.way = d1_way;
-	end
+	x_dc1.hit = d1_hit && x_dc1.ok && !x_dc1.flt;
+	x_dc1.way = d1_way;
 	if (m1.ack != 2'd0) begin
 		// CPU space (interrupt acknowledge) is never translated nor cached
 		x_dc1     = '0;
@@ -694,7 +713,6 @@ wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
                 (m4.r.v && (m4.r.mem == M_ST || m4.r.mem == M_RMW));
 // a RAM write to the load's set, or any engine activity, after its lookup
 // read the RAM makes the captured line stale: the engine reads it again
-logic m1_stale;
 
 // (a store that left WB is still being written this cycle: dw)
 wire fast_now = m2.r.v && m2.fast && !hzf && !(dw && !dwp && dw_set == m2.r.a[9:4]);
@@ -1002,6 +1020,11 @@ always_ff @(posedge clk) begin
 	tw_b      <= 1'b0;
 	dw        <= 1'b0;
 	steal_q   <= steal;
+	atc_la_q  <= steal  ? st_la[31:12] : adv_ag ? dm_va[31:12] : m1.a[31:12];
+	atc_fc2_q <= steal  ? st_fc2 : adv_ag ? dm_super : m1.smode;
+	atc_set_q <= steal  ? (tc_p ? st_la[16:13] : st_la[15:12]) :
+	             adv_ag ? (tc_p ? dm_va[16:13] : dm_va[15:12]) :
+	                      (tc_p ? m1.a[16:13]  : m1.a[15:12]);
 
 	if (!nreset) begin
 		m1 <= '0; m2 <= '0; m3 <= '0; m4 <= '0;
@@ -1185,6 +1208,13 @@ always_ff @(posedge clk) begin
 		case (e_st)
 		E_IDLE: begin
 			steal <= 1'b0;
+			// a fetch's walk: its registers loaded whatever the engine takes
+			// up (they are free while it is idle, and every other walk loads
+			// its own), so the job choice -- the kill late in it -- is not
+			// their enable
+			if (iw_req && !iw_done) begin
+				tw_va <= iw_va; tw_s <= iw_fc2; tw_wr <= 1'b0; tw_pt <= 1'b0; tw_i <= 1'b1;
+			end
 			if (wfs_p1)
 				;                       // a split WB store's second part next
 			else if (mt_v && !mt_done)
@@ -1194,7 +1224,6 @@ always_ff @(posedge clk) begin
 			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now)
 				e_st <= E_S_START;
 			else if (iw_req && !iw_done) begin
-				tw_va <= iw_va; tw_s <= iw_fc2; tw_wr <= 1'b0; tw_pt <= 1'b0; tw_i <= 1'b1;
 				e_ret <= E_I_DONE;
 				e_st  <= E_TW_START;
 			end

@@ -3,7 +3,7 @@
 # /home/adam/ap68040-60/obj, NOT /tmp: it is a small tmpfs on this host).
 set -e
 cd "$(dirname "$0")"
-RTL=../rtl
+RTL=${RTL:-../rtl}
 WORK=${WORK:-$(cd .. && pwd)/obj}
 mkdir -p "$WORK"
 python3 ../tools/ucode.py

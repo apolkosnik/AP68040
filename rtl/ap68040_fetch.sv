@@ -9,7 +9,11 @@
 // valid bit per line, replacement by the first invalid way, else a 2-bit  //
 // counter.  Lines are filled by a burst (critical long word first, TBI    //
 // handled by the BIU, TCI: the line is not allocated).  Cache-inhibited   //
-// pages and CACR.IE = 0 fetch long words.                                  //
+// pages and CACR.IE = 0 fetch long words.  The data RAM holds a long word //
+// per address: F1 reads its long word of each way, a fill writes each    //
+// beat into the victim way as it arrives; the victim is invalidated and   //
+// retagged as the fill starts and validated when it completes (a TCI or  //
+// failed fill leaves it invalid, 4.6.1).                                  //
 //                                                                          //
 // I-ATC (3.3): 64 entries like the D-ATC, translating supervisor and user //
 // program space; ITT0/ITT1 transparent translation.  An ATC miss asks the //
@@ -267,7 +271,7 @@ atce_t       atc_e;
 ap68040_atc #(.SAME_SEARCH(0)) iatc (
 	.clk(clk), .nreset(nreset), .p8k(tc_p),
 	.la(iatc_flush_page ? iatc_flush_la : fpc),
-	.fc2(iatc_flush_page ? iatc_flush_fc2 : smode),
+	.fc2(iatc_flush_page ? iatc_flush_fc2 : smode), .set_m(4'd0),
 	.hit(atc_hit), .ent(atc_e), .hv(), .wpa(),
 	.la_d(32'd0), .fc2_d(1'b0), .set_d(4'd0), .hv_d(), .wpa_d(),
 	.wr(iatc_wr), .wla(iatc_wla), .wfc2(iatc_wfc2), .went(iatc_went),
@@ -303,17 +307,28 @@ logic          c_we;
 logic  [5:0]   c_waddr;
 logic  [1:0]   c_wway;
 logic [21:0]   c_wtag;
-logic [127:0]  cd [4];
+logic [31:0]   cd [4];        // each way's long word at F1's address
 logic [23:0]   ct [4];
 
-logic [127:0] m_line;            // the line being filled (and the line buffer)
+logic [31:0] m_cw;               // the fill's first long word (the one fetched)
 logic  [3:0] m_got;              // ... the long words of it that arrived
+logic        m_vclr;             // the fill's victim line is still to be invalidated
+logic        m_rrinc;            // ... the set was full: the replacement counter moves
+// The data RAMs hold a long word per address ({set, A3:A2}): F1 reads its
+// long word of each way directly, and a fill writes each beat into the
+// victim way as it arrives.  The victim is invalidated and given its new
+// tag as the fill starts, and validated when the line is complete (a
+// failed or TCI fill leaves it invalid, MC68040UM 4.6.1): the line is in
+// the cache for the first fetch after it -- no line buffer.  The long word
+// being fetched (the burst's first) is kept for a fill that is not
+// allocated (TCI, a later beat's bus error), which delivers it alone.
+wire         c_dwe = (st == S_FILL) && b_rvalid && m_alloc && !m_vclr;
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
-		ap68040_sdp_be #(.AW(6), .NB(16), .OREG(0)) dram (
-			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
-			.wbe(16'hFFFF), .wdata(m_line), .raddr(c_raddr), .oce(1'b1), .q(cd[gw])
+		ap68040_sdp_be #(.AW(8), .NB(4), .OREG(0)) dram (
+			.clk(clk), .we(c_dwe && m_way == 2'(gw)), .waddr({m_pa[9:4], b_rbeat}),
+			.wbe(4'hF), .wdata(b_rdata), .raddr(fpc[9:2]), .oce(1'b1), .q(cd[gw])
 		);
 		ap68040_sdp_be #(.AW(6), .NB(3), .OREG(0)) tram (
 			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
@@ -347,10 +362,7 @@ logic        f1_s, f1_dem;
 logic        f1_hit;
 atce_t       f1_e;
 
-// line buffer: the last line filled (it also serves TCI lines)
 logic        m_tci;            // the fill in progress was answered with TCI
-logic        lb_v;             // m_line holds the line at lb_pa (the last fill):
-logic [27:0] lb_pa;            // it is also the cache's write data
 
 // miss engine
 logic        b_req_r;          // request pending (not granted yet)
@@ -376,7 +388,7 @@ wire [31:0] redir_npc = redir_v ? redir_pc : d_redir_pc;
 //--------------------------------------------------------------------------
 // F1 evaluation
 //--------------------------------------------------------------------------
-logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
+logic        x_ok, x_flt, x_walk, x_cach, x_hit;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
 logic [31:0] x_chunk;
@@ -423,15 +435,13 @@ always_comb begin
 		if (x_mj[i]) begin x_hit = 1'b1; x_way = 2'(i); end
 	end
 	x_hit  = x_hit && x_cach;
-	x_lb   = x_cach && lb_v && (use_t ? (lb_pa == {tg, f1_pc[9:4]}) : (lb_pa == f1_pc[31:4]));
 	// (the chunk by the one-hot match, AND-OR: no encoded way on the path;
 	// at most one way holds a line)
 	x_chunk = '0;
-	for (int i = 0; i < 4; i++) if (x_mj[i]) x_chunk = x_chunk | cd[i][127 - 32 * f1_pc[3:2] -: 32];
-	if (x_lb) x_chunk = m_line[127 - 32 * f1_pc[3:2] -: 32];
+	for (int i = 0; i < 4; i++) if (x_mj[i]) x_chunk = x_chunk | cd[i];
 end
 wire f1_go      = f1_v && !redir_any;
-wire f1_deliver = f1_go && (x_hit || x_lb);
+wire f1_deliver = f1_go && x_hit;
 
 //--------------------------------------------------------------------------
 // F0 issue: room for this chunk and those in flight
@@ -504,10 +514,10 @@ always_ff @(posedge clk) begin
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
 		for (int i = 0; i < 2; i++) f3_w[i] <= '0;
-		lb_v  <= 1'b0; lb_pa <= '0; m_tci <= 1'b0;
+		m_tci <= 1'b0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0;
-		m_alloc <= 1'b0; m_way <= '0; m_line <= '0;
+		m_alloc <= 1'b0; m_way <= '0; m_cw <= '0; m_vclr <= 1'b0; m_rrinc <= 1'b0;
 		iw_req <= 1'b0;
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
@@ -693,10 +703,11 @@ always_ff @(posedge clk) begin
 				vv = ivf_q;
 				st      <= S_FILL;
 				m_got   <= 4'd0;
-				lb_v    <= 1'b0;          // its beats go into m_line
 				m_alloc <= 1'b1;
 				m_tci   <= 1'b0;
 				m_way   <= !vv[0] ? 2'd0 : !vv[1] ? 2'd1 : !vv[2] ? 2'd2 : !vv[3] ? 2'd3 : rr;
+				m_vclr  <= 1'b1;
+				m_rrinc <= (vv == 4'hF);
 				b_req_r <= 1'b1;
 			end
 			else begin
@@ -719,11 +730,24 @@ always_ff @(posedge clk) begin
 				st     <= S_RUN;
 			end
 		S_FILL: begin
-			logic [127:0] ln;
-			ln = m_line;
+			logic [31:0] lw0;
+			// the long word being fetched: arriving now, or kept
+			lw0 = (b_rvalid && b_rbeat == m_pa[3:2]) ? b_rdata : m_cw;
+			// (the fill's first cycle: no beat has arrived yet) the victim
+			// invalid, its tag the new line's
+			if (m_vclr && !inv_busy) begin
+				m_vclr  <= 1'b0;
+				iw_set = m_pa[9:4]; iw_m[m_way] = 1'b1; iw_v = 1'b0;
+				c_we    <= 1'b1;
+				c_waddr <= m_pa[9:4];
+				c_wway  <= m_way;
+				c_wtag  <= m_pa[31:10];
+			end
+			// (a beat before the victim is invalid is not written: the
+			// line is not allocated then)
+			if (b_rvalid && m_vclr) m_alloc <= 1'b0;
 			if (b_rvalid) begin
-				ln[127 - 32 * b_rbeat -: 32] = b_rdata;
-				m_line <= ln;
+				if (b_rbeat == m_pa[3:2]) m_cw <= b_rdata;
 				m_got[b_rbeat] <= 1'b1;
 				if (b_rtci) begin m_alloc <= 1'b0; m_tci <= 1'b1; end
 			end
@@ -731,24 +755,18 @@ always_ff @(posedge clk) begin
 				busy  <= 1'b0;
 				stale <= 1'b0;
 				if (m_alloc && !(b_rvalid && b_rtci)) begin
-					c_we    <= 1'b1;
-					c_waddr <= m_pa[9:4];
-					c_wway  <= m_way;
-					c_wtag  <= m_pa[31:10];
 					iw_set = m_pa[9:4]; iw_m[m_way] = 1'b1; iw_v = 1'b1;
-					if (ivo_q == 4'hF) rr <= rr + 2'd1;     // (ivo_ra: m_pa's set)
+					if (m_rrinc) rr <= rr + 2'd1;
 				end
-				lb_pa <= m_pa[31:4];
 				st    <= S_RUN;
 				if (m_tci || (b_rvalid && b_rtci)) begin
 					// a TCI line is not kept (5.7.1: sequential access only
 					// until the burst's last long word arrives): the long word
 					// being fetched goes straight to the decoder, the next one
 					// is fetched anew (unless a redirect takes the stream)
-					lb_v <= 1'b0;
 					if (!stale && !redir_any) begin
 						logic [31:0] lw, nla;
-						lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+						lw  = lw0;
 						nla = {m_la[31:2], 2'b00} + 32'd4;
 						if (m_la[1]) begin
 							f2_n    <= 2'd1;
@@ -767,7 +785,6 @@ always_ff @(posedge clk) begin
 						fnew  <= 1'b0;
 					end
 				end
-				else lb_v <= 1'b1;
 			end
 			if (busy && b_err) begin
 				busy  <= 1'b0;
@@ -779,7 +796,7 @@ always_ff @(posedge clk) begin
 					// is not allocated, and no exception (MC68060UM 7.9.1,
 					// 5.7.1).  The next long word is fetched anew.
 					logic [31:0] lw, nla;
-					lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+					lw  = lw0;
 					nla = {m_la[31:2], 2'b00} + 32'd4;
 					if (m_la[1]) begin
 						f2_n    <= 2'd1;
@@ -888,11 +905,10 @@ always_ff @(posedge clk) begin
 		// CINV/CPUSH of the instruction cache
 		//------------------------------------------------------------------
 		if ((ic_inv || sn_inv) && !inv_busy && !inv_hold && st != S_FILL && !c_we) begin
-			lb_v <= 1'b0;
 			inv_sn    <= !ic_inv;
 			inv_scope <= ic_inv ? ic_inv_scope : 2'd1;
 			inv_pa    <= ic_inv ? ic_inv_pa : sn_inv_pa;
-			inv_lbh   <= !ic_inv && lb_v && lb_pa == sn_inv_pa[31:4];
+			inv_lbh   <= 1'b0;
 			if (ic_inv ? (ic_inv_scope == 2'd3) : sn_inv_all) begin
 				// every line: the sweep below (scope 3 matches every way)
 				inv_scope <= 2'd3;

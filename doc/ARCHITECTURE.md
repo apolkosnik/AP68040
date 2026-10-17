@@ -33,7 +33,7 @@ predictor):
 | `FPU_PIPE` | 0 | 1: the arithmetic pipeline beside the FPU state machine |
 | `LOOP_PRED` | 0 | 1: the loop-exit predictor (the history table and the BTB remain) |
 | `EARLY_RES` | 0 | 1: early results in AG (a base or index need not wait for EX) |
-| `DC1_ATC` | 1 | DC1's own ATC read port and parallel tag compare (timing) |
+| `DC1_ATC` | 0 | 1: DC1's own ATC read port and a tag compare against all four ATC ways' pages (timing; 0 reads the main port at a registered set) |
 | `SKID` | 0 | 1: a skid register between D2 and AG |
 | `DIV_STEPS` | 2 | quotient bits per clock of the integer divider (2 or 4) |
 
@@ -94,7 +94,12 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   RAM read, and the branch target buffer lookup.  **F1** compares the tags;
   a hit goes on, a miss starts the miss engine (table walk through the DMU,
   line fill with critical word first, or a cache-inhibited read) and F0
-  rolls back to the missed address.  **F2** reads the predecoder table for
+  rolls back to the missed address.  The instruction cache's data RAM holds
+  a long word per address, so F1 reads its long word of each way directly;
+  a fill writes each beat into the victim way as it arrives (the victim is
+  invalidated and retagged as the fill starts, validated when the line is
+  complete), and only the fetched long word is kept aside, for a TCI or
+  failed fill that is not allocated.  **F2** reads the predecoder table for
   both words of the chunk (each could start an instruction): a block RAM
   of 8192 words, one per operation word bits 15:3, with two read ports
   (`ap68040_pdrom`, 32 M10Ks, generated with the microcode).  **F3** forms
@@ -154,17 +159,22 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   is also computed in AG; a younger base or index whose youngest older
   writer carries one takes it instead of waiting for EX.  EX still computes
   and writes every result; simulation checks that the two agree.
-* **DC1/DC2**: the D-ATC/DTT lookup and tag compare (DC1 reads an ATC port
-  of its own, a copy of the entries with the set registered with DC1's
-  address, and compares the cache tags with all four ways' pages in
-  parallel: no address multiplexer before the hit) and the operand from
-  DC2's copy of the way it hit (see the DMU).
+* **DC1/DC2**: the D-ATC/DTT lookup and tag compare and the operand from
+  DC2's copy of the way it hit (see the DMU).  The ATC's lookup port is
+  shared with the miss engine; its set is a flip-flop (DC1's set, or the
+  engine's the cycle after it takes the port -- DC1 is held then), so no
+  multiplexer precedes the entries' read.  The cache tags are compared
+  with DC1's address and with the ATC entry's page side by side, DC1's
+  registered transparency (a TTR match, translation off) selecting.
 * **EX**: ALU, shifter (one 66-bit right funnel for every right shift and
   the rotates, one left funnel for LSL/ASL; the carry and X come from the
   operand bit by index, off the funnel, and N and Z from the registered
   result in the op's second cycle; ROL shifts the doubled operand by the
   count's complement, ROXL's amount and the count modulo size+1 are
-  registered in a cycle of their own), bit-field unit, BCD, condition
+  registered in a cycle of their own; the shift's kind is decoded as the
+  uop enters EX and registered), bit-field unit (one right rotator serves
+  BFINS's source in the pre-cycle and the extracted field or the
+  register's write-back in the main cycle), BCD, condition
   codes, branch resolution (every prediction is verified here),
   multiply/divide (holds EX; `DIV_STEPS` quotient bits a clock), CHK2/CMP2,
   the FPU interface.  EX results go to the front file and are captured by
@@ -322,6 +332,11 @@ frames an FPSP expects: the deciding state leaves the operands in the
 shadow registers as the frame wants them and one state (F_CAP, the cycle
 after) captures the frame.  The normalizer takes two cycles: its leading-
 zero count is registered (F_NLZ) and the state it returns to shifts.
+The add, multiply, divide and square-root results reach F_ROUND through
+one window select; one incrementer serves F_ROUND and the single and
+double register stores; single and double stores (and their denormals,
+F_PACKS) are packed in one form, the single's fields being the double's
+upper bits.
 `FPU_REVISION` selects the FSAVE frame revision ($41 or $40).
 
 An FPm-to-FPn operation is one uop (FPU_RRF: CHK and DISP fused); others

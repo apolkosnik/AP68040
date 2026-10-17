@@ -12,6 +12,10 @@ module ap68040_alu_slow
 	import ap68040_pkg::*;
 (
 	input  logic  [6:0] op,
+	// the shift's kind, one-hot, decoded from op as the uop enters EX and
+	// registered (the funnel's amount and input selects start from these
+	// flip-flops, not from a decode of op): ASL LSL ASR LSR ROL ROR ROXL ROXR
+	input  logic  [7:0] shk,
 	input  logic  [1:0] sz,
 	input  logic [31:0] a,
 	input  logic [31:0] b,
@@ -133,49 +137,47 @@ always_comb begin
 	// the right funnel's input and count.  A rotate's input repeats its
 	// period P from bit 0 ({P, P}): shifted right by k (< the period), its
 	// low bits are P rotated right by k
-	case (op)
-		OP_ASR:  begin
-			rv = {{34{b_msb}}, bm, 1'b0};
-			case (sz)
-				SZ_B:    rv[65:9]  = {57{b_msb}};
-				SZ_W:    rv[65:17] = {49{b_msb}};
-				default: ;
-			endcase
-			ra = {1'b0, sh_n};
-		end
-		OP_ROL, OP_ROR: begin
-			case (sz)
-				SZ_B:    rv = {50'd0, bm[7:0], bm[7:0]};
-				SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
-				default: rv = {2'd0, bm, bm};
-			endcase
-			// ROL by k: the doubled operand shifted right by size - 1 - k
-			// (the count's complement within the size: no subtraction) and
-			// taken one bit up (ro[32:1], as a right shift's result)
-			ra = (op == OP_ROR) ? {1'b0, sh_nm} : {1'b0, ~sh_nm & (nbits - 6'd1)};
-		end
-		OP_ROXL, OP_ROXR: begin
-			case (sz)
-				SZ_B:    rv = {48'd0, f_x, bm[7:0], f_x, bm[7:0]};
-				SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
-				default: rv = {f_x, bm, f_x, bm};
-			endcase
-			ra = (op == OP_ROXR) ? {1'b0, sh_nx} : nxl_q;
-		end
-		OP_ASL, OP_LSL: begin
-			// a left shift through the same funnel: the operand above 31
-			// zeros, shifted right by 31 - n (the count inverted, no
-			// subtraction), is the operand shifted left by n; n >= 32
-			// shifts everything out (C of a long shifted by 32: below)
-			rv = {3'd0, bm, 31'd0};
-			ra = sh_n[5] ? 7'd127 : {2'd0, ~sh_n[4:0]};
-		end
-		default: begin   // LSR
-			rv = {33'd0, bm, 1'b0};
-			ra = {1'b0, sh_n};
-		end
-	endcase
-	ro = (op == OP_ASR) ? 66'($signed(rv) >>> ra) : (rv >> ra);
+	if (shk[2]) begin               // ASR
+		rv = {{34{b_msb}}, bm, 1'b0};
+		case (sz)
+			SZ_B:    rv[65:9]  = {57{b_msb}};
+			SZ_W:    rv[65:17] = {49{b_msb}};
+			default: ;
+		endcase
+		ra = {1'b0, sh_n};
+	end
+	else if (shk[4] || shk[5]) begin    // ROL, ROR
+		case (sz)
+			SZ_B:    rv = {50'd0, bm[7:0], bm[7:0]};
+			SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
+			default: rv = {2'd0, bm, bm};
+		endcase
+		// ROL by k: the doubled operand shifted right by size - 1 - k
+		// (the count's complement within the size: no subtraction) and
+		// taken one bit up (ro[32:1], as a right shift's result)
+		ra = shk[5] ? {1'b0, sh_nm} : {1'b0, ~sh_nm & (nbits - 6'd1)};
+	end
+	else if (shk[6] || shk[7]) begin    // ROXL, ROXR
+		case (sz)
+			SZ_B:    rv = {48'd0, f_x, bm[7:0], f_x, bm[7:0]};
+			SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
+			default: rv = {f_x, bm, f_x, bm};
+		endcase
+		ra = shk[7] ? {1'b0, sh_nx} : nxl_q;
+	end
+	else if (shk[0] || shk[1]) begin    // ASL, LSL
+		// a left shift through the same funnel: the operand above 31
+		// zeros, shifted right by 31 - n (the count inverted, no
+		// subtraction), is the operand shifted left by n; n >= 32
+		// shifts everything out (C of a long shifted by 32: below)
+		rv = {3'd0, bm, 31'd0};
+		ra = sh_n[5] ? 7'd127 : {2'd0, ~sh_n[4:0]};
+	end
+	else begin                          // LSR
+		rv = {33'd0, bm, 1'b0};
+		ra = {1'b0, sh_n};
+	end
+	ro = shk[2] ? 66'($signed(rv) >>> ra) : (rv >> ra);
 	lo = ro;                      // (ASL, LSL: the operand shifted left by n)
 	// ASL: V when the bits shifted out and the new sign bit are not all
 	// equal, i.e. the top count+1 bits of the operand (at the size) differ
@@ -188,15 +190,13 @@ always_comb begin
 	sh_r = bm;
 	sh_v = 1'b0;
 	if (sh_n != 6'd0) begin
-		case (op)
-			OP_ASL, OP_LSL: begin
-				sh_r = lo[31:0] & szmask;
-				if (op == OP_ASL)
-					sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
-			end
-			OP_LSR, OP_ASR, OP_ROL: sh_r = ro[32:1] & szmask;
-			default:        sh_r = ro[31:0] & szmask;   // ROR, ROXL, ROXR
-		endcase
+		if (shk[0] || shk[1]) begin         // ASL, LSL
+			sh_r = lo[31:0] & szmask;
+			if (shk[0])
+				sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
+		end
+		else if (shk[3] || shk[2] || shk[4]) sh_r = ro[32:1] & szmask;   // LSR, ASR, ROL
+		else sh_r = ro[31:0] & szmask;      // ROR, ROXL, ROXR
 	end
 	// The carry (the last bit moved out) and X come from the operand bit
 	// at that step's index -- one 32:1 multiplexer on the operand, the
@@ -214,17 +214,17 @@ always_comb begin
 	begin : direct_c
 		logic [5:0] ck, ci;
 		logic       left, rox, rot, c_bit;
-		rox  = (op == OP_ROXL) || (op == OP_ROXR);
-		rot  = (op == OP_ROL) || (op == OP_ROR);
-		left = (op == OP_ASL) || (op == OP_LSL) || (op == OP_ROL) || (op == OP_ROXL);
+		rox  = shk[6] || shk[7];
+		rot  = shk[4] || shk[5];
+		left = shk[0] || shk[1] || shk[4] || shk[6];
 		ck   = rox ? sh_nx : rot ? sh_nm : sh_n;
 		ci   = left ? (nbits - ck) : (ck - 6'd1);
-		if (rot && sh_nm == 6'd0) ci = (op == OP_ROL) ? 6'd0 : (nbits - 6'd1);
+		if (rot && sh_nm == 6'd0) ci = shk[4] ? 6'd0 : (nbits - 6'd1);
 		c_bit = bm[ci[4:0]];
 		if (sh_n == 6'd0)             sh_c = rox ? f_x : 1'b0;
 		else if (rox)                 sh_c = (sh_nx == 6'd0) ? f_x : c_bit;
 		else if (rot)                 sh_c = c_bit;
-		else if (sh_n > nbits)        sh_c = (op == OP_ASR) ? b_msb : 1'b0;
+		else if (sh_n > nbits)        sh_c = shk[2] ? b_msb : 1'b0;
 		else                          sh_c = c_bit;
 		sh_x = (sh_n != 6'd0 && !rot) ? sh_c : f_x;
 	end

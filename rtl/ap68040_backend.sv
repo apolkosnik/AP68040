@@ -762,6 +762,7 @@ logic  [7:0] bf_lo_out;
 // (a rotate and a second variable shift in one cycle do not close at 65 MHz)
 logic        ex_pb;
 logic [31:0] bf_ins_q, bf_rot, bf_rot_q;
+logic [31:0] bf_rr;             // the shared right rotator's output (below)
 logic  [5:0] rox_nx, rox_nx_q;  // ROXL/ROXR: their count mod (size + 1), the same way
 logic  [6:0] rox_nxl, rox_nxl_q; // ROXL: its funnel amount, the same way (from the registered count)
 wire         ex_pre = (ex_u.op == OP_BF) || (ex_u.op == OP_ROXL) || (ex_u.op == OP_ROXR);
@@ -769,7 +770,7 @@ wire         ex_bfins = (ex_u.op == OP_BF) && (ex_u.cond[2:0] == 3'd7);
 logic  [4:0] bf_flags;
 always_comb begin
 	logic [4:0]  o;
-	logic [31:0] top, rot, fld, ins_top, nrot, nreg, zf;
+	logic [31:0] top, rot, fld, ins_top, nrot, nrot_v, nreg, zf;
 	logic [39:0] win, mask40, ins40, nwin;
 	logic [5:0]  lz;
 	logic        nflag, zflag;
@@ -800,14 +801,29 @@ always_comb begin
 	end
 	bf_rot = rot;
 	rot    = bf_rot_q;
-	fld = rot >> bf_wn;
 	case (t)
-		3'd2: nrot = rot ^ top;                     // BFCHG
-		3'd4: nrot = rot & ~top;                    // BFCLR
-		3'd6: nrot = rot | top;                     // BFSET
-		default: nrot = (rot & ~top) | (ins_top & top);   // BFINS
+		3'd2: nrot_v = rot ^ top;                     // BFCHG
+		3'd4: nrot_v = rot & ~top;                    // BFCLR
+		3'd6: nrot_v = rot | top;                     // BFSET
+		default: nrot_v = (rot & ~top) | (ins_top & top);   // BFINS
 	endcase
-	nreg = 32'({nrot, nrot} >> o);
+	// One right rotator for three shifts that never run in the same cycle:
+	// the pre-cycle's BFINS source (ex_av << (32 - w): rotated right by w,
+	// masked to the field's top bits), and in the main cycle the extracted
+	// field (rot >> (32 - w): rotated right by 32 - w, masked to the low w
+	// bits) or the register's merged value rotated back (nreg, by the offset)
+	begin
+		logic [31:0] ri;
+		logic  [4:0] ra;
+		logic        ext;
+		ext = (t == 3'd1) || (t == 3'd3);
+		ri  = !ex_pb ? ex_av : ext ? rot : nrot_v;
+		ra  = !ex_pb ? bf_w[4:0] : ext ? bf_wn[4:0] : o;
+		bf_rr = 32'({ri, ri} >> ra);
+	end
+	fld = bf_rr & ~bf_sx;
+	nrot = nrot_v;
+	nreg = bf_rr;
 	case (t)
 		3'd2: nwin = win ^ mask40;
 		3'd4: nwin = win & ~mask40;
@@ -917,13 +933,26 @@ wire  ex_shift = (ex_u.op == OP_ASL) || (ex_u.op == OP_ASR) || (ex_u.op == OP_LS
                  (ex_u.op == OP_LSR) || (ex_u.op == OP_ROL) || (ex_u.op == OP_ROR) ||
                  (ex_u.op == OP_ROXL) || (ex_u.op == OP_ROXR);
 logic ex_ph;                    // second cycle of a slow op
+// the shift's kind for the slow unit, one-hot, registered with ex_u
+function automatic logic [7:0] shk_of(input logic [6:0] o);
+	shk_of = {o == OP_ROXR, o == OP_ROXL, o == OP_ROR, o == OP_ROL,
+	          o == OP_LSR, o == OP_ASR, o == OP_LSL, o == OP_ASL};
+endfunction
+logic [7:0] ex_shk;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && ex_shk != shk_of(ex_u.op)) begin
+		$display("FAIL: the registered shift kind %b, the op's %b", ex_shk, shk_of(ex_u.op));
+		$finish;
+	end
+// synthesis translate_on
 exo_t xf, xs, xs_q;
 
 logic [31:0] sl_res;
 logic  [4:0] sl_flags;
 logic        sl_sim_c;
 ap68040_alu_slow alu_s (
-	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
+	.op(ex_u.op), .shk(ex_shk), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
 	.nx_q(rox_nx_q), .nx(rox_nx), .nxl_q(rox_nxl_q), .nxl(rox_nxl),
 	.res(sl_res), .flags_out(sl_flags), .sim_c(sl_sim_c)
 );
@@ -1708,6 +1737,7 @@ always_ff @(posedge clk) begin
 			ex_kc    <= {dc2_u.op == OP_CAS2R, dc2_u.op == OP_CHK2B,
 			             dc2_u.op == OP_DBCC, dc2_u.op == OP_MDRES, dc2_u.op == OP_DIV,
 			             dc2_u.op == OP_FPU};
+			ex_shk   <= shk_of(dc2_u.op);
 			ex_ee    <= dc2_ee;
 			ex_er    <= dc2_er;
 			ex_a     <= (exw_v && dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) ? exw_val : dc2_a;
@@ -1732,7 +1762,7 @@ always_ff @(posedge clk) begin
 		if (ex_v && ex_div0) md_z <= 1'b1;
 		if (ex_v && ex_pre && !ex_pb) begin
 			ex_pb    <= 1'b1;
-			bf_ins_q <= ex_av << bf_wn;
+			bf_ins_q <= bf_rr & bf_top;    // (ex_av << bf_wn)
 			bf_rot_q <= bf_rot;
 			rox_nx_q <= rox_nx;
 			rox_nxl_q <= rox_nxl;

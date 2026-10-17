@@ -24,7 +24,11 @@ module ap68040_atc
 	// access's M-bit update rewrites its own entry).  0: no copy for the
 	// search -- the caller says whether the page is there (wsame) and in
 	// which way (the hit vector of the lookup that started the search)
-	parameter bit SAME_SEARCH = 1
+	parameter bit SAME_SEARCH = 1,
+	// the lookup's set from the caller, registered (set_m), not formed from
+	// la: no logic between the caller's flip-flops and the entries' read
+	// address
+	parameter bit EXT_SET = 0
 )
 (
 	input  logic        clk,
@@ -34,6 +38,7 @@ module ap68040_atc
 	// lookup
 	input  logic [31:0] la,
 	input  logic        fc2,
+	input  logic  [3:0] set_m,         // (EXT_SET) la's set
 	output logic        hit,
 	output atce_t       ent,
 	output logic  [3:0] hv,            // the hit way (one-hot), and every way's
@@ -73,7 +78,7 @@ logic [3:0] v   [16];     // valid, per set and way
 logic [3:0] g   [16];     // global
 logic [1:0] rr;           // replacement counter
 
-wire [3:0] lset = p8k ? la[16:13]  : la[15:12];
+wire [3:0] lset = EXT_SET ? set_m : p8k ? la[16:13] : la[15:12];
 wire [3:0] wset = p8k ? wla[16:13] : wla[15:12];
 
 slot_t s [4];

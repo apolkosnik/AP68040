@@ -17,9 +17,9 @@ its benches in `tb_old/`, as a reference.
 
 | | |
 |---|---|
-| clock | 60 MHz (16.667 ns), out of context on three fitter seeds (Quartus 17.0, HIGH PERFORMANCE EFFORT, hold optimized on all paths), at least +0.22 ns at the 100C slow corner; doc/STATUS.md has each seed |
-| area | 20,761 - 20,822 ALMs on the three seeds (50 % of the 5CSEBA6), 12,500 registers, 140 M10Ks (the caches, the ATCs' tags, the microcode, the decoder tables, the predecoder table), 15 DSPs -- with every feature of the core; the arithmetic pipeline, the loop predictor and the early results are parameters, off by default |
-| Dhrystone 2.1 | 948 cycles/iteration, 36.0 DMIPS at 60 MHz, 0.600 DMIPS/MHz (user mode, copyback caches, in simulation) |
+| clock | 60 MHz (16.667 ns), out of context on three fitter seeds (Quartus 17.0, HIGH PERFORMANCE EFFORT, hold optimized on all paths), +0.33 / +0.05 / +0.16 ns at the 100C slow corner on seeds 1-3 |
+| area | 19,443 - 19,519 ALMs on the three seeds (47 % of the 5CSEBA6), 12,500 registers, 132 M10Ks (the caches, the microcode, the decoder tables, the predecoder table), 15 DSPs -- with every feature of the core; the arithmetic pipeline, the loop predictor and the early results are parameters, off by default |
+| Dhrystone 2.1 | 964 cycles/iteration, 35.4 DMIPS at 60 MHz, 0.590 DMIPS/MHz (user mode, copyback caches, in simulation) |
 | Whetstone | 469,922 cycles/loop, 12.77 MWIPS at 60 MHz |
 | cputest 68040 corpus | 3,778 of 3,801 slices (sampled); the rest are known WinUAE generator defects (doc/STATUS.md) |
 
@@ -85,7 +85,7 @@ JTAG.
 * `a_i`, `ts_n_i`, `rw_n_i`, `siz_i` and `tt_i` are the bus as another
   master drives it, for snooping.
 * Parameters: `FPU_REVISION` ($41), `FPU_PIPE` (0), `LOOP_PRED` (0),
-  `EARLY_RES` (0), `DC1_ATC` (1), `SKID` (0), `DIV_STEPS` (2); their
+  `EARLY_RES` (0), `DC1_ATC` (0), `SKID` (0), `DIV_STEPS` (2); their
   costs are in doc/STATUS.md.
 
 ## Building and testing
