@@ -954,33 +954,35 @@ assign dm_hold1 = sn_frz || steal || steal_q || (m1.v && m1_stale) ||
                    e_st != E_W_PART && e_st != E_W_DONE);
 
 // the table walk's descriptor line in the cache: the hit and its way, from
-// the tags read at the walk's set (E_TW_DLK reads the descriptor from it,
-// E_TW_UPD pushes or invalidates it before the update)
+// the tags read at the walk's set.  E_TW_UPD uses the compare as it stands
+// (it pushes or invalidates the line before the update); E_TW_DLK reads
+// the descriptor by the way registered a cycle earlier (E_TW_DESCW, the
+// tags of the set valid from then on), so the compare stays off the data
+// path
 logic        tw_hw_h;
 logic  [1:0] tw_hw_w;
+logic        tw_hhq;
+logic  [1:0] tw_hwq;
 always_comb begin
 	tw_hw_h = 1'b0; tw_hw_w = 2'd0;
 	for (int i = 0; i < 4; i++)
 		if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin tw_hw_h = 1'b1; tw_hw_w = 2'(i); end
 end
-// the data RAM's way for the engine's readers, one select (and one line
-// multiplexer) for all of them: the snooper's way while it has the cache
-// (the engine is frozen then), the walk's descriptor way, the fill's or
-// push's victim way, else the job's way
-wire  [1:0]  dq_wsel = sn_frz ? sn_way :
-                       (e_st == E_TW_DLK || e_st == E_TW_UPD) ? tw_hw_w :
-                       (e_st == E_FILL_W || e_st == E_PUSHV_W) ? f_way : e_x.way;
+// the data RAM's way for the engine's line readers other than its
+// operand path, one select (and one line multiplexer) for them: the
+// snooper's way while it has the cache (the engine is frozen then), the
+// walk's descriptor way, else the fill's or push's victim way
+wire  [1:0]  dq_wsel = sn_frz ? sn_way : (e_st == E_TW_DLK) ? tw_hwq : f_way;
 wire [127:0] dq_w    = dq_rn[dq_wsel];
 // the engine's operand bytes, one extractor for its states: E_SP_3 the
 // rest of a split load from the stolen read, E_S_ACT from the line a fill
-// delivered (bo_line), E_S_RD2 from the read way, E_TW_DLK the descriptor
-// from the walk's line
+// delivered (bo_line), E_S_RD2 from the read way (the job's: a register
+// selects the way, a timing path)
 wire  [2:0]  sp_n0    = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
 wire         etk_sp   = (e_st == E_SP_3);
-wire         etk_tw   = (e_st == E_TW_DLK);
-wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_w;
-wire  [3:0]  etk_o    = etk_tw ? tw_da[3:0] : etk_sp ? 4'd0 : e_va[3:0];
-wire  [2:0]  etk_n    = etk_tw ? 3'd4 : etk_sp ? 3'(nbytes(m2.r.msz) - sp_n0) : e_n;
+wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_rn[e_x.way];
+wire  [3:0]  etk_o    = etk_sp ? 4'd0 : e_va[3:0];
+wire  [2:0]  etk_n    = etk_sp ? 3'(nbytes(m2.r.msz) - sp_n0) : e_n;
 wire [31:0]  etk      = take(etk_line, etk_o, etk_n);
 
 always_ff @(posedge clk) begin
@@ -1022,7 +1024,7 @@ always_ff @(posedge clk) begin
 		sc_set <= '0; sc_lv <= '0; sc_ld <= '0;
 		tw_lvl <= TW_ROOT; tw_va <= '0; tw_s <= 1'b0; tw_wr <= 1'b0; tw_pt <= 1'b0;
 		tw_i <= 1'b0; tw_da <= '0; tw_d <= '0; tw_wp <= 1'b0; tw_fail <= 1'b0;
-		tw_berr <= 1'b0; tw_pd <= '0; tw_upd <= 1'b0; tw_hw <= 4'd0; tw_lkrd <= 1'b0;
+		tw_berr <= 1'b0; tw_pd <= '0; tw_upd <= 1'b0; tw_hw <= 4'd0; tw_lkrd <= 1'b0; tw_hhq <= 1'b0; tw_hwq <= '0;
 		tset_b <= '0; tway_b <= '0; twd_b <= '0;
 		dw_set <= '0; dw_way <= '0; dw_be <= '0; dw_src <= '0; dw_word <= '0;
 		ic_inv <= 1'b0; ic_inv_scope <= '0; ic_inv_pa <= '0;
@@ -1987,10 +1989,14 @@ always_ff @(posedge clk) begin
 			tset_b <= tw_da[9:4];
 			e_st   <= E_TW_DESCW;
 		end
-		E_TW_DESCW: e_st <= E_TW_DLK;
+		E_TW_DESCW: begin
+			tw_hhq <= tw_hw_h;
+			tw_hwq <= tw_hw_w;
+			e_st   <= E_TW_DLK;
+		end
 		E_TW_DLK: begin
-			if (tw_hw_h && dc_en) begin
-				tw_d <= etk;                  // (the extractor: the walk's line)
+			if (tw_hhq && dc_en) begin
+				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
 				e_st <= E_TW_EVAL;
 			end
 			else begin
