@@ -1,38 +1,34 @@
-# AP68040-60 status
+# AP68040 `faster` status
 
 ## Milestones
 
 | | milestone | state |
 |---|---|---|
-| M0 | bus unit, 68040 bus slave model, Verilator bench | done |
-| M1 | pipeline skeleton: fetch, D1, D2, AG/DC/EX/WB, bus loads/stores | done |
-| M2 | integer ISA (t_integer) | done |
-| M3 | exceptions, interrupts, trace (t_exceptions) | done |
-| M4 | instruction and data caches, copyback, bus snooping (t_cache, t_snoop) | done |
-| M5 | MMU: ATCs, table walk, TTRs, PTEST/PFLUSH (t_mmu, t_atcprobe) | done |
-| M6 | FPU (t_fpu, t_fpu_frames, t_fpu_resume) | done |
-| M7 | cputest corpus replay (tb_cputest.sv) | done: only the 25 known generator artifacts fail |
-| M8 | 60 MHz timing closure on 5CSEBA6U23I7 | done: out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths).  69028f0: seeds 1, 2 and 3 meet setup and hold in all four corners (worst setup slack +0.063, +0.181, +0.222 ns at 16.667 ns); 26,976 ALMs (seed 1) |
-| M9 | performance: prediction, BTB, return stacks, store forwarding, early redirect | Dhrystone 2.1: CPI 1.36, about 38.6 DMIPS at 60 MHz |
-| M10 | the remaining 68040 pins: IPEND, PST, CDIS, MDIS (t_pins) | done |
+| M0 | the AP68060 tree converted back to the 68040 (631f440): MSP/ISP, format $7 frames with the restart model, MOVEM continuation, T0/T1 trace, the 040 MOVEC set, CACR/TC, PTEST/MMUSR, nonresident ATC entries, table walks through the data cache, 4 KB caches, the 040 snooper, BIU and bus protocol, 128-clock reset, IPL sampling, PST codes, FPU revision $41 frames; the 060 round's pipeline work kept | done |
+| M1 | regression: 29 programs x 5 bus configurations, the exhaustive decode bench | done |
+| M2 | cputest corpus replay (tb/tb_cputest.sv): the sampled corpus | done: 3,778 of 3,801 slices, the rest the known generator defects |
+| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | see the timing section |
+| M4 | area: under 20,000 ALMs with every feature | see the area section: 21,436 at the conversion, about 20,800 now |
+| M5 | the AP68060's tests under the 68040's rules: level 7 interrupts, IPL skew, an interrupt among snoop invalidations, nested exceptions and double faults, RESET and the halted bus, the cache cases (t_irq7, t_iplglitch, t_snirq, t_xnest, t_halt, t_cache2) | done |
+| M6 | performance | Dhrystone 2.1: 948 cycles/iteration, 36.0 DMIPS at 60 MHz (0.600 DMIPS/MHz); Whetstone 469,922 cycles/loop, 12.77 MWIPS |
 
 ## Regression
 
 ```
-tb/run_tests.sh                 # the twenty-one programs, five bus configurations each
+tb/run_tests.sh                 # the 29 programs, five bus configurations each, and the decode bench
 tb/build_cputest.sh             # the corpus replay bench
 tb/run_cputest.py ~/Downloads/data040.zip                    # smoke slices
-tb/run_cputest.py ~/Downloads/data040.zip --full --group AE  # a group, every slice
-tb/run_cputest.py ~/Downloads/data040.zip --full --sample 300:24 --jobs 30  # every slice, sampled
+tb/run_cputest.py ~/Downloads/data040.zip --full --group BasicFPU --group intFPU --group PackedFPU --sample 300:24  # the FPU groups
+tb/run_cputest.py ~/Downloads/data040.zip --full --sample 300:24 --jobs 12  # every slice, sampled
+tb/run_bench.sh                 # Dhrystone and Whetstone (vbcc), scores at 60 MHz
 ```
 
-Testing tiers: run_tests.sh for every change (about 10 minutes); the full
-corpus slices of the area touched (FPU: `--instruction 'F*'`); before a
-push, the sampled corpus -- every round of each slice up to 300, then
-every 24th, about 6 % of the rounds, 9 minutes at 30 jobs, and on 87ea11d
-plus the two-slot BTB it failed exactly the 25 known slices, as the full
-run does; the full corpus (2.5 hours or more) for milestones and before
-an RBF.
+Testing tiers: run_tests.sh for every change (about 10 minutes at eight
+jobs); the corpus slices of the area touched (FPU: the three FPU groups,
+sampled, 562 slices; shifts: `--instruction 'AS*' ...`); before a push, the
+sampled corpus -- every round of each slice up to 300, then every 24th,
+about 40 minutes at eight jobs -- which must fail exactly the known
+slices; the full corpus (hours) for milestones.
 
 Bus configurations: zero wait, random waits, waits with TBI and TA/TEA
 retries, BCLK at half PCLK, and all of those together.
@@ -40,233 +36,176 @@ retries, BCLK at half PCLK, and all of those together.
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
 t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress,
-t_eredir, t_cbsplit, t_cmodes, t_loops, t_early.  The FPU pipeline also
-has its own bench: tb/build_fpu_pipe.sh, then obj/obj_fpu_pipe/tb_fpu_pipe
-+seed=<n> [+pipeonly] compares it against the sequential FPU.
+t_eredir, t_cbsplit, t_cmodes, t_loops, t_early, and from the AP68060
+under the 68040's rules: t_irq7 (level 7 on its edge and by level
+comparison, 8.2.9), t_iplglitch (IPL pins settling at different clocks:
+a request counts after two consecutive bus-clock samples agree, 7.8),
+t_snirq (an interrupt taken while snoops invalidate the instruction cache
+and the front end refetches), t_xnest (a handler whose fetch fails is an
+ordinary access error; an access or address error during the processing
+of an access error, an address error or a reset, the frame's writes and
+the handler's fetch included, halts the processor: PST $5, the bus quiet,
+until a reset, 7.6.3), t_halt (RESET with a fetch in flight: RSTO waits
+for it and no bus cycle overlaps RSTO; the reset's SR; an odd address
+error vector halts; the caches survive a reset), t_cache2 (line fill
+errors on a later beat, locked accesses, CPUSHP with 8K pages, RTE's
+reads not allocating, a misaligned operand's fill error, inhibited writes
+hitting a dirty line, a disabled cache, TCI lines, hits behind an
+invalidation, MOVE16 with the cache disabled).
 
-The bench counts the CPU's bus transfers in a window ($F2D0-$F2DC);
-t_cbsplit uses it to show that misaligned and line- or page-crossing
-reads in copyback and write-through mode are served by the data cache
-(no bus read), and that copyback stores reach the bus only when pushed;
-t_cmodes checks every caching mode by its bus transfers (fills, write-
-through, write-allocate, victim pushes, CPUSHL, CINVL, noncachable
-accesses, and a noncachable read that hits a dirty line: push, invalidate,
-then memory, as WinUAE does).  The bench also counts Bcc/DBcc
-mispredictions ($F2E4): t_loops checks that the loop exit predictor
-predicts the exits of fixed-trip loops (Bcc, DBRA, nested, with a TRAP
-flushing every pass, after a trip change) besides the loops' results.
-t_early (generated by tb/tools/gen_t_early.py) runs random chains of
-register operations into table indexes, the table holding its own offsets,
-so a wrong early result or forwarding reads the wrong entry; it runs again
-under periodic interrupts.  t_stld 15-17 put a user-mode store and load of
-every size and offset of a line back to back.
+The exhaustive decode bench (tb/build_decode.sh, part of run_tests.sh)
+runs every operation word through the pattern decoder against
+tools/ucode.py's model and through the block RAM predecoder against the
+pattern decoder.
 
-Performance: `tb/build_c.sh dhry` (vbcc; `ASFLAGS=-DCOPYBACK=1` runs it in
-user mode with copyback caches), then `obj/obj_prog/tb_ap68040
-+prog=tb/build/dhry.hex +prof`: cycles and instructions between the
-program's stamps, and where the cycles went (stage holds, redirects by
-cause, BTB checks, load fast-path misses, DMU engine jobs).  `+pcprof`
-adds, by instruction address, the cycles since the previous instruction
-completed, the uops and the mispredictions, and the AG interlock cycles by
-producer (stage, load or not, op).  `+ftrace=<cycle>` prints the pipeline
-by instruction address, one line a cycle (`+ftto=<cycle>` ends it).
+The bench (tb/tb_ap68040.sv) provides, besides the 68040 bus slave and
+the alternate master: one-shot and standing TEAs on data reads, fetches
+and pushes ($F142, $F154, $F156, $F15E), TCI on an instruction line and a
+rewrite of its second long word ($F16A, $F16C), IPL timing and skew
+($F110-$F150, $F16E), a reset the bench raises itself ($F168), a halted
+processor answered with a reset and counted ($F158, $F15A), the watch
+window of bus beats ($F2D0-$F2DC), CDIS/MDIS ($F2C0), and checks on every
+run: no bus cycle starting or ending under RSTO, none inside the 128-clock
+internal reset, PST never reserved, interrupts never phantom, IPEND held
+through the acknowledge.
 
-Dhrystone history (cycles for the 2000 runs between the stamps):
-2,475,417 with the two-entry record FIFO (D2 idled one cycle in three);
-2,015,434 with three entries and the return stack and BHT repaired;
-1,997,442 with load data handed to AG at DC2; 1,985,428 with mispredicts
-redirecting from EX; 1,951,441 with one-uop JSR; 1,927,452 with a WB
-store merged into DC2's copy in its own cycle; 1,903,474 with the split
-access and FPU work; 1,819,584 with the loop exit predictor (Bcc/DBcc
-mispredictions 12,000 -> 2,032; the exits it predicts cost a D1 redirect
-where the fetch BTB had taken the branch); 1,791,599 with a load waiting
-only for an older store whose bytes it reads (not any store to its line);
-1,767,599 with early results in AG (ALU-to-index interlocks: an index
-right behind its producer waits one cycle instead of three).  tb/tools/gen_bench_insn.py
-measures 67 instruction forms (bench_insn.s); outliers left: MOVE16
-(about 38), CAS/TAS (locked bus transfers, about 25), split accesses
-(about 8), FP arithmetic (about 6).  What is left in Dhrystone: 2,000
-mispredictions of a forward BLE whose history counter it shares with a
-never-taken branch 512 bytes away (a hashed index moved the aliasing
-elsewhere and was slower), load- and ALU-to-address interlocks (about
-6 %), DIVS.L, two-uop memory-to-memory MOVE, MOVEM one register a cycle; loop
-exits the fetch BTB took (a D1 redirect, about 4 cycles each, 10,000).  A 512-entry
-BTB removes 8,000 D1 redirects (2 %), but failed timing by 0.44 ns
-(placement of the D1 consume path); not adopted.
+## Area
 
-Timing: seeds move the worst path by about +-0.5 ns, so a change is judged
-on three seeds.  The paths that limited the seeds in this round, and what
-cut them: the FPU normalizer's input select (registered with the state),
-the fetch F1 ITT match (formed in F0), the D1 BTB target check (compares
-the displacement with bt_tgt - qpc - 2, no adder), JSR_K chosen as the
-record enters the FIFO (off the return stack path), and the ALU's taken
-kept off EX's operand forwarding.  Then, for the fast split accesses: the
-split lookup only registers its translation (the decision and the data a
-cycle later), and the BHT is written from registers of its own (a hold
-violation on the training copy's address).  The seeds that miss now fail on
-paths no recent change touched (the FPU's rounding increment and range
-check into a_m; EX's operand select into the slow-op result register):
-those are the next to shorten if a build's seed does not close.  In
-the early-result round: the early operands read the register file only
-(not EX's broadcast of the same cycle), an early index is scaled beside
-the writer search, the predecoder's length sums its EA lengths in
-parallel and leaves the illegal-word override off them, the FPU's
-rounding increment is formed beside the rounding decision, the dispatch's
-datatype check reads a per-register flag kept as registers are written,
-F_UNFL's rounding increment likewise, and the zero tests of F_NORM and
-F_UNFL no longer gate a_m.  In the FPU pipeline round (78 % of the ALMs): the
-two engines share one 64x64 multiplier with operand registers of its own,
-F_ROUND decides overflow/underflow for both rounding carries side by side,
-the pipeline's forwarding flag for P5 is a register (it feeds pdone and so
-the core's stall path), EX's register write no longer waits on the CAS
-compare (CAS writes Dc either way) or on EX's selected taken (the odd-
-target check uses the FPU's), and the FMOVEM slot map is a register.
+The goal is the core's ALM count in the Minimig build.  Measured out of
+context (syn/fitcore.sh, PERIOD=16.667, retiming off, seeds 1-3; a seed
+moves the count by about 100 ALMs and the worst path by about half a
+nanosecond, so a change is judged on three):
 
-Area round (branch area-wip; closed at 57 MHz on three seeds in four, at
-60 MHz on one, see the end of the section): register retiming
-is off (it added about 6,000 registers), and the core is 28,900-29,200
-ALMs (69 %) against 77 % with retiming.  What it changes besides the
-retiming: FMUL's 64x64 product takes two cycles (registered partial
-products), FDIV and FSQRT share one restoring datapath, BFINS takes a
-cycle more, EX's results reach AG's base and index through registers
-(+0.9 % Dhrystone cycles; DIV by zero takes a cycle more), and the rotates
-use two funnel shifters.  The timing work of the round: the FPU's
-dispatch reads flip-flops only (per-register ready flags, their selection
-by the next source and destination, and the static pipeline eligibility,
-all registered a cycle ahead from fpif's next values; FRESTORE's resume
-decode off it), CHK's encoding checks are decoded as the uop enters EX,
-the shift count and CHK's words come from EX's operand registers,
-the EX/WB same-instruction test is a register, the predecoder's
-attributes are OR trees of the one-hot selection (tools/ucode.py,
-ent_attr_oh), the return stack is written while a call waits in D1,
-the sequencer leaves the deferred-update and MOVEM displacement additions
-to AG (uop dmv/dma) and negates its small displacements without carry
-chains, the uop FIFO's pop selects last, the instruction cache compares
-its tags with both candidate addresses, the ATC selects its hit way
-AND-OR, the cache maintenance scan reads a copy of its set's valid and
-dirty bits, and the bit field rotates are funnels.  Status on four seeds:
-t66 met all corners on seeds 2 and 4 (seeds 1 and 3 -0.31 and -0.29 ns at
-100C); t68 meets none (-0.01 to -0.86 ns), with retiming on 78 % and no
-seed either.  The failing paths are now spread over the core (the stall
-chain from EX's holds to AG and the sequencer, the FPU normalizer, the
-slow ALU's memory operand) at 0.2-0.9 ns, and a seed moves them by about
-that much.  A skid between DC2 and EX (one uop, the DMU's m2s beside it)
-then took EX's holds off the stall chain: DC2 stalls on the skid's
-register.  No failing path goes through EX's hold since, but four seeds
-still miss (t69: -0.14 to -1.50 ns; DC2's store-hazard hold, D1, the
-slow ALU).  It brought two ordering rules with it: a DC2 bus job (a miss)
-waits while an older store is in the skid or EX (WB's has the engine
-first), and every cache-inhibited read -- not only a serialized one --
-waits until no older instruction is in flight, so a device is never read
-on a path an older instruction discards (t_cmodes and t_snoop found both).
+| state | ALMs (three seeds) | setup slack at 100C | what changed |
+|---|---:|---|---|
+| 631f440 | 21,436 (seed 1) | +0.08 | the converted core, FPU_PIPE/LOOP_PRED/EARLY_RES off, DIV_STEPS 4 |
+| 1de8e9b | 21,575 - 21,687 | -0.05 / -0.32 / -0.41 | the AP68060's FPU timing/area work re-applied with 68040 semantics (accepted register, tree leading-zero count, staged sticky shift, shared incrementer; -288 ALUTs); DIV_STEPS 2 (-130 ALUTs); the worst paths the engine's stolen ATC lookup into DC1's hit and the slow ALU's funnel into the flags |
+| 3cb76fc | | | the shifts' carry and X from the operand bit by index, N and Z from the registered result: the funnel off the flags |
+| (DC1_ATC=1) | 21,809 - 21,834 | +0.45 / +0.30 / +0.25 | DC1's own ATC port and parallel tag compare (+200 ALMs): 60 MHz on every seed |
+| 058958e | 21,298 - 21,336 | -0.17 / +0.30 / +0.38 | the predecoder from a block RAM table (-963 ALUTs, +32 M10Ks); the remaining path the rotate amount's subtraction into the funnel |
+| 604e98e | | | F_UNFL through the shared incrementer, a move's shadow recorded once (-354 ALUTs); ROL by the complemented count, ROXL's amount registered |
+| 93721e3 | 20,768 - 20,895 | -0.48 / -1.44 / -0.34 | one data RAM way select for the engine's readers (-500 ALUTs): the walk's tag compare and the state decode on the operand path |
+| 0f80c32 | 20,901 - 20,916 | -0.03 / -0.37 / +0.21 | the operand path's way from a register again; push, walk and snoop readers share one multiplexer; the FPU normalizer (count, shift and the a_m multiplexer in one cycle) is the worst path |
+| 1a48b50 | see below | | datatype and unimplemented-instruction frames captured in one state from the shadow registers (-531 ALUTs by measurement of the capture paths); imm_b a signed word |
+| (F_NLZ) | see below | | the normalizer's count registered before its shift |
 
-Area round, measured (seed 1, 16.667 ns, retiming off; a per-entity fit
-after every step, which caught two changes that saved nothing):
+What the options cost, synthesis estimates (syn/mapvar.sh, ALMs needed
+and combinational ALUTs) of the same RTL with one option on; their
+cycle gains were measured in the ap68040-60mhz round (Dhrystone: early
+results -1.9 %, the loop predictor -4.4 %; FP workloads with the pipeline
+-20 to -82 %):
 
-| state | ALMs | what changed |
-|---|---:|---|
-| ed5ff93 | 27,912 | skid removed (its two bus-ordering rules kept), DC2 copies its hit way only, dirty bits and return stacks in LUT RAM |
-| a4f5c08 | ~27,250 | cache valid bits in LUT RAM (CINVA, a snooped clear and reset sweep the 64 sets) |
-| 23c76c8 | 27,491 | ATCs in block RAM: REVERTED -- two read ports became two RAM copies plus bypass registers, +80 to +157 ALMs per ATC |
-| b86fc10 | 26,363 | BTBs in simple-dual-port block RAM (F1 compares), DC2's store hazard by the line within the page |
-| 1e5eef1 | 25,947 | FRESTORE writes the FPU's frame registers directly; the queue's predecode in a ring with a registered head |
-| 522fca8 | 25,815 | the FPU pipeline shares the normalizer and the sticky right shifter with the state machine |
-| 8e58dd6 | 25,530 | D1's attribute table a block RAM ROM read a cycle ahead (an initialized array: a clocked case or a function behind a register stays logic) |
-| 1571385 | | D1's return stack one read address (MLAB), SDP RAMs with registered output (no bypass), the multiplier's partial products summed in two adders |
-| 33ec2d8 | 25,118 | the predecode ring as two MLAB banks by slot parity; one right and one left funnel for every slow-ALU shift (833 -> 628 ALMs) |
-| 035e51d | 24,935 | the ring banks with one write statement each (two read as two ports and stayed logic) |
-| ab9f58f | 24,831 | D1's PC-relative adds one adder per EA (PC16/PCX exclusive), the slow path's two phases one mk_ea; this seed meets 60 MHz at both corners (+0.29/+0.40 ns) |
-| f58cc0b | 24,787 | the FPU's memory operand unpacked on one bus (ten a_m sources fewer): -8 ALMs in the FPU -- its register-input muxes are not reducible this way |
-| 7fbbd9c | 24,712 | the integer register files in M10K (reads a cycle ahead, same-edge writes forwarded): REVERTED (3a4c4bf) -- three seeds -94 ALMs on average (the files -488, the backend's logic +365 around the fixed M10K columns) for about 1 ns worse setup on every seed, the DMU's ATC-to-dq1 path |
+| option on | ALMs (estimate) | ALUTs |
+|---|---:|---:|
+| none (the default) | 19,869 | 28,088 |
+| FPU_PIPE | +714 | +1,417 |
+| LOOP_PRED | +427 | +753 |
+| EARLY_RES | +519 | +783 |
 
-Dhrystone 1,786,949 cycles throughout (the 64-set clear after reset is
-the only change from 1,786,890); bench_fpu unchanged.  The round's FPU
-against the one before it (bef4deb), both pipelined, in tb/tb_fpu_pipe.sv
-(REF=bef4deb tb/build_fpu_pipe.sh wraps an FPU without the round's
-ports): eight seeds of 40,000 commands, registers and FPSR identical at
-every sync point; the round's FPU takes 0.4 % more cycles on that stream
-(the two-cycle multiplier and the shared normalizer).  The sampled corpus
-(--sample 300:24) on the round's last RTL: 3776/3801, exactly the 25
-known slices.
+Measured and not taken: the integer register files in M10K (the reads a
+cycle ahead need a cycle of write bypass that costs what the MLAB banks
+cost); a decoded-record FIFO of one (D1 would wait a clock behind every
+pop: 28 % on Dhrystone); a uop FIFO of one (the back end's stall would
+reach the sequencer's step); the upd2 register-file port (about 200 ALMs
+for a cycle on every instruction with two address updates).  Left: the FPU
+result output's sources (about 150 ALUTs), the fetch queue's length, the
+table walk's locked update sequencing.
 
-Timing at the round's end (be879b5's RTL, retiming off, four seeds): at
-57 MHz (17.544 ns, the period chosen when 60 MHz would not close on every
-seed) seeds 2, 3 and 4 meet both corners (+0.57, +0.41, +0.78 ns at 100C)
-and seed 1 misses by 0.29 ns at 100C (meets at -40C); hold is positive on
-all four (+0.14 to +0.23 ns); 24,739-24,796 ALMs.  At 60 MHz seed 1 of
-ab9f58f met both corners (+0.29/+0.40 ns).  A seed moves the worst path
-by about a nanosecond: a build takes the seed that closes.
+With the Minimig project's fitter settings (physical synthesis with
+retiming, sparse register packing; `MISTER=1 syn/fitcore.sh`) the same
+RTL fits about 100 ALMs larger and the retiming moves the worst paths:
+that build's closure is its own matter.
 
-What the prediction and forwarding features cost, each switched off alone
-(seed 1 fits of f58cc0b; cycles against its 1,786,949 Dhrystone,
-1,496,306 kern, 318,795 bench_insn, 54,430 bench_loop):
+## Timing
 
-| off | ALMs | Dhrystone | kern | bench_insn | bench_loop |
-|---|---:|---:|---:|---:|---:|
-| early results in AG (ag_ee = 0) | -557 | +1.9 % | +13.0 % | +1.7 % | 0 |
-| loop exit predictor (lp_exit = 0) | -448 | +4.4 % | +2.3 % | 0 | +2.5 % |
-| BTB (F1 never takes) | -276 | +44 % | +23 % | +8.7 % | +92 % |
-| branch history table (static Bcc) | -191 | +11.1 % | +0.3 % | 0 | 0 |
-| the FPU pipeline (PIPE=0, the outside report) | -1,517 | 0 | 0 | 0 | FP +20-82 % |
+The paths that limited seeds in this round, and what cut them: the engine's
+stolen ATC lookup address into DC1's fast-path decision (DC1_ATC: DC1 reads
+its own ATC port and compares tags with the four ways' pages in parallel);
+the slow ALU's funnel into the first-cycle flags (carry and X by index off
+the funnel, N and Z from the registered result); the rotate amounts'
+subtractions before the funnel (ROL by the complemented count, ROXL's
+amount registered in its pre-cycle); the walk's tag compare and the state
+decode on the engine's operand path (the operand path keeps a registered
+way); the FPU normalizer's count, shift and result multiplexer in one
+cycle (the count registered).  The remaining near-critical paths are the
+FPU's a_m register (46 sources) and the DMU's operand extractor.
 
-The integer register files in M10K (7fbbd9c, reverted): -94 ALMs on
-three seeds for ~1 ns of setup.
+## Known corpus failures
 
-The three worthwhile cuts are parameters of ap68040 (71e77c0: FPU_PIPE,
-LOOP_PRED, EARLY_RES, all 1 by default; the bench takes them as
-build_sim.sh DEFS="+define+AP_FPU_PIPE=0 ...", on the run_tests.sh
-invocation -- it rebuilds the simulator itself).  All three off: 22,766
-ALMs (54 %), 13,470 registers, seed 1 setup -0.11 ns at 60 MHz, the FPU
-4,606 and the backend's own logic 3,680; Dhrystone 1,906,833 (+6.7 %),
-kern +15.6 %, bench_insn +6.2 %, bench_fpu +7.1 %; the regression passes
-(be879b5: t_loops checks its misprediction counts only when the bench's
-$F2E8 bit 0 says the loop predictor is present).  Two traps met measuring this: run_tests.sh's own build drops
-a variant's DEFS unless they are on its command line, and a snapshot
-copied while a build regenerates rtl/gen/ can get an empty microcode ROM
-(the core then synthesizes to 5,425 ALMs).  The full Minimig fit with the old core
-(38,255 ALMs, 91 %) leaves 16,887 outside cpu_wrapper and ~1,400 for
-the shell: at that density the new core must be about 20,000 ALMs.  Kept at 8 entries:
-the loop predictor (4 cost 4.4 % Dhrystone).  Not changed, with the
-measured reason: the DMU tag RAMs' bypass logic (the engine reads a set
-in the cycle another port writes it thousands of times in t_snstress),
-the bus-out line copy (the push buffer refills while its line is on the
-bus), and the serial FPU (PIPE=0 saves 1,517 ALMs for +20-82 % on FP
-workloads).  Left: the bit field unit's six shifters shared over a third
-cycle (~300 ALMs), D1's adders.
-
-Known corpus failures (WinUAE generator defects, a real 68040 fails them
-too): BasicFPU FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007;
-ODD_EXC CHK/DIV*/TRAPV and ODD_IRQ EXT/SWAP slices (21).  Any other
-failing slice is a regression.
+WinUAE generator defects (a real 68040 fails them too): BasicFPU
+FADD.L/0001, FNEG.B/0002, FSNEG.S/0002, FSNEG.X/0007; ODD_EXC
+CHK/DIV*/TRAPV and ODD_IRQ EXT/SWAP slices (21).  The sampled corpus hits
+23 of them.  Any other failing slice is a regression.
 
 ## Running one program
 
 ```
 tb/build_asm.sh smoke t_integer      # assemble tb/asm/*.s
 tb/build_sim.sh                      # verilate (objects in ./obj)
-obj/obj_prog/tb_ap68040 +prog=tb/build/smoke.hex [+trace] [+ptrace] [+amtrace] [+prof] [+waits] [+tbi=2] [+retry=5] [+bclk2]
-tb/where.sh t_mmu 172                # the source of a failing test number
+obj/obj_prog/tb_ap68040 +prog=tb/build/smoke.hex [+trace] [+ptrace] [+amtrace] [+prof] [+waits] [+tbi=2] [+retry=5] [+bclk2] [+iplskew=<mask>]
+tb/build_decode.sh                   # the exhaustive decoder check
 ```
 
-The decoder table is checked against WinUAE for all 65536 operation words:
-`python3 tools/check_isa.py <op040.txt>` (the oracle dump is produced by a
-small program linked against WinUAE's readcpu.cpp; see tools/README).
+## Behaviour notes (decided by tests, the oracle or the manual)
 
-## Behaviour notes (decided by tests or the oracle)
-
+* Authority: real hardware, then WinUAE and its corpus, then the manual.
+  Where WinUAE and the manual conflict and a test pins WinUAE, WinUAE
+  wins: MOVES with any function code is translated through the root FC2
+  selects (t_mmu 55, 177-180; the manual's alternate address spaces are
+  not treated as physical); an overflowing FMOVE.S/.D store sets INEX2
+  only for lost bits (softfloat's 68K rounding); the FPCR keeps bits 15:0.
+  Where no test pinned anything the manual was followed: reset leaves the
+  caches and ATCs alone (8.2.1); a cache-inhibited or locked access
+  hitting a dirty line pushes and invalidates it first (4.6.2); a locked
+  table update carries LOCK/LOCKE and pushes a dirty descriptor line
+  first; table searches read descriptors through the data cache without
+  allocating (3.2.5), as do exception stack accesses and vector fetches
+  (4.5, 7.5); an untranslated access with no TTR match is cachable
+  write-through; IPEND negates at internal recognition; interrupt
+  processing follows other exception processing at once; BKPT runs an
+  acknowledge cycle (TT 3, TM 0, address 0) and then takes the illegal
+  instruction; RTE's stack reads and the frame's writes are supervisor
+  data; the internal reset lasts 128 bus clocks after RSTI negates and
+  RSTI is sampled over two bus clocks (C.4); an IPL level counts once two
+  consecutive bus-clock samples agree (7.8); a TA+TEA retry with BG negated
+  gives the bus up and reruns the transfer (7.8.1).
+* Interrupts: the mask an SR-writing instruction sets decides at its own
+  boundary; IPEND keeps a request that beat the old mask; an interrupt
+  beats a simultaneous trace; an interrupt pending as an exception's
+  processing ends is taken before the handler's first instruction (8.2.9,
+  t_exceptions 93-105 -- the 68060 differs); level 7 is taken on its edge
+  at any mask and again by level comparison when the mask drops below 7
+  (figure 8-3, t_irq7); a MOVEM continuation (SSW CM) runs before a
+  pending interrupt.
+* Double bus faults (7.6.3, 8.2.1, 8.2.2): an access or address error
+  during the processing of an access error, an address error or a reset
+  -- the vector fetch, the frame's writes, the fetch of the handler's first
+  instruction (an odd handler address included) -- halts the processor:
+  PST $5, BR negated, no bus cycle, until RSTI.  A handler fetch that fails
+  during any other exception's processing is an ordinary access error with
+  FA and the stacked PC the handler's address and the SSW a supervisor
+  code read (t_xnest).  RESET drives RSTO for 512 bus clocks once the bus
+  cycle in progress has ended (t_halt).
+* Access error frames (format $7): SSW SIZE is encoded as the SIZ pins (00
+  long, 01 byte, 10 word, 11 line); a misaligned operand within one line
+  whose fill fails on the long word it needs takes the access error at
+  once with FA the operand (7.6.1, t_cache2 12-14); a bus error on a later
+  beat of a fill the operand does not need takes no exception and the line
+  is not allocated; a bus error on a line push is reported as an access
+  error with the push's SSW (a write, SIZE line, TT normal, TM 0; figure
+  8-6).  Fetch faults on the lookahead are refetched once on demand before
+  they become access errors; FA is the faulting word's address.
 * Odd change-of-flow targets: address error at the instruction, frame PC
   per gencpu (JMP +2/+6, JSR the target, handler fetch the vector offset),
   Bcc/DBcc validate the target taken or not, RTE commits its SR first.
-* Interrupts: the mask an SR-writing instruction sets decides at its own
-  boundary; IPEND keeps a request that beat the old mask; an interrupt
-  beats a simultaneous trace (delivered at the handler entry); a MOVEM
-  continuation (SSW CM) runs before a pending interrupt.
-* Fetch faults: a fault on the lookahead is refetched once on demand
-  before it becomes an access error; FA is the faulting word's address.
 * Memory bit fields touch only the bytes of the field (WinUAE).
 * MOVEM: a loaded base/index register commits after the last transfer;
   indexed and PC-relative modes stack CM and the EA, RTE continues.
-* MOVES translates through its SFC/DFC space; IACK is never translated.
+* Caches: with the data cache disabled by CACR or CDIS, accesses bypass it
+  and leave its lines alone, MOVE16 included (4.4.1); a TCI instruction
+  line serves only the burst it came with (4.5.1); MOVE16 allocates no
+  line, a write hit invalidates (4.5); CPUSHP with TC.P pushes the 8K
+  page (t_cache2).
 * Bus snooping (MC68040UM tables 4-3/4-4, 7.9): SC 01/10 transfers of
   another master are looked up in the data cache, the push buffer and a
   push queued for the bus; dirty data is supplied (MI held, the 68040
@@ -275,27 +214,24 @@ small program linked against WinUAE's readcpu.cpp; see tools/README).
   drops a line on any snooped write and on an SC 10 read.  MI is
   asserted whenever another master owns the bus except while memory may
   answer.  The bench's alternate master (tb/m68040_alt_master.sv) is
-  also the arbiter; t_snoop checks every case.
+  also the arbiter; t_snoop and t_snirq check the cases.
 * Bus arbitration: a negated BG gives the bus up after the transfer in
   progress (a locked sequence keeps it).
 * Reads may pass earlier writes (7.7) except: a cache-inhibited or locked
   read waits for older stores, and a serialized-page or locked read is
-  performed only once every older instruction has completed, so nothing
-  can restart it after the read.
-* FDIV/FSQRT: two quotient bits (root digits) per clock, 33 iterations.
-* FADD/FSUB/FMUL register to register: 6 cycles back to back (the 68040
-  takes 3 and 5); 15 and 11 before the interface and dispatch work; with
-  the arithmetic pipeline a dependent FADD chain is 5 a step, independent
-  operations 3.  From memory: FMOVE.D 6, FMOVE.X 7, FADD.D 6, FADD.X 7;
-  FMOVE.L Dn,FPn 4 (bench_insn: before it set its
-  FP registers, the FP forms measured NaN and zero operands).  Operations
-  on unordinary operands (beyond +-60 in exponent, denormals, NaNs,
-  infinities), with an exception enabled, or other than FMOVE/FABS/FNEG/
-  FADD/FSUB/FMUL still take the state machine (6 cycles and up).
+  performed only once every older instruction has completed.
+* FPU: FDIV/FSQRT two quotient bits per clock; FADD/FMUL register to
+  register 6 cycles back to back, an effective subtraction 7 (the
+  normalizer's count cycle); a datatype or unimplemented-instruction trap
+  is raised a cycle after the decision (the frame captured from the
+  shadow registers); underflow is decided on the intermediate result
+  before rounding (9.7.5, softfloat roundAndPackFloatx80); the underflow
+  rounding forms the denormalized result (the 68040 keeps nothing else);
+  an FMOVE.X of a signaling NaN stores it as it is.
 * Branch prediction is invisible to programs except for self-modified
-  code: like the 68040 (which prefetches both paths of a branch) the core
-  may fetch a branch target before an older store to it; CPUSHA must
-  precede modified code (MC68040UM 4.5).  A store into the 128 bytes after
-  its own instruction still refetches what follows.  A snoop that drops
-  valid instruction-cache data refetches from the next instruction.
+  code: like the 68040 the core may fetch a branch target before an older
+  store to it; CPUSHA must precede modified code (MC68040UM 4.5).  A store
+  into the 128 bytes after its own instruction still refetches what
+  follows.  A snoop that drops valid instruction-cache data refetches from
+  the next instruction.
 * CDIS's reset-time selection of the multiplexed bus mode is not provided.

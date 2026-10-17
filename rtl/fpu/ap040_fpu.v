@@ -316,6 +316,7 @@ localparam F_RESTORE_A = 5'd18; // finish ET15 denormalization, shift FPTEMP
 localparam F_RESTORE_B = 5'd19; // finish FPTE15 denormalization
 localparam F_RESTORE_N = 5'd20; // normalize the prepared destination
 localparam F_CAP   = 5'd21;  // a datatype or unimplemented-instruction frame captured
+localparam F_NLZ   = 5'd22;  // the normalizer's count registered, before its shift
 
 reg  [4:0] fst;
 // unimp/unsupp decisions are made in the dispatch cycle (register
@@ -332,7 +333,7 @@ assign wb_ok = (fst == F_WB) && !(|(fpsr[15:8] & fpcr[15:8]));
 wire acc_dec = (fst == F_ADDX) || (fst == F_MULT) ||
                (fst == F_SHR && sh_ret == F_ADDX) ||
                (fst == F_DIVL) || (fst == F_SQRTL) ||
-               (fst == F_NORM2) || (fst == F_ROUND);
+               (fst == F_NORM2) || (fst == F_NLZ && nz_ret == F_NORM2) || (fst == F_ROUND);
 reg  acc_r;
 function acc_of;
 	input [4:0] st;
@@ -408,6 +409,12 @@ reg         mv_st;            // a move's F_ROUND starts: record its exception s
 // frame, its T and E1 flags, and a packed operand's E1
 reg  [15:0] cap_cmd;
 reg         cap_unimp, cap_t, cap_e1, cap_pk;
+// the normalizer takes two cycles: F_NLZ registers the leading-zero count
+// (nlz_q), the state it returns to (nz_ret: F_NORM, F_NORM2, F_RESTORE_N)
+// shifts by it -- the count and the shift in one cycle, with the select
+// before and the result multiplexer after, did not close at 60 MHz
+reg   [6:0] nlz_q;
+reg   [4:0] nz_ret;
 reg signed [17:0] e_w;        // working exponent (wrap safe)
 
 // These states already run in separate cycles. Select their input before
@@ -439,7 +446,8 @@ function [66:0] shr_sticky;
 endfunction
 // synthesis translate_off
 always @(posedge clk)
-	if (nsel != {fst == F_NORM2, fst == F_RESTORE_N})
+	if (nsel != {fst == F_NORM2 || (fst == F_NLZ && nz_ret == F_NORM2),
+	             fst == F_RESTORE_N || (fst == F_NLZ && nz_ret == F_RESTORE_N)})
 		$display("FPU: nsel %b disagrees with state %0d", nsel, fst);
 // synthesis translate_on
 
@@ -652,8 +660,12 @@ wire [63:0] norm_m = nsel[0] ? b_m :
                      nsel[1] ? acc_hi[63:0] :
                      p4_v    ? p4_m : a_m;
 wire [6:0] norm_lz = clz64(norm_m);
+// (the state machine shifts by the registered count; the pipeline, which
+// holds an operation only while the state machine is idle, by the count
+// of the cycle)
+wire [6:0] norm_cnt = p4_v ? norm_lz : nlz_q;
 wire [66:0] norm_shifted =
-    {norm_m, (nsel[1] ? grs : (!nsel[0] && p4_v) ? p4_g : 3'd0)} << norm_lz;
+    {norm_m, (nsel[1] ? grs : (!nsel[0] && p4_v) ? p4_g : 3'd0)} << norm_cnt;
 // one right shifter with sticky for F_SHR and the pipeline's P2 alignment
 // (P2 holds an operation only while the state machine is idle)
 wire        shr_fsm = (fst == F_SHR);
@@ -1374,6 +1386,7 @@ always @(posedge clk) begin
 		fstate_busy <= 0; fstate_wbt <= 0; fstate_fpiar_c <= 0;
 		sh_cmd <= 0; sh_src <= 0; sh_stag <= 0;
 		cap_cmd <= 0; cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+		nlz_q <= 0; nz_ret <= F_NORM;
 		sh_dst <= 0; sh_dtag <= 0;
 		wb_s <= 0; wb_e <= 0; wb_m <= 0; wb_grs <= 0;
 		dout <= 0;
@@ -1969,7 +1982,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd31;   // integer bit at 63
 							r_stag <= (r_din[95:64] == 32'd0) ? 3'd1 : 3'd0;
-							begin fst <= F_NORM; acc_r <= 1'b0; end
+							begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd4: begin : cv_w
 							a_s <= r_din[95];
@@ -1977,7 +1990,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd15;
 							r_stag <= (r_din[95:80] == 16'd0) ? 3'd1 : 3'd0;
-							begin fst <= F_NORM; acc_r <= 1'b0; end
+							begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd6: begin : cv_b
 							a_s <= r_din[95];
@@ -1985,7 +1998,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd7;
 							r_stag <= (r_din[95:88] == 8'd0) ? 3'd1 : 3'd0;
-							begin fst <= F_NORM; acc_r <= 1'b0; end
+							begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd1: begin : cv_s
 							a_s <= r_din[95];
@@ -2008,7 +2021,7 @@ always @(posedge clk) begin
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd16257;
 										a_m <= unp_m;
-										r_stag <= 3'd5; begin fst <= F_NORM; acc_r <= 1'b0; end
+										r_stag <= 3'd5; begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
 										sh_stag <= 3'd5;
@@ -2069,7 +2082,7 @@ always @(posedge clk) begin
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd15361;
 										a_m <= unp_m;
-										r_stag <= 3'd5; begin fst <= F_NORM; acc_r <= 1'b0; end
+										r_stag <= 3'd5; begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
 										sh_stag <= 3'd5;
@@ -2112,7 +2125,7 @@ always @(posedge clk) begin
 								if (r_unimp) begin
 									{a_s, a_e, a_m, a_t} <=
 										unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
-									r_stag <= 3'd4; begin fst <= F_NORM; acc_r <= 1'b0; end
+									r_stag <= 3'd4; begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 								end
 								else begin
 									cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
@@ -2124,7 +2137,7 @@ always @(posedge clk) begin
 								r_stag <= frame_tag_x(r_din[94:80], r_din[63:0]);
 								{a_s, a_e, a_m, a_t} <=
 									unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
-								begin fst <= F_NORM; acc_r <= 1'b0; end
+								begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 							end
 							else begin : cv_xs
 								// a supported extended operand is normalized
@@ -2155,6 +2168,14 @@ always @(posedge clk) begin
 						end
 					endcase
 				end
+			end
+
+			F_NLZ: begin
+				// the normalizer's count, registered; its input select
+				// (nsel) stays as the entering state set it
+				nlz_q <= norm_lz;
+				nsel  <= nsel;
+				begin fst <= nz_ret; acc_r <= acc_of(nz_ret); end
 			end
 
 			F_CAP: begin
@@ -2192,7 +2213,7 @@ always @(posedge clk) begin
 				if (b_t == T_NUM && sh_v[66:3] == 0) b_t <= T_ZERO;
 				sh_dst <= {b_s, b_e[14:0], 16'd0, sh_v[66:3]};
 				sh_dtag <= frame_tag_x(b_e[14:0], sh_v[66:3]);
-				begin fst <= F_RESTORE_N; acc_r <= 1'b0; end
+				begin fst <= F_NLZ; nz_ret <= F_RESTORE_N; acc_r <= 1'b0; end
 				nsel <= 2'b01;
 			end
 
@@ -2201,9 +2222,9 @@ always @(posedge clk) begin
 				// The normal instruction path still traps on these operands.
 				if (b_t == T_NUM) begin
 					b_m <= norm_shifted[66:3];
-					b_e <= b_e - {10'd0, norm_lz};
+					b_e <= b_e - {10'd0, nlz_q};
 				end
-				begin fst <= F_NORM; acc_r <= 1'b0; end
+				begin fst <= F_NLZ; nz_ret <= F_NORM; acc_r <= 1'b0; end
 			end
 
 			F_NORM: begin
@@ -2216,7 +2237,7 @@ always @(posedge clk) begin
 					if (a_m == 64'd0) begin
 						a_t <= T_ZERO; a_e <= 0;
 					end
-					else a_e <= a_e - {10'd0, norm_lz};
+					else a_e <= a_e - {10'd0, nlz_q};
 					begin fst <= F_EXEC; acc_r <= 1'b0; end
 				end
 			end
@@ -2598,7 +2619,7 @@ always @(posedge clk) begin
 						a_t <= T_NUM;
 						acc_hi <= {1'b0, diff[66:3]};
 						grs <= diff[2:0];
-						begin fst <= F_NORM2; acc_r <= 1'b1; end
+						begin fst <= F_NLZ; nz_ret <= F_NORM2; acc_r <= 1'b1; end
 						nsel <= 2'b10;
 					end
 				end
@@ -2609,7 +2630,7 @@ always @(posedge clk) begin
 					a_t <= T_ZERO;
 					begin fst <= F_WB; acc_r <= 1'b0; end
 				end
-				else if (norm_lz == 7'd64) begin
+				else if (nlz_q == 7'd64) begin
 					a_m <= {grs, 61'd0};
 					grs <= 0;
 					e_w <= e_w - 18'sd64;
@@ -2618,7 +2639,7 @@ always @(posedge clk) begin
 				else begin
 					a_m <= norm_shifted[66:3];
 					grs <= norm_shifted[2:0];
-					e_w <= e_w - {11'd0, norm_lz};
+					e_w <= e_w - {11'd0, nlz_q};
 					begin fst <= F_ROUND; acc_r <= 1'b1; end
 				end
 			end
