@@ -327,7 +327,7 @@ always_comb begin
 	nu.b_src  = ob.v ? ob.src : OS_ZERO;
 	nu.b_reg  = ob.r;
 	nu.imm    = oa.imm_v ? oa.imm : {{16{uw.cval[15]}}, uw.cval};
-	nu.imm_b  = ob.imm;
+	nu.imm_b  = {ob.imm[31], ob.imm[15:0]};   // (never a full immediate: 16 bits and the sign)
 	nu.mfc    = (uw.mfc == MFC_EAP) ? MFC_NORM : uw.mfc;
 	nu.dyn    = uw.dyn;
 	nu.dynk   = uw.dynk;

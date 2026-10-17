@@ -457,7 +457,8 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 endfunction
 
 wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
+wire [31:0] ag_immb = {{15{ag_u.imm_b[16]}}, ag_u.imm_b};   // the B immediate extended
+wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_immb, 1'b0);
 
 // AG's early result: MOVE, ADD, SUB, AND, OR, EOR and LSL/ASL by an
 // immediate count, from register or immediate operands whose values are
@@ -490,7 +491,7 @@ always_comb begin
 			else ea_ok = 1'b0;
 		end
 	end
-	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_u.imm_b : 32'd0;
+	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_immb : 32'd0;
 	eb_ok = 1'b1;
 	if (ag_u.b_src == OS_REG) begin
 		w = yw(ag_u.b_reg);

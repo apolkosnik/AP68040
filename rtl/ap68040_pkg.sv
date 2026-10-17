@@ -219,7 +219,9 @@ typedef struct packed {
 	logic  [1:0] b_src;
 	logic  [4:0] b_reg;
 	logic [31:0] imm;       // operand A immediate (or a constant)
-	logic [31:0] imm_b;     // operand B immediate
+	logic [16:0] imm_b;     // operand B immediate: a 16-bit word with its sign
+	                        // (the B symbols are 16-bit constants and words,
+	                        // sign- or zero-extended: bit 16 extends it)
 	// address generation: EA = base + idx*scale + disp
 	logic        ag;        // compute an effective address
 	logic        base_v;

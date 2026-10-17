@@ -315,6 +315,7 @@ localparam F_STDONE = 5'd17; // store completion: settled-status trap check
 localparam F_RESTORE_A = 5'd18; // finish ET15 denormalization, shift FPTEMP
 localparam F_RESTORE_B = 5'd19; // finish FPTE15 denormalization
 localparam F_RESTORE_N = 5'd20; // normalize the prepared destination
+localparam F_CAP   = 5'd21;  // a datatype or unimplemented-instruction frame captured
 
 reg  [4:0] fst;
 // unimp/unsupp decisions are made in the dispatch cycle (register
@@ -400,6 +401,13 @@ reg   [3:0] op_kind;          // 0 none, 1 add, 2 mul, 3 div, 4 sqrt
 reg   [4:0] sh_ret;           // staged shifter return state
 reg   [1:0] r_pr;             // rounding precision latched for F_UNFL
 reg         mv_st;            // a move's F_ROUND starts: record its exception shadow
+// a datatype or unimplemented-instruction frame is captured in F_CAP, the
+// cycle after the decision, from the shadow registers (sh_src, sh_stag,
+// sh_dst, sh_dtag: one form for every site -- the dispatch records the
+// operands as such a frame wants them) and these: the command word, which
+// frame, its T and E1 flags, and a packed operand's E1
+reg  [15:0] cap_cmd;
+reg         cap_unimp, cap_t, cap_e1, cap_pk;
 reg signed [17:0] e_w;        // working exponent (wrap safe)
 
 // These states already run in separate cycles. Select their input before
@@ -1365,6 +1373,7 @@ always @(posedge clk) begin
 		fstate_e1 <= 0; fstate_grs <= 0; fstate_wbte15 <= 0;
 		fstate_busy <= 0; fstate_wbt <= 0; fstate_fpiar_c <= 0;
 		sh_cmd <= 0; sh_src <= 0; sh_stag <= 0;
+		cap_cmd <= 0; cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
 		sh_dst <= 0; sh_dtag <= 0;
 		wb_s <= 0; wb_e <= 0; wb_m <= 0; wb_grs <= 0;
 		dout <= 0;
@@ -1629,6 +1638,33 @@ always @(posedge clk) begin
 				sh_dtag <= frame_tag_x(fr_dst_e, fr_dst_m);
 				{b_s, b_e, b_m, b_t} <=
 					unpack_x(fr_dst_s, fr_dst_e, fr_dst_m);
+				// the operands as a datatype or unimplemented-instruction
+				// frame records them (F_CAP): the source raw -- a register's
+				// image; a memory operand in extended layout, a packed one
+				// in its split layout -- with its tag (an S/D denormal's is
+				// set where it is found); a store's register in both
+				if (op_class == 3'b011) begin
+					sh_dst  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
+					sh_dtag <= frame_tag_x(fr_src_e, fr_src_m);
+				end
+				if (op_class == 3'b010 && src_fmt == 3'd7) begin
+					sh_src  <= 96'd0;
+					sh_stag <= 3'd1;
+				end
+				else if (op_class == 3'b010 && src_fmt == 3'd3) begin
+					sh_src  <= {32'd0, din[63:0]};
+					sh_stag <= 3'd7;
+					sh_dst  <= {32'd0, din[63:32], din[95:64]};
+					sh_dtag <= 3'd0;
+				end
+				else if (op_class == 3'b010) begin
+					sh_src  <= {din[95], din[94:80], 16'd0, din[63:0]};
+					sh_stag <= frame_tag_x(din[94:80], din[63:0]);
+				end
+				else begin
+					sh_src  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
+					sh_stag <= frame_tag_x(fr_src_e, fr_src_m);
+				end
 				if (op_class == 3'b011) begin
 					// FMOVE FPn,<ea>: packed decimal and denormal/unnormal
 					// register contents are unsupported data types
@@ -1636,22 +1672,14 @@ always @(posedge clk) begin
 					// BOTH ETEMP and FPTEMP (WinUAE marks the FPTEMP/dtag
 					// half undocumented but writes it).
 					if (src_fmt == 3'd3 || src_fmt == 3'd7) begin
-						unsupp <= 1;
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    1'b1, 1'b1);   // T, packed -> E1
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 1; cap_e1 <= 1; cap_pk <= 0;   // T, packed -> E1
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else if (fr_src_unsup) begin
-						unsupp <= 1;
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    1'b1, 1'b0);   // T, not packed
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 1; cap_e1 <= 0; cap_pk <= 0;   // T, not packed
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else begin
 						{a_s, a_e, a_m, a_t} <=
@@ -1661,26 +1689,22 @@ always @(posedge clk) begin
 					end
 				end
 				else if (op_class == 3'b010 && src_fmt == 3'd7) begin : save_fmovecr
-					capture_unimp({op_class, src_fmt, dst_r, opmode},
-					               96'd0, 3'd1,
-					               {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-					               frame_tag_x(fr_dst_e, fr_dst_m));
+					cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+					cap_unimp <= 1; cap_pk <= 0;
+					begin fst <= F_CAP; acc_r <= 1'b0; end
 				end
 				else if (!op_in_hw(opmode)) begin : save_unimp_command
 					if (op_class == 3'b000) begin
-						capture_unimp({op_class, src_fmt, dst_r, opmode},
-						               {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						               frame_tag_x(fr_src_e, fr_src_m),
-						               {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-						               frame_tag_x(fr_dst_e, fr_dst_m));
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 1; cap_pk <= 0;
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else if (src_fmt == 3'd3) begin
 						// Packed operands use the same split payload in the short
 						// unimplemented frame as in a datatype BUSY frame.
-						capture_unimp({op_class, src_fmt, dst_r, opmode},
-						               {32'd0, din[63:0]}, 3'd7,
-						               {32'd0, din[63:32], din[95:64]}, 3'd0);
-						fstate_flags <= 3'b100; // E1 tells get_op to unpack
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 1; cap_pk <= 1;   // E1 tells get_op to unpack
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else begin
 						// Reuse the normal sequential source converter instead of
@@ -1692,15 +1716,11 @@ always @(posedge clk) begin
 				end
 				else if (op_class == 3'b000) begin
 					if (fr_src_unsup) begin
-						unsupp <= 1;
 						// OPCLASS 000: source in ETEMP; a dyadic op also
 						// carries its destination in FPTEMP
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-						    frame_tag_x(fr_dst_e, fr_dst_m),
-						    1'b0, 1'b0);
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else begin : disp_rr
 					reg [83:0] ua;
@@ -1733,15 +1753,14 @@ always @(posedge clk) begin
 					// an unsupported data type.  FMOVECR was handled above so
 					// its exception could retain a complete state frame.
 					if (src_fmt == 3'd3) begin
-						unsupp <= 1;
 						// The core has fetched all twelve bytes.  The 040 stores
 						// the first packed longword in FPTEMP_LO, not ETEMP_EX;
 						// FPSP get_op copies it back before calling decbin.
-						// Match Previous fp_unimp_datatype's split frame layout.
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {32'd0, din[63:0]}, 3'd7,
-						    {32'd0, din[63:32], din[95:64]}, 3'd0,
-						    1'b0, 1'b1);   // packed -> E1, stag 7
+						// Match Previous fp_unimp_datatype's split frame layout
+						// (the dispatch's sh_src/sh_dst for a packed operand).
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 0; cap_e1 <= 1; cap_pk <= 0;   // packed -> E1, stag 7
+						begin fst <= F_CAP; acc_r <= 1'b0; end
 					end
 					else begin
 						a_t <= T_NUM;   // provisional; F_SRC classifies
@@ -1992,14 +2011,10 @@ always @(posedge clk) begin
 										r_stag <= 3'd5; begin fst <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
-										unsupp <= 1;
-										capture_datatype(
-										    {3'b010, r_fmt, r_dst, r_op},
-										    {r_din[95], r_din[94:80], 16'd0,
-										     r_din[63:0]}, 3'd5,
-										    sh_dst, sh_dtag,
-										    1'b0, 1'b0);
-										begin fst <= F_IDLE; acc_r <= 1'b0; end
+										sh_stag <= 3'd5;
+										cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+										cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+										begin fst <= F_CAP; acc_r <= 1'b0; end
 									end
 								end
 								else begin
@@ -2057,14 +2072,10 @@ always @(posedge clk) begin
 										r_stag <= 3'd5; begin fst <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
-										unsupp <= 1;
-										capture_datatype(
-										    {3'b010, r_fmt, r_dst, r_op},
-										    {r_din[95], r_din[94:80], 16'd0,
-										     r_din[63:0]}, 3'd5,
-										    sh_dst, sh_dtag,
-										    1'b0, 1'b0);
-										begin fst <= F_IDLE; acc_r <= 1'b0; end
+										sh_stag <= 3'd5;
+										cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+										cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+										begin fst <= F_CAP; acc_r <= 1'b0; end
 									end
 								end
 								else begin
@@ -2104,15 +2115,9 @@ always @(posedge clk) begin
 									r_stag <= 3'd4; begin fst <= F_NORM; acc_r <= 1'b0; end
 								end
 								else begin
-									unsupp <= 1;
-									capture_datatype(
-									    {3'b010, r_fmt, r_dst, r_op},
-									    {r_din[95], r_din[94:80], 16'd0,
-									     r_din[63:0]},
-									    frame_tag_x(r_din[94:80], r_din[63:0]),
-									    sh_dst, sh_dtag,
-									    1'b0, 1'b0);
-									begin fst <= F_IDLE; acc_r <= 1'b0; end
+									cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+									cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+									begin fst <= F_CAP; acc_r <= 1'b0; end
 								end
 							end
 							else if (r_unimp) begin
@@ -2150,6 +2155,22 @@ always @(posedge clk) begin
 						end
 					endcase
 				end
+			end
+
+			F_CAP: begin
+				// the datatype or unimplemented-instruction frame, from the
+				// shadow registers the deciding site prepared (one form for
+				// every site: the frame's operand multiplexers do not grow
+				// with the sites)
+				if (cap_unimp) begin
+					capture_unimp(cap_cmd, sh_src, sh_stag, sh_dst, sh_dtag);
+					if (cap_pk) fstate_flags <= 3'b100;   // E1 tells get_op to unpack
+				end
+				else begin
+					unsupp <= 1;
+					capture_datatype(cap_cmd, sh_src, sh_stag, sh_dst, sh_dtag, cap_t, cap_e1);
+				end
+				begin fst <= F_IDLE; acc_r <= 1'b0; end
 			end
 
 			F_RESTORE_A: begin
@@ -2208,11 +2229,11 @@ always @(posedge clk) begin
 					sh_stag <= r_stag;
 				end
 				if (r_unimp) begin
-					capture_unimp({3'b010, r_fmt, r_dst, r_op},
-					               {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					               sh_dst, sh_dtag);
+					// (sh_src/sh_stag written above, this cycle)
+					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_unimp <= 1; cap_pk <= 0;
 					r_unimp <= 0;
-					begin fst <= F_IDLE; acc_r <= 1'b0; end
+					begin fst <= F_CAP; acc_r <= 1'b0; end
 				end
 				// FCMP evaluates its destination without passing through
 				// F_BIN, so its unsupported-datatype check lives here -- and
@@ -2221,12 +2242,9 @@ always @(posedge clk) begin
 				// status byte stays clean.
 				else if (!r_resume && r_op == 7'h38 &&
 				    unsupported_x(b_e[14:0], b_m)) begin
-					unsupp <= 1;
-					capture_datatype({3'b010, r_fmt, r_dst, r_op},
-					    {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					    sh_dst, sh_dtag,
-					    1'b0, 1'b0);
-					begin fst <= F_IDLE; acc_r <= 1'b0; end
+					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+					begin fst <= F_CAP; acc_r <= 1'b0; end
 				end
 				else begin
 				// Quiet signaling NaNs after recording SNAN.  Source and
@@ -2289,12 +2307,10 @@ always @(posedge clk) begin
 					// dispatch; r_ae7 holds the prior accrued-IOP bit)
 					fpsr[14] <= 0;
 					fpsr[7]  <= r_ae7;
-					unsupp <= 1;
-					capture_datatype({3'b010, r_fmt, r_dst, r_op},
-					    {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					    sh_dst, sh_dtag,
-					    1'b0, 1'b0);
-					begin fst <= F_IDLE; acc_r <= 1'b0; end
+					// (sh_src/sh_stag written above, this cycle)
+					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+					begin fst <= F_CAP; acc_r <= 1'b0; end
 				end
 				else begin
 				if (op_kind != 4'd4 && b_t == T_NAN && !b_m[62]) begin
