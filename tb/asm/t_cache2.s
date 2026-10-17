@@ -50,6 +50,10 @@
 ;   27   a TCI instruction line is not kept for the next sequential fetch
 ;        (4.5.1): the bench rewrites the line's second long word after it
 ;        is fetched ($F16C); the instruction there must be the new one
+;   28-29 MOVE16 from a cached source line copies that line: the source in
+;        way 0, then another line of the same set filled into way 1 just
+;        before; the destination must hold the source's first and last
+;        long words
 ;
 ;   98   an unexpected exception
 
@@ -432,6 +436,39 @@ ma_back:
 	bgt.s	.t27		; MOVEQ #n with n > 0: fetched anew
 	failt	27
 .t27:
+
+;------------------------------------------------ 28-29 MOVE16 from a cached line
+	cinva	bc
+	moveq	#0,d0
+	movec	d0,cacr
+	movec	d0,dtt1		; no TTR, translation off: write-through, cachable
+	lea	($A600).l,a0	; the source line (set $20)
+	move.l	#$5A5A0001,(a0)+
+	move.l	#$5A5A0002,(a0)+
+	move.l	#$5A5A0003,(a0)+
+	move.l	#$5A5A0004,(a0)+
+	lea	($AA00).l,a0	; another line of set $20
+	move.l	#$C3C30001,(a0)+
+	move.l	#$C3C30002,(a0)+
+	move.l	#$C3C30003,(a0)+
+	move.l	#$C3C30004,(a0)+
+	clr.l	($A700).l	; the destination line (set $30)
+	clr.l	($A70C).l
+	move.l	#$80000000,d0	; data cache on
+	movec	d0,cacr
+	tst.l	($A600).l	; the source into way 0
+	tst.l	($AA00).l	; the other line into way 1: the last fill
+	lea	($A600).l,a2
+	lea	($A700).l,a3
+	move16	(a2)+,(a3)+
+	move.l	($A700).l,d1
+	move.l	($A70C).l,d2
+	moveq	#0,d0
+	movec	d0,cacr
+	move.l	#$0000A040,d0
+	movec	d0,dtt1
+	chkl	d1,$5A5A0001,28
+	chkl	d2,$5A5A0004,29
 
 	move.w	#$600D,(DONEREG).l
 	bra.s	*

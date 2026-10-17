@@ -987,19 +987,20 @@ always_comb begin
 	for (int i = 0; i < 4; i++)
 		if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin tw_hw_h = 1'b1; tw_hw_w = 2'(i); end
 end
-// the data RAM's way for the engine's line readers other than its
-// operand path, one select (and one line multiplexer) for them: the
-// snooper's way while it has the cache (the engine is frozen then), the
-// walk's descriptor way, else the fill's or push's victim way
+// the data RAM's way for the engine's line readers, one select (and one
+// line multiplexer) for them, every input a flip-flop: the snooper's way
+// while it has the cache (the engine is frozen then), the walk's
+// descriptor way, else f_way -- the fill's or push's victim way, or the
+// hit way an operand or MOVE16 read (E_S_RD, E_SP_2) set
 wire  [1:0]  dq_wsel = sn_frz ? sn_way : (e_st == E_TW_DLK) ? tw_hwq : f_way;
 wire [127:0] dq_w    = dq_rn[dq_wsel];
 // the engine's operand bytes, one extractor for its states: E_SP_3 the
 // rest of a split load from the stolen read, E_S_ACT from the line a fill
-// delivered (bo_line), E_S_RD2 from the read way (the job's: a register
-// selects the way, a timing path)
+// delivered (bo_line), E_S_RD2 from the read way (through the shared line
+// multiplexer: f_way holds the hit way then)
 wire  [2:0]  sp_n0    = 3'(5'd16 - {1'b0, m2.r.a[3:0]});
 wire         etk_sp   = (e_st == E_SP_3);
-wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_rn[e_x.way];
+wire [127:0] etk_line = (e_st == E_S_ACT) ? bo_line : dq_w;   // (f_way: e_x.way)
 wire  [3:0]  etk_o    = etk_sp ? 4'd0 : e_va[3:0];
 wire  [2:0]  etk_n    = etk_sp ? 3'(nbytes(m2.r.msz) - sp_n0) : e_n;
 wire [31:0]  etk      = take(etk_line, etk_o, etk_n);
@@ -1295,8 +1296,9 @@ always_ff @(posedge clk) begin
 			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lve_q);
 			// the second part's translation and lookup, registered (the
 			// decision and the data next cycle; the RAM keeps reading the
-			// stolen set)
+			// stolen set, the line multiplexer its way)
 			e_x  <= x;
+			f_way <= x.way;
 			e_st <= E_SP_3;
 		end
 		E_S_XL: begin
@@ -1489,9 +1491,12 @@ always_ff @(posedge clk) begin
 			else e_st <= E_S_NEXT;
 		end
 		E_S_RD: begin
-			// read the line through the stolen data port
+			// read the line through the stolen data port (the shared line
+			// multiplexer selects f_way: the hit way's, for the operand
+			// and for a MOVE16 source)
 			steal  <= 1'b1;
 			st_set <= e_va[9:4];
+			f_way  <= e_x.way;
 			e_st   <= E_S_RDW;
 		end
 		E_S_RDW: e_st <= E_S_RD2;

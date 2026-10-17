@@ -7,8 +7,8 @@
 | M0 | the AP68060 tree converted back to the 68040 (631f440): MSP/ISP, format $7 frames with the restart model, MOVEM continuation, T0/T1 trace, the 040 MOVEC set, CACR/TC, PTEST/MMUSR, nonresident ATC entries, table walks through the data cache, 4 KB caches, the 040 snooper, BIU and bus protocol, 128-clock reset, IPL sampling, PST codes, FPU revision $41 frames; the 060 round's pipeline work kept | done |
 | M1 | regression: 29 programs x 5 bus configurations, the exhaustive decode bench | done |
 | M2 | cputest corpus replay (tb/tb_cputest.sv): the sampled corpus | done: 3,778 of 3,801 slices, the rest the known generator defects |
-| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done: +0.33 / +0.05 / +0.16 ns at the 100C slow corner after the area round (the timing section) |
-| M4 | area: under 20,000 ALMs with every feature | done: 19,443 - 19,519 ALMs on three seeds (21,436 at the conversion); the area section |
+| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done: +0.53 / +0.09 / +0.44 ns at the 100C slow corner after the area round (the timing section) |
+| M4 | area: under 20,000 ALMs with every feature | done: 19,481 - 19,525 ALMs on three seeds (21,436 at the conversion); with the Minimig project's fitter settings about 20,100 (the area section) |
 | M5 | the AP68060's tests under the 68040's rules: level 7 interrupts, IPL skew, an interrupt among snoop invalidations, nested exceptions and double faults, RESET and the halted bus, the cache cases (t_irq7, t_iplglitch, t_snirq, t_xnest, t_halt, t_cache2) | done |
 | M6 | performance | Dhrystone 2.1: 964 cycles/iteration, 35.4 DMIPS at 60 MHz (0.590 DMIPS/MHz); Whetstone 469,922 cycles/loop, 12.77 MWIPS (948 cycles/iteration with DIV_STEPS 4) |
 
@@ -90,6 +90,7 @@ nanosecond, so a change is judged on three):
 | 1434241 | 20,733 - 20,781 | +0.49 / +0.18 / +0.05 | the normalizer's count registered before its shift: 60 MHz on every seed |
 | 92ea705 | 20,761 - 20,822 | +0.37 / +0.22 / +0.65 | the table walk's line compare registered throughout the walk: the walk's update state off the hit update; the remaining worst paths are the TC register into the engine's hit decision, the fetch queue's word into D1's record, and the ATC's address into the engine's physical address |
 | area round | 19,443 - 19,519 | +0.33 / +0.05 / +0.16 | below |
+| MOVE16 fix | 19,481 - 19,525 | +0.53 / +0.09 / +0.44 | a MOVE16 from a cached source line copied the line of the way f_way named, not the hit way's (t_cache2 28-29); the engine sets f_way to the hit way before its line reads, and its operand extractor shares the line multiplexer |
 
 The area round (synthesis estimates, ALMs needed, each change against the
 one before; the fit lands about 800 above the estimate):
@@ -139,7 +140,7 @@ table walk's locked update sequencing.
 
 With the Minimig project's fitter settings (physical synthesis with
 retiming, sparse register packing; `MISTER=1 syn/fitcore.sh`) the same
-RTL fitted about 100 ALMs larger before the area round, and about 580 larger after it (20,079 ALMs at seed 1, +0.14 ns): its sparse register packing undoes much of the round's gain, and the retiming moves the worst paths:
+RTL fitted about 100 ALMs larger before the area round, and about 600 larger after it (20,073 / 20,117 / 20,181 ALMs on seeds 1-3 at the MOVE16 fix): physical synthesis adds about 1,000 ALUTs and retiming 1,300 registers, mostly in fetch, D1 and the FPU, and the retiming moves the worst paths:
 that build's closure is its own matter.
 
 ## Timing
