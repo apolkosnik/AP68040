@@ -256,8 +256,11 @@ up to five cycles before the routine starts.
   allocation; a write hit invalidates), CINV/CPUSH (line, page, all),
   PFLUSH/PTEST, and table walks for both ATCs.  Its push, walk and snoop
   readers share one line multiplexer; its operand extractor selects its
-  way from the job's registered way.  With the data cache disabled (CACR
-  or CDIS) accesses bypass it and leave its lines alone.
+  way from the job's registered way; a table walk's descriptor lookup
+  compares the tags of its set every cycle the walk runs and uses the
+  registered hit and way (a snoop that freezes the engine invalidates
+  them for a cycle).  With the data cache disabled (CACR or CDIS)
+  accesses bypass it and leave its lines alone.
 * Table walks (MC68040UM 3.2): root, pointer and page descriptors,
   indirect descriptors, 4 KB/8 KB pages, accumulated write protection, U
   and M updates.  Descriptor reads see the data cache (cachable
