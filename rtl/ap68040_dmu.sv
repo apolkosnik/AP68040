@@ -954,14 +954,15 @@ assign dm_hold1 = sn_frz || steal || steal_q || (m1.v && m1_stale) ||
                    e_st != E_W_PART && e_st != E_W_DONE);
 
 // the table walk's descriptor line in the cache: the hit and its way, from
-// the tags read at the walk's set.  E_TW_UPD uses the compare as it stands
-// (it pushes or invalidates the line before the update); E_TW_DLK reads
-// the descriptor by the way registered a cycle earlier (E_TW_DESCW, the
-// tags of the set valid from then on), so the compare stays off the data
-// path
+// the tags and valid bits read at the walk's set (tw_busy: the valid copy
+// reads that set throughout the walk, its bus cycles included), registered
+// every cycle (tw_hhq, tw_hwq; tw_hvq says the cycle before read that
+// set, unfrozen).  E_TW_DLK reads the descriptor by the registered way,
+// E_TW_UPD pushes or invalidates by it (waiting a cycle after a snoop
+// froze the engine): the compare is off the data and bookkeeping paths
 logic        tw_hw_h;
 logic  [1:0] tw_hw_w;
-logic        tw_hhq;
+logic        tw_hhq, tw_hvq;
 logic  [1:0] tw_hwq;
 always_comb begin
 	tw_hw_h = 1'b0; tw_hw_w = 2'd0;
@@ -1024,7 +1025,7 @@ always_ff @(posedge clk) begin
 		sc_set <= '0; sc_lv <= '0; sc_ld <= '0;
 		tw_lvl <= TW_ROOT; tw_va <= '0; tw_s <= 1'b0; tw_wr <= 1'b0; tw_pt <= 1'b0;
 		tw_i <= 1'b0; tw_da <= '0; tw_d <= '0; tw_wp <= 1'b0; tw_fail <= 1'b0;
-		tw_berr <= 1'b0; tw_pd <= '0; tw_upd <= 1'b0; tw_hw <= 4'd0; tw_lkrd <= 1'b0; tw_hhq <= 1'b0; tw_hwq <= '0;
+		tw_berr <= 1'b0; tw_pd <= '0; tw_upd <= 1'b0; tw_hw <= 4'd0; tw_lkrd <= 1'b0; tw_hhq <= 1'b0; tw_hwq <= '0; tw_hvq <= 1'b0;
 		tset_b <= '0; tway_b <= '0; twd_b <= '0;
 		dw_set <= '0; dw_way <= '0; dw_be <= '0; dw_src <= '0; dw_word <= '0;
 		ic_inv <= 1'b0; ic_inv_scope <= '0; ic_inv_pa <= '0;
@@ -1171,6 +1172,11 @@ always_ff @(posedge clk) begin
 				e_st   <= E_W_PART;
 			end
 		end
+
+		// the walk's line compare, registered (see tw_hhq)
+		tw_hhq <= tw_hw_h;
+		tw_hwq <= tw_hw_w;
+		tw_hvq <= tw_busy && !sn_frz;
 
 		//--------------------------------------------------------------
 		// engine (frozen while the snooper has the cache)
@@ -1989,11 +1995,7 @@ always_ff @(posedge clk) begin
 			tset_b <= tw_da[9:4];
 			e_st   <= E_TW_DESCW;
 		end
-		E_TW_DESCW: begin
-			tw_hhq <= tw_hw_h;
-			tw_hwq <= tw_hw_w;
-			e_st   <= E_TW_DLK;
-		end
+		E_TW_DESCW: e_st <= E_TW_DLK;   // (the tags of the set valid: the compare registers)
 		E_TW_DLK: begin
 			if (tw_hhq && dc_en) begin
 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
@@ -2093,7 +2095,9 @@ always_ff @(posedge clk) begin
 			nd    = tw_d | 32'h8 | (setm ? 32'h10 : 32'h0);
 			// (back from the push: e_ret is this state, the caller in e_wret)
 			caller = (e_ret == E_TW_UPD) ? e_wret : e_ret;
-			h = tw_hw_h; w = tw_hw_w;         // (lv_ra: tw_da)
+			h = tw_hhq; w = tw_hwq;           // (registered the cycle before, lv_ra: tw_da)
+			if (!tw_hvq) ;                    // (a snoop had the set: the compare registers now)
+			else begin
 			e_wret <= caller;
 			if (h && ld_q[w]) begin
 				// a dirty copy: pushed (E_PUSHV invalidates it), then back here
@@ -2129,6 +2133,7 @@ always_ff @(posedge clk) begin
 					bo_wd   <= nd;
 					e_ret   <= E_TW_UPD_W;
 				end
+			end
 			end
 		end
 		E_TW_LKW: begin
@@ -2427,7 +2432,7 @@ always_comb
 	        (e_st == E_S_XL2 || e_st == E_S_ACT ||
 	         e_st == E_W_PART)                         ? e_va[9:4] :
 	        (e_st == E_M_SCANW || e_st == E_M_SCAN2)   ? sc_set :
-	        (e_st == E_TW_DLK || e_st == E_TW_UPD)     ? tw_da[9:4] : f_set;
+	        tw_busy                                    ? tw_da[9:4] : f_set;
 initial for (int i = 0; i < 64; i++) begin
 	lsd[i] = 8'd0; lse[i] = 8'd0; lsw[i] = 8'd0;
 end
