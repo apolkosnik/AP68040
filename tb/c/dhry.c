@@ -9,7 +9,9 @@
  * DMIPS = (NUMBER_OF_RUNS / seconds) / 1757, seconds = cycles / f.
  */
 
+#ifndef NUMBER_OF_RUNS
 #define NUMBER_OF_RUNS 2000
+#endif
 
 typedef enum { Ident_1, Ident_2, Ident_3, Ident_4, Ident_5 } Enumeration;
 typedef int One_Thirty;

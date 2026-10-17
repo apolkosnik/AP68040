@@ -762,6 +762,7 @@ logic  [7:0] bf_lo_out;
 logic        ex_pb;
 logic [31:0] bf_ins_q, bf_rot, bf_rot_q;
 logic  [5:0] rox_nx, rox_nx_q;  // ROXL/ROXR: their count mod (size + 1), the same way
+logic  [6:0] rox_nxl, rox_nxl_q; // ROXL: its funnel amount, the same way (from the registered count)
 wire         ex_pre = (ex_u.op == OP_BF) || (ex_u.op == OP_ROXL) || (ex_u.op == OP_ROXR);
 wire         ex_bfins = (ex_u.op == OP_BF) && (ex_u.cond[2:0] == 3'd7);
 logic  [4:0] bf_flags;
@@ -922,7 +923,7 @@ logic  [4:0] sl_flags;
 logic        sl_sim_c;
 ap68040_alu_slow alu_s (
 	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
-	.nx_q(rox_nx_q), .nx(rox_nx),
+	.nx_q(rox_nx_q), .nx(rox_nx), .nxl_q(rox_nxl_q), .nxl(rox_nxl),
 	.res(sl_res), .flags_out(sl_flags), .sim_c(sl_sim_c)
 );
 // synthesis translate_off
@@ -1733,6 +1734,7 @@ always_ff @(posedge clk) begin
 			bf_ins_q <= ex_av << bf_wn;
 			bf_rot_q <= bf_rot;
 			rox_nx_q <= rox_nx;
+			rox_nxl_q <= rox_nxl;
 		end
 		else if (ex_v && ex_slow && !ex_ph) begin
 			ex_ph <= 1'b1;

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dhrystone 2.1 (c/dhry.c) and Whetstone (c/whet.c) on the core, built by
 # build_c.sh with the Amiga-like start-up (crt0.s -DCOPYBACK: user mode,
-# copyback data, all 68060 caches, the store buffer and the branch cache
+# copyback data, both caches
 # on).  Each runs at two counts; two stamps bracket the timed loop, and the
 # difference of the two counts gives the steady-state cost without start-up
 # or cold caches.  Whetstone's reference results come from the same source

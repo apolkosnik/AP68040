@@ -399,6 +399,7 @@ reg [127:0] mul_pd;           // registered DSP full product (F_MULT)
 reg   [3:0] op_kind;          // 0 none, 1 add, 2 mul, 3 div, 4 sqrt
 reg   [4:0] sh_ret;           // staged shifter return state
 reg   [1:0] r_pr;             // rounding precision latched for F_UNFL
+reg         mv_st;            // a move's F_ROUND starts: record its exception shadow
 reg signed [17:0] e_w;        // working exponent (wrap safe)
 
 // These states already run in separate cycles. Select their input before
@@ -651,10 +652,14 @@ wire        shr_fsm = (fst == F_SHR);
 wire [66:0] shr_out = shr_sticky(shr_fsm ? sh_v : {p2_sm, 3'd0}, shr_fsm ? sh_cnt : p2_sh);
 // one incrementer for the roundings of the shifted value (sh_v[66:3]):
 // the integer store's at bit 0, a denormal single's or double's store
-// (F_PACKS) at its last kept bit -- in states of their own
+// (F_PACKS) and the underflow rounding (F_UNFL) at the precision's last
+// kept bit -- in states of their own.  (The bits below that position ride
+// along: the increment carries into the kept bits as it would from the
+// masked value, so a caller masks them off the sum.)
 wire [64:0] shk    = {1'b0, sh_v[66:3]};
-wire [64:0] shk_i  = shk + ((fst != F_PACKS) ? 65'd1 :
-                            (r_fmt == 3'd1) ? 65'h100_0000_0000 : 65'h800);
+wire [64:0] shk_i  = shk + ((fst == F_PACKS) ? ((r_fmt == 3'd1) ? 65'h100_0000_0000 : 65'h800) :
+                            (fst == F_UNFL)  ? ((r_pr == 2'd1) ? 65'h100_0000_0000 :
+                                                (r_pr == 2'd2) ? 65'h800 : 65'd1) : 65'd1);
 
 // one 64x64 multiplier for both: the state machine multiplies only in
 // F_MULT, which it reaches with the pipeline empty
@@ -1372,7 +1377,7 @@ always @(posedge clk) begin
 		b_s <= 0; b_e <= 0; b_m <= 0; b_t <= 0;
 		grs <= 0; eff_sub <= 0; acc_hi <= 0; acc_lo <= 0;
 		qv <= 0; srem <= 0; srad <= 0; loop_n <= 0; op_kind <= 0;
-		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0;
+		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0; mv_st <= 0;
 		nsel <= 2'd0;
 		// Invalid entries read as the default positive nonsignaling NaN.
 		fr_valid <= 0;
@@ -1483,6 +1488,7 @@ always @(posedge clk) begin
 		end
 		if (fp_reset) begin
 			fpcr <= 0; fpsr <= 0; fpiar <= 0;
+			mv_st <= 0;
 			fpu_used <= 0;
 			fstate_unimp <= 0;
 			fstate_e1 <= 0;
@@ -1711,11 +1717,10 @@ always @(posedge clk) begin
 					end
 					else if ((opmode == 7'h00 || opmode == 7'h40 || opmode == 7'h44) &&
 					         ua[1:0] != T_NAN) begin
-						// a move: F_EXEC's work for it, here (its exception
-						// shadow, GRS, the working exponent), then F_ROUND
-						sh_cmd  <= {3'b010, src_fmt, dst_r, opmode};
-						sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
-						sh_stag <= r_stag;
+						// a move: F_EXEC's work for it, here (GRS, the
+						// working exponent; F_ROUND records the exception
+						// shadow as it starts: mv_st), then F_ROUND
+						mv_st <= 1'b1;
 						grs <= 3'd0;
 						e_w <= $signed({ua[82], ua[82:66]});
 						begin fst <= F_ROUND; acc_r <= 1'b1; end
@@ -2020,13 +2025,9 @@ always @(posedge clk) begin
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
 									// a move: F_EXEC's work for it, here
-									// (as for a register source)
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {r_din[95], {7'd0, r_din[94:87]} + 15'd16256, 16'd0,
-										            1'b1, r_din[86:64], 40'd0};
-										sh_stag <= 3'd0;
-									end
+									// (as for a register source; the shadow
+									// as F_ROUND starts)
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
 									begin fst <= F_ROUND; acc_r <= 1'b1; end
@@ -2087,12 +2088,7 @@ always @(posedge clk) begin
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
 									// a move: F_EXEC's work for it, here
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {r_din[95], {4'd0, r_din[94:84]} + 15'd15360, 16'd0,
-										            1'b1, r_din[83:32], 11'd0};
-										sh_stag <= 3'd0;
-									end
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
 									begin fst <= F_ROUND; acc_r <= 1'b1; end
@@ -2144,11 +2140,7 @@ always @(posedge clk) begin
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) &&
 								         ua[1:0] != T_NAN) begin
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
-										sh_stag <= tg;
-									end
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({ua[82], ua[82:66]});
 									begin fst <= F_ROUND; acc_r <= 1'b1; end
@@ -2692,6 +2684,15 @@ always @(posedge clk) begin
 				reg [1:0]  pr;
 				reg signed [17:0] er, emin, emax;
 				pr = prec_of(r_op);
+				// a move started here (mv_st): its exception shadow, the
+				// one form from the working registers (as F_BIN and F_EXEC
+				// record theirs), for every source format
+				if (mv_st) begin
+					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
+					sh_stag <= r_stag;
+					mv_st   <= 1'b0;
+				end
 				if (a_t != T_NUM) begin fst <= F_WB; acc_r <= 1'b0; end
 				else begin
 					case (pr)
@@ -3021,30 +3022,31 @@ always @(posedge clk) begin
 				// exponent, which the shift in F_SHR has already scaled the
 				// significand to.
 				reg [64:0] mr, mk, mi;
+				reg [63:0] rmask;
 				reg        up, inx2;
 				if (r_pr == 2'd0) begin
 					up = round_up(sh_v[3], sh_v[2],
 					              (sh_v[1:0] != 0), a_s);
 					inx2 = (sh_v[2:0] != 0);
-					mk = {1'b0, sh_v[66:3]};
-					mi = mk + 65'd1;
+					rmask = 64'hFFFF_FFFF_FFFF_FFFF;
 				end
 				else if (r_pr == 2'd1) begin
 					up = round_up(sh_v[43], sh_v[42],
 					              (sh_v[41:0] != 0), a_s);
 					inx2 = (sh_v[42:0] != 0);
-					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FF00_0000_0000};
-					mi = mk + 65'h100_0000_0000;
+					rmask = 64'hFFFF_FF00_0000_0000;
 				end
 				else begin
 					up = round_up(sh_v[14], sh_v[13],
 					              (sh_v[12:0] != 0), a_s);
 					inx2 = (sh_v[13:0] != 0);
-					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FFFF_FFFF_F800};
-					mi = mk + 65'h800;
+					rmask = 64'hFFFF_FFFF_FFFF_F800;
 				end
-				// the increment is formed beside the rounding decision,
-				// which only selects it (a timing path)
+				// the increment (the shared incrementer, shk_i) is formed
+				// beside the rounding decision, which only selects it (a
+				// timing path)
+				mk = {1'b0, sh_v[66:3] & rmask};
+				mi = {shk_i[64], shk_i[63:0] & rmask};
 				mr = up ? mi : mk;
 				if (inx2) begin
 					fpsr[9] <= 1;                   // INEX2

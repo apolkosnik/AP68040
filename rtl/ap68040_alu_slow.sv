@@ -18,6 +18,8 @@ module ap68040_alu_slow
 	input  logic  [5:0] cnt,        // shift count: a[5:0], without a's mux
 	input  logic  [5:0] nx_q,       // ROXL/ROXR: the count mod (size + 1), registered
 	output logic  [5:0] nx,         // ... formed here from cnt (for that register)
+	input  logic  [6:0] nxl_q,      // ROXL: the funnel's amount, size + 1 - nx, registered
+	output logic  [6:0] nxl,        // ... formed here from nx (for that register)
 	input  logic  [4:0] flags_in,   // X N Z V C
 	output logic [31:0] res,
 	output logic  [4:0] flags_out,
@@ -124,6 +126,9 @@ always_comb begin
 		default: if (sh_nx >= 6'd33) sh_nx = sh_nx - 6'd33;
 	endcase
 	nx    = sh_nx;
+	// ROXL's funnel amount, size + 1 - the count, formed with the count
+	// (its subtraction in the pre-cycle too, off the funnel's path)
+	nxl   = (sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx});
 	sh_nx = nx_q;
 	// the right funnel's input and count.  A rotate's input repeats its
 	// period P from bit 0 ({P, P}): shifted right by k (< the period), its
@@ -144,7 +149,10 @@ always_comb begin
 				SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
 				default: rv = {2'd0, bm, bm};
 			endcase
-			ra = (op == OP_ROR) ? {1'b0, sh_nm} : {1'b0, (nbits - sh_nm) & (nbits - 6'd1)};
+			// ROL by k: the doubled operand shifted right by size - 1 - k
+			// (the count's complement within the size: no subtraction) and
+			// taken one bit up (ro[32:1], as a right shift's result)
+			ra = (op == OP_ROR) ? {1'b0, sh_nm} : {1'b0, ~sh_nm & (nbits - 6'd1)};
 		end
 		OP_ROXL, OP_ROXR: begin
 			case (sz)
@@ -152,8 +160,7 @@ always_comb begin
 				SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
 				default: rv = {f_x, bm, f_x, bm};
 			endcase
-			ra = (op == OP_ROXR) ? {1'b0, sh_nx}
-			                     : ((sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx}));
+			ra = (op == OP_ROXR) ? {1'b0, sh_nx} : nxl_q;
 		end
 		OP_ASL, OP_LSL: begin
 			// a left shift through the same funnel: the operand above 31
@@ -187,8 +194,8 @@ always_comb begin
 				if (op == OP_ASL)
 					sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
 			end
-			OP_LSR, OP_ASR: sh_r = ro[32:1] & szmask;
-			default:        sh_r = ro[31:0] & szmask;   // rotates
+			OP_LSR, OP_ASR, OP_ROL: sh_r = ro[32:1] & szmask;
+			default:        sh_r = ro[31:0] & szmask;   // ROR, ROXL, ROXR
 		endcase
 	end
 	// The carry (the last bit moved out) and X come from the operand bit
@@ -229,7 +236,7 @@ always_comb begin
 		case (op)
 			OP_ASL, OP_LSL: sim_c = (sh_n <= nbits) && (sh_n[5] ? bm[0] : lo[nbits]);
 			OP_LSR, OP_ASR: sim_c = ro[0];
-			OP_ROL:         sim_c = ro[0];
+			OP_ROL:         sim_c = ro[1];
 			OP_ROR:         sim_c = ro[nbits - 6'd1];
 			default:        sim_c = ro[nbits];   // ROXL, ROXR
 		endcase
