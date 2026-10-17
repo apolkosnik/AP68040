@@ -31,6 +31,12 @@
 //               $F15A (read) counts those resets                          //
 //   $F168 word  reset the processor this many clocks later (RSTI for 12  //
 //               clocks), counted in $F15A with the halt resets           //
+//   $F15E word  arm a one-shot TEA on the next data read of the long word  //
+//               at the written address (low 16 bits)                       //
+//   $F16A word  answer every instruction fetch of this line with TCI (0:  //
+//               off)                                                       //
+//   $F16C word  nonzero: after each fetch beat of that line's long word at //
+//               +4, rewrite its upper word to MOVEQ #n,D0 (n counts them)  //
 //   $F16E word  IPL skew: bits 2:0 the IPL bits that change one clock    //
 //               after the others (from now on), bits 6:4 a level raised   //
 //               after bits 15:8 clocks (t_iplglitch); +iplskew=<mask>     //
@@ -191,6 +197,10 @@ logic [31:0] ev_addr, ev_data;
 logic  [3:0] ev_be;
 logic  [1:0] ev_siz, ev_tt;
 logic  [2:0] ev_tm;
+logic        itci_on;
+logic [15:0] itci_a;
+wire         itci_req = itci_on && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
+                        xfer_addr[15:4] == itci_a[15:4];
 
 m68040_bus_slave #(.AW(20)) mem (
 	.clk(clk), .nreset(rsti_n), .bclk_en(bclk_en),
@@ -198,7 +208,7 @@ m68040_bus_slave #(.AW(20)) mem (
 	.d_mem(d_mem), .ta_n(slv_ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(1'b0), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
+	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
 	.iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
@@ -618,8 +628,43 @@ always_comb begin
 			tea_req = 1'b1;
 		if (wberr_arm && (xfer_tm == 3'd3 || xfer_tm == 3'd4))
 			tea_req = 1'b1;
+		if (dtea_arm && xfer_rd && xfer_tt == 2'd0 && (xfer_tm == 3'd1 || xfer_tm == 3'd5) &&
+		    xfer_addr[15:2] == dtea_a[15:2])
+			tea_req = 1'b1;
 	end
 end
+// $F16A: every instruction fetch of the line at the written address is
+// answered with TCI (0 turns it off); $F16C nonzero: after each fetch beat
+// of that line's long word at +4, the bench rewrites it -- its upper word
+// becomes MOVEQ #n,D0 with n counting the rewrites (the lower word is kept)
+logic        itci_mod;
+logic  [7:0] itci_n;
+always_ff @(posedge clk)
+	if (!rsti_n) begin itci_on <= 1'b0; itci_a <= '0; itci_mod <= 1'b0; itci_n <= '0; end
+	else begin
+		if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && ev_addr[15:0] == 16'hF16A) begin
+			itci_a  <= ev_word(ev_addr, ev_data);
+			itci_on <= ev_word(ev_addr, ev_data) != 16'd0;
+		end
+		if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && ev_addr[15:0] == 16'hF16C)
+			itci_mod <= ev_word(ev_addr, ev_data) != 16'd0;
+		if (itci_on && itci_mod && ev && ev_rd && !ev_err && (ev_tm == 3'd2 || ev_tm == 3'd6) &&
+		    ev_addr[15:4] == itci_a[15:4] && ev_addr[3:2] == 2'd1) begin
+			itci_n <= itci_n + 8'd1;
+			mem.mem[{itci_a[15:4], 2'd1}] <= {8'h70, itci_n + 8'd1, mem.mem[{itci_a[15:4], 2'd1}][15:0]};
+		end
+	end
+// $F15E: a one-shot TEA on the next data read of the long word at the
+// written address (spent by it)
+logic        dtea_arm;
+logic [15:0] dtea_a;
+always_ff @(posedge clk)
+	if (!rsti_n) begin dtea_arm <= 1'b0; dtea_a <= '0; end
+	else if (ev && !ev_rd && !ev_err && ev_tt == 2'd0 && ev_addr[15:0] == 16'hF15E) begin
+		dtea_arm <= 1'b1;
+		dtea_a   <= ev_word(ev_addr, ev_data);
+	end
+	else if (ev && ev_rd && ev_err && ev_addr[15:2] == dtea_a[15:2]) dtea_arm <= 1'b0;
 
 always_ff @(posedge clk) begin
 	cycles <= cycles + 1;
