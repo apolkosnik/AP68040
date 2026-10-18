@@ -2059,8 +2059,21 @@ always_ff @(posedge clk) begin
 
 		// front-valid bits: a front write makes the register's front copy
 		// current; a redirect, a refetch or an exception drops them all
-		for (int i = 0; i < 3; i++) if (fwe[i]) fv[fwa[i]] <= 1'b1;
+		// (AG's two writes as a mask formed without the advance, which
+		// gates the mask last: the stall chain stays off the decode)
+		begin
+			logic [31:0] m_ag, m_ex;
+			m_ag = (fwe_ag[0] ? (32'd1 << fwa[0]) : 32'd0) | (fwe_ag[1] ? (32'd1 << fwa[1]) : 32'd0);
+			m_ex = fwe[2] ? (32'd1 << fwa[2]) : 32'd0;
+			fv <= fv | (adv_ag ? m_ag : 32'd0) | m_ex;
+		end
 		if ((wb_commit && wb_redir) || wb_refetch || x_go) fv <= 32'd0;
+		// synthesis translate_off
+		if (fwe[0] != (adv_ag && fwe_ag[0]) || fwe[1] != (adv_ag && fwe_ag[1])) begin
+			$display("FAIL: the front writes %b, the advance %b and AG's %b", fwe, adv_ag, fwe_ag);
+			$finish;
+		end
+		// synthesis translate_on
 
 		// a store that took a bus error at WB becomes an access fault of
 		// its instruction (WB holds one cycle, then takes it)

@@ -1200,7 +1200,8 @@ always_ff @(posedge clk) begin
 		// the walk's line compare, registered (see tw_hhq)
 		tw_hhq <= tw_hw_h;
 		tw_hwq <= tw_hw_w;
-		tw_hvq <= tw_busy && !sn_frz;
+		tw_hvq <= tw_busy && !sn_frz && (f_set == tw_da[9:4]);
+		if (tw_busy) f_set <= tw_da[9:4];   // (lv_ra: the walk's set)
 
 		//--------------------------------------------------------------
 		// engine (frozen while the snooper has the cache)
@@ -2465,8 +2466,9 @@ always_comb
 	        (e_st == E_SP_2)                           ? m2.r.a[9:4] + 6'd1 :
 	        (e_st == E_S_XL2 || e_st == E_S_ACT ||
 	         e_st == E_W_PART)                         ? e_va[9:4] :
-	        (e_st == E_M_SCANW || e_st == E_M_SCAN2)   ? sc_set :
-	        tw_busy                                    ? tw_da[9:4] : f_set;
+	        (e_st == E_M_SCANW || e_st == E_M_SCAN2)   ? sc_set : f_set;
+	// (a walk's set through f_set, which follows tw_da a cycle late while
+	// the walk runs: the walk's decode stays off this read address)
 initial for (int i = 0; i < 64; i++) begin
 	lsd[i] = 8'd0; lse[i] = 8'd0; lsw[i] = 8'd0;
 end
