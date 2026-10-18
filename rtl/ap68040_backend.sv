@@ -1574,9 +1574,12 @@ endfunction
 always_ff @(posedge clk) begin
 	// (AG's uop PC and the continued MOVEM's PC as they will be: their
 	// compare is registered, cm_hit_q)
-	logic [31:0] agpc_n, cmpc_n;
-	agpc_n = ag_u.pc;
-	cmpc_n = cm_pc;
+	// (each candidate pair compared in parallel; AG's late take and WB's
+	// write of cm_pc select last)
+	logic ag_ld, cm_wr, cm_rst;
+	ag_ld  = 1'b0;
+	cm_wr  = 1'b0;
+	cm_rst = 1'b0;
 	redir_v <= 1'b0;
 	ras_rv  <= 1'b0;
 	exc_go  <= 1'b0;
@@ -1615,7 +1618,7 @@ always_ff @(posedge clk) begin
 		cm_pend  <= 1'b0;
 		cm_ea    <= 32'd0;
 		cm_pc    <= 32'd0;
-		cmpc_n   = 32'd0;
+		cm_rst   = 1'b1;
 		wb_mv_ea <= 32'd0;
 		trace_defer <= 1'b0;
 		trace_addr <= 32'd0;
@@ -1807,12 +1810,16 @@ always_ff @(posedge clk) begin
 			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we ||
 			               (ex_u.last && (smc_pend || ex_smc));
 			wb_eredir   <= ex_early;
+			// (the return stack to restore is read only with ras_rv, which
+			// pulses with a redirect: it is loaded every advance, so the
+			// late early-redirect decision is not its enable; WB's later
+			// loads take precedence)
+			{ras_rtp, ras_rn} <= ras_after(ex_u.ras);
 			if (ex_early) begin
 				fe_flush    <= 1'b1;
 				redir_v     <= 1'b1;
 				redir_pc    <= ex_next;
 				ras_rv      <= ex_u.ras.v;
-				{ras_rtp, ras_rn} <= ras_after(ex_u.ras);
 				eredir_pend <= 1'b1;
 			end
 			if (ex_u.last) smc_pend <= 1'b0;
@@ -1988,7 +1995,7 @@ always_ff @(posedge clk) begin
 				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
 				cm_ea   <= cm_n_ea;
 				cm_pc   <= wb_next;
-				cmpc_n  = wb_next;
+				cm_wr   = 1'b1;
 				if (wb_u.op == OP_RTE) cm_n_v <= 1'b0;
 			end
 		end
@@ -2124,7 +2131,7 @@ always_ff @(posedge clk) begin
 			if (!stall_ag) ag_v <= ain_v && !stopped && !halted;
 			if (ag_take && ain_v) begin
 				ag_u      <= ain_u;
-				agpc_n    = ain_u.pc;
+				ag_ld     = 1'b1;
 				ag_u.disp <= ain_u.dmv ? ain_u.disp + {{24{ain_u.dma[7]}}, ain_u.dma} : ain_u.disp;
 			end
 			// the skid: emptied when AG takes it; filled by a popped uop AG
@@ -2143,7 +2150,9 @@ always_ff @(posedge clk) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
 		end
 	end
-	cm_hit_q <= (agpc_n == cmpc_n);
+	cm_hit_q <= cm_rst ? ((ag_ld ? ain_u.pc : ag_u.pc) == 32'd0) :
+	            ag_ld  ? (cm_wr ? (ain_u.pc == wb_next) : (ain_u.pc == cm_pc)) :
+	                     (cm_wr ? (ag_u.pc  == wb_next) : (ag_u.pc  == cm_pc));
 end
 // synthesis translate_off
 always_ff @(posedge clk)

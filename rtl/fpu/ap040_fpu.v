@@ -558,9 +558,9 @@ function [7:0] fp_exception_vector;
 	end
 endfunction
 
-// Operand shadow for the pending-exception frame: captured at
-// F_EXEC/F_BIN entry, where the classified source is in hand -- by the
-// time the exception is known (F_WB) the pipeline has consumed it.
+// Command shadow is captured at dispatch (or from the restored frame).
+// Operand shadow is captured at F_EXEC/F_BIN entry, where the classified
+// source is in hand -- F_WB has already consumed the working operand.
 reg [15:0] sh_cmd;
 reg [95:0] sh_src;
 reg  [2:0] sh_stag;
@@ -1335,9 +1335,6 @@ end
 
 assign cur_vec = fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
 
-// WinUAE's e3 predicate: OVFL/UNFL/INEX from the five arithmetic ops
-// take the 96-byte BUSY frame (Tier 2, not implemented); everything
-// else pends as the $30 e1 frame.
 // WinUAE fp_is_dyadic: the operations with a destination operand
 function dyadic;
 	input [6:0] op;
@@ -1346,10 +1343,15 @@ function dyadic;
 	end
 endfunction
 
+// MC68040UM table 9-16: OVFL/UNFL/INEX from the five arithmetic ops
+// take the BUSY/E3 frame; moves, absolute value and negate use E1.
 function arith5;
 	input [6:0] op;
 	begin
-		arith5 = ((op & 7'h30) == 7'h20) || ((op & 7'h3f) == 7'h04);
+		// Include forced-precision sqrt and its saved 04 -> 05 encoding.
+		// Masking with 3f would instead include FDMOVE (44).
+		arith5 = ((op & 7'h30) == 7'h20) || op == 7'h04 ||
+		         op == 7'h05 || op == 7'h41 || op == 7'h45;
 	end
 endfunction
 
@@ -1768,6 +1770,8 @@ always @(posedge clk) begin
 				r_ae7 <= fpsr[7];
 				r_dst <= dst_r;
 				r_op <= opmode;
+				// Preserve opclass and source register/format before execution.
+				sh_cmd <= {op_class, src_fmt, dst_r, opmode};
 				r_din <= din;
 				r_unimp <= 0;
 				r_resume <= 0;
@@ -1786,7 +1790,6 @@ always @(posedge clk) begin
 				if (op_class == 3'b011) begin
 					sh_dst  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
 					sh_dtag <= frame_tag_x(fr_src_e, fr_src_m);
-					sh_cmd  <= {op_class, src_fmt, dst_r, opmode};   // the store's command word
 				end
 				if (op_class == 3'b010 && src_fmt == 3'd7) begin
 					sh_src  <= 96'd0;
@@ -1805,6 +1808,7 @@ always @(posedge clk) begin
 				else begin
 					sh_src  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
 					sh_stag <= frame_tag_x(fr_src_e, fr_src_m);
+					r_stag  <= frame_tag_x(fr_src_e, fr_src_m);
 				end
 				if (op_class == 3'b011) begin
 					// FMOVE FPn,<ea>: packed decimal and denormal/unnormal
@@ -2285,13 +2289,12 @@ always @(posedge clk) begin
 			F_EXEC: begin
 				// operand shadow for a possible deferred-exception frame
 				if (!r_resume) begin
-					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
 					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
 					sh_stag <= r_stag;
 				end
 				if (r_unimp) begin
 					// (sh_src/sh_stag written above, this cycle)
-					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_cmd <= sh_cmd;
 					cap_unimp <= 1; cap_pk <= 0;
 					r_unimp <= 0;
 					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
@@ -2303,7 +2306,7 @@ always @(posedge clk) begin
 				// status byte stays clean.
 				else if (!r_resume && r_op == 7'h38 &&
 				    unsupported_x(b_e[14:0], b_m)) begin
-					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_cmd <= sh_cmd;
 					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
 					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
@@ -2351,8 +2354,9 @@ always @(posedge clk) begin
 
 			F_BIN: begin : f_bin
 				reg        s_a;
-				if (!r_resume) begin
-					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+				// NaNs went through F_EXEC, which saved the source before
+				// quieting it. Keep that image for SNAN and datatype recovery.
+				if (!r_resume && a_t != T_NAN) begin
 					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
 					sh_stag <= r_stag;
 				end
@@ -2368,8 +2372,7 @@ always @(posedge clk) begin
 					// dispatch; r_ae7 holds the prior accrued-IOP bit)
 					fpsr[14] <= 0;
 					fpsr[7]  <= r_ae7;
-					// (sh_src/sh_stag written above, this cycle)
-					cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+					cap_cmd <= sh_cmd;
 					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
 					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
@@ -2745,7 +2748,6 @@ always @(posedge clk) begin
 				// one form from the working registers (as F_BIN and F_EXEC
 				// record theirs), for every source format
 				if (mv_st) begin
-					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
 					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
 					sh_stag <= r_stag;
 					mv_st   <= 1'b0;
