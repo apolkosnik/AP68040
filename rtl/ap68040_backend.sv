@@ -426,7 +426,8 @@ wire        ag_dyncan = (ag_u.dyn == 3'd1 && !fp_mvslots[ag_u.dynk[2:0]]) ||
 wire        ag_cancel = (ag_bft && !(bf_nb == 3'd3 || bf_nb == 3'd5)) ||
                         (ag_rte7 && !rte_fmt7) || ag_dyncan;
 // a continued MOVEM transfers from the stacked EA
-wire        ag_cm     = cm_pend && (ag_u.pc == cm_pc) && (ag_u.mem != M_NONE) &&
+logic       cm_hit_q;          // ag_u.pc == cm_pc, registered
+wire        ag_cm     = cm_pend && cm_hit_q && (ag_u.mem != M_NONE) &&
                         (ag_u.op == OP_MOV) && (ag_u.cond == 4'hC);
 wire  [1:0] ag_msz    = ag_bfh ? ((bf_nb == 3'd1) ? SZ_B : (bf_nb <= 3'd3) ? SZ_W : SZ_L)
                                : ag_u.msz;
@@ -1571,6 +1572,11 @@ function automatic logic [6:0] ras_after(input ras_snap_t r);
 endfunction
 
 always_ff @(posedge clk) begin
+	// (AG's uop PC and the continued MOVEM's PC as they will be: their
+	// compare is registered, cm_hit_q)
+	logic [31:0] agpc_n, cmpc_n;
+	agpc_n = ag_u.pc;
+	cmpc_n = cm_pc;
 	redir_v <= 1'b0;
 	ras_rv  <= 1'b0;
 	exc_go  <= 1'b0;
@@ -1609,6 +1615,7 @@ always_ff @(posedge clk) begin
 		cm_pend  <= 1'b0;
 		cm_ea    <= 32'd0;
 		cm_pc    <= 32'd0;
+		cmpc_n   = 32'd0;
 		wb_mv_ea <= 32'd0;
 		trace_defer <= 1'b0;
 		trace_addr <= 32'd0;
@@ -1981,6 +1988,7 @@ always_ff @(posedge clk) begin
 				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
 				cm_ea   <= cm_n_ea;
 				cm_pc   <= wb_next;
+				cmpc_n  = wb_next;
 				if (wb_u.op == OP_RTE) cm_n_v <= 1'b0;
 			end
 		end
@@ -2116,6 +2124,7 @@ always_ff @(posedge clk) begin
 			if (!stall_ag) ag_v <= ain_v && !stopped && !halted;
 			if (ag_take && ain_v) begin
 				ag_u      <= ain_u;
+				agpc_n    = ain_u.pc;
 				ag_u.disp <= ain_u.dmv ? ain_u.disp + {{24{ain_u.dma[7]}}, ain_u.dma} : ain_u.disp;
 			end
 			// the skid: emptied when AG takes it; filled by a popped uop AG
@@ -2134,7 +2143,15 @@ always_ff @(posedge clk) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
 		end
 	end
+	cm_hit_q <= (agpc_n == cmpc_n);
 end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && cm_hit_q != (ag_u.pc == cm_pc)) begin
+		$display("FAIL: the registered MOVEM continuation compare %b, the PCs' %b", cm_hit_q, ag_u.pc == cm_pc);
+		$finish;
+	end
+// synthesis translate_on
 
 assign dm_st_v    = wb_v && wb_stv;
 // synthesis translate_off

@@ -286,6 +286,12 @@ logic        pend;             // its enabled exception, for the next FPU instru
 logic  [7:0] pend_vec;
 logic        go;               // DISP: the request is out
 logic        done_q;           // DISP (store): the outcome is known
+// the operation in EX ended with an enabled arithmetic exception (the
+// FPU's one-cycle exc_req): it is pending for the next FPU instruction,
+// as a released operation's is (MC68040UM 9.7: arithmetic exceptions are
+// taken pre-instruction at the next FPU instruction; WinUAE fp_exp_pend),
+// and the instruction completes
+logic        fx_q;
 logic [31:0] eaa;              // the operand address
 logic        eav;
 logic        sx_v;             // a store's exception, raised by END
@@ -565,7 +571,7 @@ always_comb begin
 						xvec = VEC_UNSUP; xfmt = 4'd3; xnext = 1'b1;
 						xaddr = 32'd0; xcommit = 1'b1;
 					end
-					else if (f_excreq) begin xvec = f_excvec; xnext = 1'b1; end
+					else if (f_excreq || fx_q) ;   // pending: the instruction completes
 					else if (!(f_accepted || f_done || f_pdone)) hold = 1'b1;
 				end
 				else if (bg && !f_end) hold = 1'b1;
@@ -604,9 +610,7 @@ always_comb begin
 					xvec = VEC_UNSUP; xfmt = 4'd3; xnext = 1'b1;
 					xaddr = eav ? eaa : 32'd0; xcommit = 1'b1;
 				end
-				else if (go && f_excreq) begin
-					xvec = f_excvec; xnext = 1'b1;
-				end
+				else if (go && (f_excreq || fx_q)) ;   // pending: the instruction completes
 				else if (!(go && (f_accepted || f_done || f_pdone))) hold = 1'b1;
 			end
 			FC_GET: res_g = (imm[1:0] == 2'd1) ? get_q[63:32] : get_q[31:0];
@@ -754,7 +758,7 @@ always_ff @(posedge clk) begin
 	if (!nreset) begin
 		opw_q <= '0; ext_q <= '0; fsr_q <= 1'b0; lst_q <= '0;
 		bg <= 1'b0; pend <= 1'b0; pend_vec <= '0; fresh <= 1'b0;
-		go <= 1'b0; done_q <= 1'b0; eaa <= '0; eav <= 1'b0;
+		go <= 1'b0; done_q <= 1'b0; fx_q <= 1'b0; eaa <= '0; eav <= 1'b0;
 		sx_v <= 1'b0; sx_vec <= '0; sx_fmt <= '0; sx_addr <= '0; sx_kill <= 1'b0;
 		list <= '0; mv_slots <= '0; mv_lsb <= 1'b0; mv_rev <= 1'b0; mv_st <= 1'b0; mv_m1 <= 1'b0;
 		slot <= '0; mvr_wait <= 1'b0; crr_wait <= 1'b0; get_q <= '0;
@@ -783,6 +787,16 @@ always_ff @(posedge clk) begin
 			pend_vec  <= f_excvec;
 			f_pendcap <= 1'b1;
 		end
+		// the operation in EX (a fused CHK, or a DISP that is not a store):
+		// its enabled exception likewise pends, with the frame prepared
+		if (ex_v && go && !bg && f_excreq &&
+		    ((sub == FC_CHK && fuse) || (sub == FC_DISP && ocl != 3'b011))) begin
+			pend      <= 1'b1;
+			pend_vec  <= f_excvec;
+			f_pendcap <= 1'b1;
+			fx_q      <= 1'b1;
+		end
+		if (adv || kill) fx_q <= 1'b0;
 
 		f_srcr  <= n_srcr;
 		f_dstr  <= n_dstr;
@@ -867,6 +881,10 @@ always_ff @(posedge clk) begin
 					else if (f_done && f_excreq) begin
 						// an enabled SNAN/OPERR integer store writes nothing;
 						// otherwise the destination is written, then the trap
+						// (post-instruction, WinUAE fp_exception_pending(false));
+						// the FPU prepares the E1/T frame the handler's FSAVE
+						// takes (table 9-16, opclass 011)
+						f_pendcap <= 1'b1;
 						sx_v <= 1'b1; sx_vec <= f_excvec; sx_fmt <= 4'd3;
 						sx_addr <= ea_dn ? 32'd0 : eaa;
 						sx_kill <= (f_excvec == VEC_SNAN || f_excvec == VEC_OPERR) &&

@@ -5,17 +5,17 @@
 | | milestone | state |
 |---|---|---|
 | M0 | the AP68060 tree converted back to the 68040 (631f440): MSP/ISP, format $7 frames with the restart model, MOVEM continuation, T0/T1 trace, the 040 MOVEC set, CACR/TC, PTEST/MMUSR, nonresident ATC entries, table walks through the data cache, 4 KB caches, the 040 snooper, BIU and bus protocol, 128-clock reset, IPL sampling, PST codes, FPU revision $41 frames; the 060 round's pipeline work kept | done |
-| M1 | regression: 29 programs x 5 bus configurations, the exhaustive decode bench | done |
+| M1 | regression: 30 programs x 5 bus configurations, the exhaustive decode bench | done |
 | M2 | cputest corpus replay (tb/tb_cputest.sv): the sampled corpus | done: 3,778 of 3,801 slices, the rest the known generator defects |
-| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done: +0.37 / +0.57 / +0.36 ns at the 100C slow corner (the timing section) |
-| M4 | area: under 20,000 ALMs with every feature | done: 19,516 - 19,568 ALMs on three seeds (21,436 at the conversion); with the Minimig project's fitter settings about 20,100 (the area section) |
+| M3 | 60 MHz on 5CSEBA6U23I7, out of context (Quartus 17.0, HIGH PERFORMANCE, hold optimized on all paths), judged on three seeds | done: +0.52 / +0.21 / +0.33 ns at the 100C slow corner (the timing section) |
+| M4 | area: under 20,000 ALMs with every feature | done: 19,637 - 19,693 ALMs on three seeds (21,436 at the conversion); with the Minimig project's fitter settings about 20,100 (the area section) |
 | M5 | the AP68060's tests under the 68040's rules: level 7 interrupts, IPL skew, an interrupt among snoop invalidations, nested exceptions and double faults, RESET and the halted bus, the cache cases (t_irq7, t_iplglitch, t_snirq, t_xnest, t_halt, t_cache2) | done |
 | M6 | performance | Dhrystone 2.1: 964 cycles/iteration, 35.4 DMIPS at 60 MHz (0.590 DMIPS/MHz); Whetstone 469,922 cycles/loop, 12.77 MWIPS (948 cycles/iteration with DIV_STEPS 4) |
 
 ## Regression
 
 ```
-tb/run_tests.sh                 # the 29 programs, five bus configurations each, and the decode bench
+tb/run_tests.sh                 # the 30 programs, five bus configurations each, and the decode bench
 tb/build_cputest.sh             # the corpus replay bench
 tb/run_cputest.py ~/Downloads/data040.zip                    # smoke slices
 tb/run_cputest.py ~/Downloads/data040.zip --full --group BasicFPU --group intFPU --group PackedFPU --sample 300:24  # the FPU groups
@@ -36,7 +36,8 @@ retries, BCLK at half PCLK, and all of those together.
 Programs: smoke, t_integer, t_exceptions, t_mmu, t_cache, t_atcprobe,
 t_bitfield_cache, t_bitfield_mmu, t_movem_restart, t_moves_fc, t_fpu,
 t_fpu_frames, t_fpu_resume, t_snoop, t_btb, t_stld, t_pins, t_snstress,
-t_eredir, t_cbsplit, t_cmodes, t_loops, t_early, and from the AP68060
+t_eredir, t_cbsplit, t_cmodes, t_loops, t_early, t_fpexc (an FPU
+arithmetic exception's timing and FSAVE frame, table 9-16), and from the AP68060
 under the 68040's rules: t_irq7 (level 7 on its edge and by level
 comparison, 8.2.9), t_iplglitch (IPL pins settling at different clocks:
 a request counts after two consecutive bus-clock samples agree, 7.8),
@@ -91,6 +92,7 @@ nanosecond, so a change is judged on three):
 | 92ea705 | 20,761 - 20,822 | +0.37 / +0.22 / +0.65 | the table walk's line compare registered throughout the walk: the walk's update state off the hit update; the remaining worst paths are the TC register into the engine's hit decision, the fetch queue's word into D1's record, and the ATC's address into the engine's physical address |
 | area round | 19,443 - 19,519 | +0.33 / +0.05 / +0.16 | below |
 | MOVE16 fix | 19,481 - 19,525 | +0.53 / +0.09 / +0.44 | a MOVE16 from a cached source line copied the line of the way f_way named, not the hit way's (t_cache2 28-29); the engine sets f_way to the hit way before its line reads, and its operand extractor shares the line multiplexer |
+| FPU exception frames | 19,637 / 19,643 / 19,693 | +0.52 / +0.21 / +0.33 | an enabled arithmetic exception pends to the next FPU instruction whether it ended in EX or the background; a store's exception prepares its E1/T frame; E1 FPTEMP and E3 WBTEMP per WinUAE and table 9-16 (t_fpexc); AG's MOVEM-continuation PC compare registered |
 | underflow fix | 19,568 / 19,516 / 19,555 | +0.37 / +0.57 / +0.36 | the underflow denormalization shifts by the unrounded exponent and an enabled UNFL's WBTEMP keeps it (t_fpu 666-674); timing: the FPU's F_WB flag registered (wb_r), AG's front-valid mask gated by the advance last, the walk's set read through f_set |
 
 The area round (synthesis estimates, ALMs needed, each change against the
@@ -280,6 +282,19 @@ tb/build_decode.sh                   # the exhaustive decoder check
   (table 9-16; t_fpu 666-674: a carry of the precision's first rounding
   had doubled the result and raised the saved exponent);
   an FMOVE.X of a signaling NaN stores it as it is.
+* FPU exceptions (WinUAE fp_exp_pend, MC68040UM 9.7): an enabled
+  arithmetic exception (opclass 000/010) is pending and taken before the
+  next FPU instruction -- whether the operation ended in EX or in the
+  background -- with the FSAVE frame prepared; an enabled store exception
+  (opclass 011) is taken after the store (format $3) and its handler's
+  FSAVE gives the E1/T frame (CMDREG1B, the register in ETEMP and FPTEMP).
+  E1 frames carry table 9-16's FPTEMP: a dyadic operation's destination
+  for SNAN/OPERR/DZ, the unrounded extended intermediate for INEX/OVFL/
+  UNFL of FMOVE to a register, FABS and FNEG (WinUAE
+  getFloatInternalFloatx80).  An E3 frame's WBTEMP for OVFL/INEX keeps
+  the precision's kept bits rounded and the bits below them unrounded
+  (WinUAE getFloatInternalRoundedSome), for UNFL the unrounded
+  intermediate (t_fpexc).
 * Branch prediction is invisible to programs except for self-modified
   code: like the 68040 the core may fetch a branch target before an older
   store to it; CPUSHA must precede modified code (MC68040UM 4.5).  A store

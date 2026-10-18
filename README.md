@@ -17,8 +17,8 @@ its benches in `tb_old/`, as a reference.
 
 | | |
 |---|---|
-| clock | 60 MHz (16.667 ns), out of context on three fitter seeds (Quartus 17.0, HIGH PERFORMANCE EFFORT, hold optimized on all paths), +0.37 / +0.57 / +0.36 ns at the 100C slow corner on seeds 1-3 |
-| area | 19,516 - 19,568 ALMs on the three seeds (47 % of the 5CSEBA6; about 20,100 with the Minimig project's fitter settings), 12,500 registers, 132 M10Ks (the caches, the microcode, the decoder tables, the predecoder table), 15 DSPs -- with every feature of the core; the arithmetic pipeline, the loop predictor and the early results are parameters, off by default |
+| clock | 60 MHz (16.667 ns), out of context on three fitter seeds (Quartus 17.0, HIGH PERFORMANCE EFFORT, hold optimized on all paths), +0.52 / +0.21 / +0.33 ns at the 100C slow corner on seeds 1-3 |
+| area | 19,637 - 19,693 ALMs on the three seeds (47 % of the 5CSEBA6; about 20,100 with the Minimig project's fitter settings), 12,500 registers, 132 M10Ks (the caches, the microcode, the decoder tables, the predecoder table), 15 DSPs -- with every feature of the core; the arithmetic pipeline, the loop predictor and the early results are parameters, off by default |
 | Dhrystone 2.1 | 964 cycles/iteration, 35.4 DMIPS at 60 MHz, 0.590 DMIPS/MHz (user mode, copyback caches, in simulation) |
 | Whetstone | 469,922 cycles/loop, 12.77 MWIPS at 60 MHz |
 | cputest 68040 corpus | 3,778 of 3,801 slices (sampled); the rest are known WinUAE generator defects (doc/STATUS.md) |
@@ -94,7 +94,7 @@ The tools are Verilator 5, vasm/vbcc (`vasmm68k_mot`, `vbccm68k`) and, for
 the fits, Quartus 17.0.
 
 ```
-tb/run_tests.sh                 # 29 programs x 5 bus configurations, and the decode bench
+tb/run_tests.sh                 # 30 programs x 5 bus configurations, and the decode bench
 tb/build_cputest.sh             # the cputest replay bench
 tb/run_cputest.py data040.zip --full --sample 300:24 --jobs 12   # the corpus, sampled
 tb/run_bench.sh                 # Dhrystone and Whetstone (vbcc)

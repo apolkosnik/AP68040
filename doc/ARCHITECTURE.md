@@ -320,8 +320,9 @@ they become access errors.  A double bus fault halts the processor (7.6.3).
 The 68040's hardware subset (`rtl/fpu/ap040_fpu.v`, verified against the
 cputest corpus), behind `ap68040_fpif.sv`, which runs the FPU beside the
 integer pipeline: arithmetic continues in the background while integer
-instructions proceed, and exceptions are reported the 68040 way
-(pre-instruction at the next FPU instruction).  Divide and square root
+instructions proceed, and exceptions are reported the 68040 way: an
+arithmetic exception pre-instruction at the next FPU instruction, a
+store's after the store, each with the FSAVE frame table 9-16 gives.  Divide and square root
 take two bits per clock; the 64x64 multiply runs in DSP blocks.  The FPCR
 keeps all of bits 15:0 (WinUAE's 040 mask); an FMOVE.X of a signaling NaN
 stores it as it is; underflow is decided on the intermediate result before

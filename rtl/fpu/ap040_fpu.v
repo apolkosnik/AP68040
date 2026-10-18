@@ -1338,6 +1338,14 @@ assign cur_vec = fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
 // WinUAE's e3 predicate: OVFL/UNFL/INEX from the five arithmetic ops
 // take the 96-byte BUSY frame (Tier 2, not implemented); everything
 // else pends as the $30 e1 frame.
+// WinUAE fp_is_dyadic: the operations with a destination operand
+function dyadic;
+	input [6:0] op;
+	begin
+		dyadic = ((op & 7'h30) == 7'h20) || (op == 7'h38);
+	end
+endfunction
+
 function arith5;
 	input [6:0] op;
 	begin
@@ -1565,18 +1573,36 @@ always @(posedge clk) begin
 			// the $41/$60 BUSY frame.  Both arms set fstate_unimp, so a
 			// later FSAVE EXTRACTS the prepared frame instead of trapping.
 			reg [7:0] pv;
+			reg       st, sn;
 			pv = fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
-			if (pv == `AP040_VEC_FP_SNAN || pv == `AP040_VEC_FP_OPERR ||
-			    pv == `AP040_VEC_FP_DZ || !arith5(sh_cmd[6:0])) begin
+			// (table 9-16 and WinUAE's 68040 recipe: an opclass 011
+			// store's frame has T set, its source in ETEMP -- a SNAN
+			// quieted -- and in FPTEMP; SNAN/OPERR/DZ keep a dyadic
+			// operation's destination in FPTEMP; OVFL/UNFL/INEX of FMOVE
+			// to a register, FABS and FNEG the intermediate result)
+			st = (sh_cmd[15:13] == 3'b011);
+			sn = (pv == `AP040_VEC_FP_SNAN) || (pv == `AP040_VEC_FP_OPERR) ||
+			     (pv == `AP040_VEC_FP_DZ);
+			if (st || sn || !arith5(sh_cmd[6:0])) begin
 				fstate_cmd1  <= frame_cmd1(sh_cmd);
 				fstate_cmd3  <= frame_cmd3(frame_cmd1(sh_cmd));
 				fstate_stag  <= sh_stag;
-				fstate_dtag  <= 0;
-				fstate_flags <= 3'b100;   // E1
-				fstate_fpt   <= 0;
-				fstate_et    <= sh_src;
+				fstate_flags <= {1'b1, 1'b0, st};   // E1, T for a store
+				if (st) begin
+					fstate_fpt  <= sh_dst;              // the register stored
+					fstate_dtag <= sh_dtag;
+				end
+				else if (sn) begin
+					fstate_fpt  <= dyadic(sh_cmd[6:0]) ? sh_dst : 96'd0;
+					fstate_dtag <= dyadic(sh_cmd[6:0]) ? sh_dtag : 3'd0;
+				end
+				else begin
+					fstate_fpt  <= {wb_s, wb_e[14:0], 16'd0, wb_m};   // the intermediate
+					fstate_dtag <= 0;
+				end
+				fstate_et    <= (st && pv == `AP040_VEC_FP_SNAN) ? (sh_src | {33'd0, 1'b1, 62'd0}) : sh_src;
 				fstate_grs   <= (pv == `AP040_VEC_FP_SNAN) ? 3'd7 : 3'd1;
-				fstate_wbte15 <= (pv == `AP040_VEC_FP_SNAN);
+				fstate_wbte15 <= (pv == `AP040_VEC_FP_SNAN) || (st && pv == `AP040_VEC_FP_UNFL);
 				fstate_busy  <= 0;
 				fstate_e1    <= 1;
 				fstate_unimp <= 1;
@@ -1760,6 +1786,7 @@ always @(posedge clk) begin
 				if (op_class == 3'b011) begin
 					sh_dst  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
 					sh_dtag <= frame_tag_x(fr_src_e, fr_src_m);
+					sh_cmd  <= {op_class, src_fmt, dst_r, opmode};   // the store's command word
 				end
 				if (op_class == 3'b010 && src_fmt == 3'd7) begin
 					sh_src  <= 96'd0;
@@ -2783,9 +2810,19 @@ always @(posedge clk) begin
 					// the intermediate before rounding, its exponent with its
 					// significand (table 9-16): not the exponent a rounding
 					// carry raised
+					// -- for OVFL and INEX of the five arithmetic ops (the E3
+					// frame) WinUAE's getFloatInternalRoundedSome: the
+					// precision's kept bits rounded (the exponent with a
+					// rounding carry), the bits below them the unrounded
+					// significand's, one up when the rounding went up (table
+					// 9-16: INEX's intermediate before rounding).  For FMOVE
+					// to a register, FABS and FNEG it is the E1 frame's FPTEMP
+					// instead: the unrounded extended intermediate (WinUAE
+					// getFloatInternalFloatx80)
 					wb_s   <= a_s;
-					wb_e   <= unf ? e_w[16:0] : er[16:0];
-					wb_m   <= unf ? a_m : mr[63:0];
+					wb_e   <= (unf || !arith5(r_op)) ? e_w[16:0] : er[16:0];
+					wb_m   <= (unf || !arith5(r_op)) ? a_m :
+					          ((mr[63:0] & rd_mask) | ({24'd0, up ? (a_m[39:0] + 40'd1) : a_m[39:0]} & ~rd_mask));
 					wb_grs <= grs;
 					if (ovf) begin
 						fpsr[12] <= 1;              // OVFL
