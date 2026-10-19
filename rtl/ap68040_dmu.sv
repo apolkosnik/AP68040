@@ -642,6 +642,7 @@ wire sim_es_m  = (e_st == E_M_START);
 wire sim_es_tw = (e_st == E_TW_START);
 wire sim_es_i  = (e_st == E_IDLE);
 logic sim_xchk = 1'b0;        // (the bench fails the run on it)
+logic sim_kchk = 1'b0;        // a job completed for a discarded uop (E_S_DONE)
 always_ff @(posedge clk) begin
 	xres_t xo;
 	xo = xlate(m1.a, m1.smode, m1_wr, fc_tt(m1.fc) == TT_ALT, atc_hit, atc_e,
@@ -1223,8 +1224,19 @@ always_ff @(posedge clk) begin
 				e_st <= E_M_START;
 			else if (wb_slow)
 				e_st <= E_W_START;
-			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now)
-				e_st <= E_S_START;
+			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now) begin
+				// the job's kill mark is cleared HERE, where the uop is known
+				// alive (kill_now is excluded), not in E_S_START: a kill can
+				// land while the engine sits in E_S_START frozen by a snoop
+				// (the kill block below runs every clock, the case does not),
+				// and E_S_START's body, run after the freeze, would erase it
+				// -- the job then finished for a discarded uop, set
+				// e_dc2_done, and the next uop into DC2 was answered at once
+				// with the dead job's data (OPENSTEP: a name-cache pointer
+				// read as 0 under disk DMA, 2026-10-19)
+				e_kill <= 1'b0;
+				e_st   <= E_S_START;
+			end
 			else if (iw_req && !iw_done) begin
 				e_ret <= E_I_DONE;
 				e_st  <= E_TW_START;
@@ -1235,7 +1247,7 @@ always_ff @(posedge clk) begin
 		// DC2 slow path
 		//==============================================================
 		E_S_START: begin
-			e_kill <= 1'b0;
+			// (e_kill: cleared when the job was scheduled, see E_IDLE)
 			e_job  <= 1'b1;
 			e_part <= 1'b0;
 			e_va   <= m2.r.a;
@@ -1545,6 +1557,14 @@ always_ff @(posedge clk) begin
 		E_S_DONE: begin
 			e_job      <= 1'b0;
 			e_dc2_done <= !e_kill;
+			// synthesis translate_off
+			// a job may only complete for a uop still in DC2: a discarded
+			// one carries e_kill (the bench fails the run on this)
+			if (!e_kill && !m2.r.v) begin
+				$display("FAIL: DMU: the slow-path job completed for a discarded DC2 uop without its kill mark (e_va=%08x)", e_va);
+				sim_kchk <= 1'b1;
+			end
+			// synthesis translate_on
 			e_ldata    <= e_acc;
 			steal      <= 1'b0;
 			e_st       <= E_IDLE;
