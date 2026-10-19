@@ -1362,6 +1362,9 @@ logic        wb_cof;          // the uop's control transfer was taken
 wire wb_is_exc   = wb_v && !wb_ok;
 wire wb_commit   = adv_wb && !wb_is_exc;
 wire wb_bound    = wb_commit && wb_u.last;
+// the mask an IPEND claim is made against: sr_r, or the new mask on the
+// cycle an SR write commits (sr_r takes it at the end of that cycle)
+wire  [2:0]  claim_mask = (wb_commit && wb_sr_we) ? wb_sr_new[10:8] : sr_r[10:8];
 wire [31:0] wb_next = wb_redir_pc;
 
 // trace uses the T bits the instruction started with (sr_r before its own
@@ -1672,7 +1675,11 @@ always_ff @(posedge clk) begin
 		ipl_q <= ipl;
 		if (ipl_q == 3'd0 || ipl_q == 3'd7 || (ipend_r && ipl_q < ipend_lvl))
 			ipend_r <= 1'b0;
-		else if (ipl_q > sr_r[10:8] && (!ipend_r || ipl_q > ipend_lvl)) begin
+		// against the mask in force: on the cycle an SR write commits, sr_r
+		// still holds the old mask, and a request rising then must not
+		// claim IPEND past a raised mask (it was taken one instruction into
+		// Kickstart's dispatcher, after its MOVE #$2700,SR)
+		else if (ipl_q > claim_mask && (!ipend_r || ipl_q > ipend_lvl)) begin
 			ipend_r   <= 1'b1;
 			ipend_lvl <= ipl_q;
 		end

@@ -981,7 +981,8 @@ always_ff @(posedge clk) begin
 		for (int l = 1; l <= 6; l++) begin
 			if (dut.be.ipl_q < 3'(l))
 				tb_qual[l] <= 1'b0;
-			else if (dut.be.ipl_q == 3'(l) && 3'(l) > dut.be.sr_r[10:8])
+			else if (dut.be.ipl_q == 3'(l) && 3'(l) > ((dut.be.wb_commit && dut.be.wb_sr_we) ?
+			                                            dut.be.wb_sr_new[10:8] : dut.be.sr_r[10:8]))
 				tb_qual[l] <= 1'b1;
 		end
 		if (ipl_lvl == 3'd0) begin
