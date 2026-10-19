@@ -737,7 +737,7 @@ typedef enum logic [5:0] {
 	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE, E_M_CLR,
 	E_FILL, E_FILLW, E_FILL_W, E_FILL_INS, E_PUSHV, E_PUSHVW, E_PUSHV_W, E_PUSHV_B,
 	E_BUS, E_BUS_W,
-	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
+	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DESCW2, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
 	E_TW_LKW, E_TW_DONE,
 	E_I_DONE
 } est_t;
@@ -2030,7 +2030,17 @@ always_ff @(posedge clk) begin
 			tset_b <= tw_da[9:4];
 			e_st   <= E_TW_DESCW;
 		end
-		E_TW_DESCW: e_st <= E_TW_DLK;   // (the tags of the set valid: the compare registers)
+		// The tag RAM registers its port B address: tset_b lands at the end
+		// of E_TW_DESC, the RAM takes it at the end of E_TW_DESCW, its tags
+		// are on tq_b in E_TW_DESCW2, and the compare registered at the end
+		// of that cycle (tw_hhq, tw_hwq) is what E_TW_DLK reads.  One wait
+		// state fewer sampled the compare against the set addressed BEFORE
+		// (the previous descriptor's, or the pipeline's): a false hit took
+		// another line's data for the descriptor, a false miss read memory
+		// past a dirty cached descriptor (the NeXT kernel's page-fault loop
+		// of 2026-10-19, tb/asm/t_nx8k.s).
+		E_TW_DESCW:  e_st <= E_TW_DESCW2;
+		E_TW_DESCW2: e_st <= E_TW_DLK;    // (the tags of the set valid: the compare registers)
 		E_TW_DLK: begin
 			if (tw_hhq && dc_en) begin
 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
@@ -2431,7 +2441,7 @@ always_ff @(posedge clk)
 // snooped set in the first H cycle)
 assign sn_line = (sn_src == 2'd0) ? dq_w : (sn_src == 2'd1) ? pv_line : bo_line;
 
-assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) ||
+assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) || (e_st == E_TW_DESCW2) ||
                  (e_st == E_TW_DLK) || (e_st == E_TW_DBUS) || (e_st == E_TW_EVAL) ||
                  (e_st == E_TW_UPD) || (e_st == E_TW_LKW) || (e_st == E_TW_UPD_W) ||
                  (e_st == E_TW_DONE) ||
