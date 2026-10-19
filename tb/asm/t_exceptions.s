@@ -22,6 +22,7 @@ FBERRCTL equ	$F154	; one-shot bus error on a FETCH at the written address
 FCREG	equ	$F120
 BERRCTL equ	$F142
 IRQEXCCTL equ	$F144
+IPENDCNT equ	$F164	; bench: interrupts accepted on an IPEND claim alone
 IPLCAP	equ	$F160	; bench capability word: bit 0 = coarse IPL delivery
 			; (IPLREG, IPLDLY arriving eventually), bit 1 = cycle-
 			; fine injectors (IPLDLY exact, IPLPULSE, IPLSTEP,
@@ -691,20 +692,37 @@ irq_withdraw_loop:
 	; its claim even though the very next instruction raises the mask.
 	; The 68040 sets IPEND when the level beats the mask, and an
 	; interrupt whose IPEND is set is taken at the next instruction
-	; boundary regardless of a mask raised in the meantime.  Time the
-	; request to arrive inside the MOVE to SR that masks it.
+	; boundary regardless of a mask raised in the meantime.  The request
+	; must arrive inside the MOVE to SR that masks it; where that window
+	; lies depends on the core's pipeline and the bus timing, so sweep the
+	; arrival clock by clock across it.  The bench counts acceptances made
+	; on a claim alone (at or below the boundary mask) at IPENDCNT, and
+	; independently fails the run if a claimed request is not taken at
+	; the next boundary or a level is taken at the mask without a claim.
+	move.w	(IPENDCNT).l,d5
+	moveq	#1,d4
+irq_hold_loop:
 	move.w	#$2000,sr		; mask 0 while the request arrives
-	move.w	(cnt_int2).l,d5
-	move.w	#6,(IPLDLY).l
+	move.w	d4,(IPLDLY).l
+	moveq	#0,d6			; straight-line work: the sweep starts
+	moveq	#0,d6			; before the MOVE to SR, whatever the
+	moveq	#0,d6			; pipeline depth, and runs past it
+	moveq	#0,d6
 	move.w	#$2700,sr		; request qualifies inside this insn
 	nop
 	nop
 	nop
-	move.w	(cnt_int2).l,d6
+	moveq	#15,d6			; let any late arrival land under the mask
+irq_hold_settle:
+	dbra	d6,irq_hold_settle
+	move.w	#0,(IPLREG).l		; withdraw a request that arrived masked
+	addq.w	#1,d4
+	cmp.w	#24,d4
+	bls.s	irq_hold_loop
+	move.w	(IPENDCNT).l,d6
 	sub.w	d5,d6
-	cmp.w	#1,d6
-	beq.s	irq_hold_ok
-	failt	136			; qualified request lost to a later mask
+	bne.s	irq_hold_ok
+	failt	136			; no arrival exercised a qualified claim
 irq_hold_ok:
 	move.w	#0,(IPLREG).l
 	move.w	#$2700,sr
@@ -817,7 +835,10 @@ t141_arm:
 	lea	t141_t(pc),a0
 	move.l	a0,(fberr_fa).l
 	move.w	a0,(FBERRCTL).l
-	bra.s	t141_t		; backward: flush, then a faulting demand
+	jmp	(a0)		; flush, then a faulting demand: an indirect
+				; jump cannot be predicted, so its target is
+				; fetched only after it (and the arm before it)
+				; completed, however deep the front end runs
 t141_chk:
 	chkcnt	cnt_fberr,1,141
 	move.w	#0,(FBERRCTL).l

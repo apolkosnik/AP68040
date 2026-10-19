@@ -5242,6 +5242,56 @@ soak_done:
 	chkcnt	cnt_fpovfl,1,322
 	fmove.l	#0,fpcr
 
+	; underflow at a narrowed rounding precision whose first rounding
+	; carries: the denormalization shifts the UNROUNDED significand by
+	; the unrounded exponent (9.7.5: denormalize, then round), so
+	; 1.FFFFFF8 x 2^-127 rounds to 2^-126, not 2^-125
+	move.l	#$3F800000,($3890).l
+	move.l	#$FFFFFF80,($3894).l
+	clr.l	($3898).l
+	fmove.l	#$40,fpcr	; single, round to nearest
+	fabs.x	($3890).l,fp0
+	fmove.l	#0,fpcr
+	fmove.x	fp0,($38A0).l
+	move.l	($38A0).l,d0
+	chkl	d0,$3F810000,666
+	move.l	($38A4).l,d0
+	chkl	d0,$80000000,667
+	move.l	($38A8).l,d0
+	chkl	d0,$00000000,668
+	; the same at double precision: 2^-1022, not 2^-1021
+	move.l	#$3C000000,($3890).l
+	move.l	#$FFFFFFFF,($3894).l
+	move.l	#$FFFFFC00,($3898).l
+	fmove.l	#$80,fpcr	; double, round to nearest
+	fabs.x	($3890).l,fp0
+	fmove.l	#0,fpcr
+	fmove.x	fp0,($38A0).l
+	move.l	($38A0).l,d0
+	chkl	d0,$3C010000,669
+	move.l	($38A4).l,d0
+	chkl	d0,$80000000,670
+	move.l	($38A8).l,d0
+	chkl	d0,$00000000,671
+	; an enabled UNFL of that kind: FSAVE's BUSY frame holds the
+	; intermediate before rounding in WBTEMP (table 9-16) -- the
+	; unrounded exponent with the unrounded significand
+	move.l	#$3F800000,($3890).l
+	move.l	#$FFFFFF80,($3894).l
+	clr.l	($3898).l
+	fmove.x	($3890).l,fp0
+	fmove.l	#1,fp1
+	fmove.l	#$0840,fpcr	; enable UNFL, single, round to nearest
+	fmul.x	fp1,fp0
+	fsave	(a3)		; extraction: the pend leaves with the frame
+	fmove.l	#0,fpcr
+	move.l	($3800).l,d0
+	chkl	d0,$41600000,672	; BUSY frame
+	move.l	($3818).l,d0
+	chkl	d0,$3F800000,673	; WBTS/WBTE: the unrounded exponent
+	move.l	($381C).l,d0
+	chkl	d0,$FFFFFF80,674	; WBTM high: the unrounded significand
+
 	jmp	audit_return
 
 ; level-2 autovector: the task-switch idiom around a possibly-active

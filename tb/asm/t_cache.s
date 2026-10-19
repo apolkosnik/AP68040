@@ -65,6 +65,8 @@ start:
 	; stub at $2000: moveq #1,d0 ; rts
 	move.w	#$7001,($2000).l
 	move.w	#$4E75,($2002).l
+	cpusha	bc			; required before self-modified code runs
+					; (MC68040UM 4.5): the 68040 may prefetch it
 	jsr	($2000).l
 	chkl	d0,1,2			; also fills the I-cache line
 

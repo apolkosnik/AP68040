@@ -1,105 +1,31 @@
-#!/bin/sh
-# AP68040 self-test suite.
-#
-# Needs iverilog and vasmm68k_mot (vbcc).  Everything here runs against the
-# core alone -- no host-project sources -- so a failure is the CPU's, not an
-# integration artifact.  The Minimig-AGA tree this core is developed in adds
-# further benches that co-simulate it with a real chipset, SDRAM and DDR3
-# controller; those live there because they need those modules.
-set -eu
+#!/bin/bash
+# AP68040 regression: every program under five bus configurations (zero
+# wait states, random wait states, waits with burst inhibit and retries,
+# BCLK at half PCLK, and all of those together).
+# Usage: run_tests.sh [program ...]   (default: the passing set)
+# JOBS=<n> simulations run in parallel (default: half the CPUs).
+set -e
 cd "$(dirname "$0")"
-
-VASM=${VASM:-vasmm68k_mot}
-RTL=../rtl
-WORK=build
-mkdir -p "$WORK"
-
-SRC="$RTL/ap040_tg68k_compat.v $RTL/ap040_core.v $RTL/ap040_bus16_adapter.v \
-     $RTL/ap040_bus_timeout.v $RTL/ap040_regfile.v $RTL/ap040_alu.v \
-     $RTL/ap040_muldiv.v $RTL/ap040_mmu.v $RTL/ap040_cache.v $RTL/ap040_fpu.v \
-     $RTL/ap040_walker_cdc.v $RTL/primitives/dpram.v"
-
-echo "== assembling test programs =="
-for t in t_integer t_exceptions t_mmu t_movem_restart t_atcprobe t_bitfield_mmu t_bitfield_cache t_moves_fc t_cache t_fpu bench_loop; do
-	$VASM -Fbin -m68040 -no-opt -o "$WORK/$t.bin" "asm/$t.s" >/dev/null
-	python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
-done
-
-echo "== compiling benches =="
-iverilog -g2012 -I "$RTL" -s tb_ap040_regfile -o "$WORK/tb_regfile.vvp" \
-	tb_ap040_regfile.v $RTL/ap040_regfile.v
-iverilog -g2012 -I "$RTL" -s tb_ap040_alu_arithmetic -o "$WORK/tb_alu_arithmetic.vvp" \
-	tb_ap040_alu_arithmetic.v $RTL/ap040_alu.v
-iverilog -g2012 -I "$RTL" -s tb_ap040_fpu_normalize -o "$WORK/tb_fpu_normalize.vvp" \
-	tb_ap040_fpu_normalize.v $RTL/ap040_fpu.v $RTL/ap040_regfile.v $RTL/primitives/dpram.v
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_prog.vvp"      tb_ap040_program.v $SRC
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_reset.vvp"     tb_ap040_reset.v $SRC
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_dblflt.vvp"    tb_ap040_double_fault.v $SRC
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_walker.vvp"    tb_ap040_walker_cdc.v $RTL/ap040_walker_cdc.v
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_bus16.vvp"     tb_ap040_bus16_gap.v $RTL/ap040_bus16_adapter.v
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_timeout.vvp"   tb_ap040_bus_timeout.v $RTL/ap040_bus_timeout.v
-iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -o "$WORK/tb_snoop.vvp" \
-	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
-# the same bench at the 4:1 clock enable, and both with the tag row's
-# mixed-port read-during-write modelled, which is what makes the lookup
-# guard load-bearing at all
-iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -P tb_ap040_cache_snoop.CE_DIV=4 \
-	-o "$WORK/tb_snoop_ce4.vvp" \
-	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
-iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -DSNOOP_MIXED_X \
-	-o "$WORK/tb_snoop_x.vvp" \
-	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
-iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -DSNOOP_MIXED_X \
-	-P tb_ap040_cache_snoop.CE_DIV=4 -o "$WORK/tb_snoop_x_ce4.vvp" \
-	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
-
-echo "== running =="
-fail=0
-run() {
-	name=$1; shift
-	if vvp "$@" 2>&1 | tee "$WORK/$name.log" | grep -q "ALL TESTS PASSED"; then
-		echo "  pass  $name"
-	else
-		echo "  FAIL  $name  (see $WORK/$name.log)"
-		fail=1
-	fi
-}
-# A negative leg passes only when the bench FAILS.  Each lookup-guard term is
-# load-bearing in one clock-enable regime and redundant in the other, so
-# blinding it must break the bench at its own divide -- a guard that cannot be
-# shown to matter is not being tested.
-negrun() {
-	name=$1; shift
-	if vvp "$@" 2>&1 | tee "$WORK/$name.log" | grep -q "TEST FAILED"; then
-		echo "  pass  $name  (control: failed as required)"
-	else
-		echo "  FAIL  $name  (control did NOT fail; see $WORK/$name.log)"
-		fail=1
-	fi
-}
-run reset        "$WORK/tb_reset.vvp"
-run regfile       "$WORK/tb_regfile.vvp"
-run regfile_poison "$WORK/tb_regfile.vvp" +poison
-negrun regfile_bypass_control "$WORK/tb_regfile.vvp" +poison +disable_bypass
-run alu_arithmetic "$WORK/tb_alu_arithmetic.vvp"
-run fpu_normalize "$WORK/tb_fpu_normalize.vvp"
-run double_fault "$WORK/tb_dblflt.vvp"
-run walker_cdc   "$WORK/tb_walker.vvp"
-run bus16_gap    "$WORK/tb_bus16.vvp"
-run bus_timeout  "$WORK/tb_timeout.vvp"
-run cache_snoop  "$WORK/tb_snoop.vvp"
-run cache_snoop_ce4       "$WORK/tb_snoop_ce4.vvp"
-run cache_snoop_x         "$WORK/tb_snoop_x.vvp"
-run cache_snoop_x_lkw     "$WORK/tb_snoop_x.vvp"     +inj_look_whole
-run cache_snoop_x_ce4     "$WORK/tb_snoop_x_ce4.vvp"
-run cache_snoop_x_ce4_accw "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_whole
-run cache_snoop_x_ce4_accs "$WORK/tb_snoop_x_ce4.vvp" +inj_acc_settle
-negrun cache_snoop_x_neg_accw   "$WORK/tb_snoop_x.vvp"     +inj_acc_whole
-negrun cache_snoop_x_ce4_neg_lkw "$WORK/tb_snoop_x_ce4.vvp" +inj_look_whole
-for t in integer exceptions mmu movem_restart atcprobe bitfield_mmu bitfield_cache moves_fc cache fpu; do
-	run "$t" "$WORK/tb_prog.vvp" "+prog=$WORK/t_$t.hex"
-done
-
-if ! sh ./run_fpu_frames.sh; then fail=1; fi
-
-if [ $fail -eq 0 ]; then echo "AP68040: ALL TESTS PASSED"; else echo "AP68040: FAILURES"; exit 1; fi
+PROGS=${*:-"smoke t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_fpu_frame_class t_fpu_frame_snan t_fpu_frame_cmd t_snoop t_btb t_stld t_pins t_snstress t_eredir t_cbsplit t_cmodes t_loops t_early t_irq7 t_iplglitch t_snirq t_xnest t_halt t_cache2 t_fpexc"}
+WORK=${WORK:-$(cd .. && pwd)/obj}; export WORK
+JOBS=${JOBS:-$(( $(nproc) / 2 ))}
+./build_asm.sh $PROGS
+./build_sim.sh > build/sim_build.log 2>&1 || { tail -30 build/sim_build.log; exit 1; }
+# the exhaustive decoder check (every operation word)
+./build_decode.sh | grep -q "DECODE PASS" || { echo "DECODE FAIL"; exit 1; }
+SIM=$WORK/obj_prog/tb_ap68040
+CFGS=(
+	""
+	"+waits"
+	"+waits +tbi=2 +retry=10"
+	"+bclk2"
+	"+bclk2 +waits +tbi=1 +retry=20"
+)
+out=$(for p in $PROGS; do for c in "${CFGS[@]}"; do printf '%s|%s\n' "$p" "$c"; done; done |
+	xargs -d '\n' -P "$JOBS" -I{} bash -c '
+		p=${1%%|*}; c=${1#*|}
+		r=$('"$SIM"' +prog=build/$p.hex $c +timeout=4000000 2>&1 | grep -E "^(PASS|FAIL)" | tail -1)
+		printf "%-16s %-34s %s\n" "$p" "${c:-(zero wait)}" "${r:-FAIL (no result)}"' _ {})
+printf '%s\n' "$out" | sort
+if printf '%s\n' "$out" | grep -qv " PASS "; then echo "FAILURES"; exit 1; fi
+echo "ALL PASSED"
