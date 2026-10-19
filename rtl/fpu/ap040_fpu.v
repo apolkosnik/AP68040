@@ -2960,14 +2960,20 @@ always @(posedge clk) begin
 				reg [83:0] du;
 				if (|(fpsr[15:8] & fpcr[15:8])) begin
 					// Enabled exceptions suppress architectural destination
-					// writeback.  The core builds the normal arithmetic-
-					// exception stack frame for the selected vector.
+					// writeback (fr_wb_we, fr_valid below).  The core builds
+					// the normal arithmetic-exception stack frame for the
+					// selected vector.  The condition codes are still set
+					// from the default result that is not written, as for
+					// a completed operation: WinUAE (the oracle) sets them in
+					// fp_arithmetic before fpsr_check_arithmetic_exception,
+					// and the 68060 does the same (Motorola's ftest.sa:
+					// FPSR $09004080 after FADD.B #2,FP0 with FP0 a negative
+					// SNAN); the M68040FPSP's enabled SNAN/OPERR exits leave
+					// the user FPSR as the hardware set it.
 					exc_req <= 1;
 					exc_vec <= fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
-					fpu_used <= 1;
-					begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 				end
-				else if (r_op == 7'h38) begin : f_cmp
+				if (r_op == 7'h38) begin : f_cmp
 					// FCMP: condition codes from FPn - source
 					du = {b_s, b_e, b_m, b_t};
 					ds = du[83];
@@ -3023,7 +3029,7 @@ always @(posedge clk) begin
 					// in a_m: created infinities carry all-zero bits and
 					// pass-through infinities keep the operand's raw image
 					// (inf_clear_intbit is a 68060 flag, not 68040).
-					fr_valid[r_dst] <= 1;
+					if (!(|(fpsr[15:8] & fpcr[15:8]))) fr_valid[r_dst] <= 1;
 					fpsr[27:24] <= {a_s,
 					                (a_t == T_ZERO),
 					                (a_t == T_INF),
