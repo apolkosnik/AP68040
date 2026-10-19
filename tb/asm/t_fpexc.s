@@ -26,6 +26,12 @@
 ;         below the precision (table 9-16; WinUAE
 ;         getFloatInternalRoundedSome), not the rounded significand
 ;
+;   40-52 enabled SNAN, OPERR, DZ: the condition codes are set from the
+;         default result that is not written (WinUAE fp_arithmetic sets
+;         them before fpsr_check_arithmetic_exception; the 68060 does the
+;         same, Motorola's ftest.sa), the destination is kept, the
+;         exception is taken by the next FPU instruction, once
+;
 ;   98   an unexpected exception
 
 FAILREG	equ	$F100
@@ -211,6 +217,61 @@ sn_sync:
 	move.l	(fbuf+$1C).l,d0
 	chkl	d0,$80000080,33
 
+;------------------------------------------------ 40-52 enabled SNAN, OPERR, DZ: condition codes
+	; SNAN: -SNAN + 2: N and NAN, the quiet NaN keeping the sign
+	move.l	(cnt).l,d6
+	fmove.l	#$4000,fpcr
+	fmovem.x	cc_snan,fp0	; (FMOVEM: loaded as it is)
+	fmove.l	#0,fpsr
+	fadd.b	#2,fp0
+	fnop			; vector 54
+	fmove.l	fpsr,d0
+	chkl	d0,$09004080,40
+	move.l	(cnt).l,d0
+	sub.l	d6,d0
+	chkl	d0,1,41
+	fmove.l	#0,fpcr
+	fmovem.x	fp0,(fbuf+$40).l
+	move.l	(fbuf+$40).l,d0
+	chkl	d0,$FFFF0000,42	; the destination kept
+	move.l	(fbuf+$48).l,d0
+	chkl	d0,$00000001,43
+	; OPERR: -inf + +inf: NAN alone, the default NaN is positive
+	move.l	(cnt).l,d6
+	fmove.l	#$2000,fpcr
+	fmovem.x	cc_minf,fp0
+	fmove.l	#0,fpsr
+	fadd.s	#$7F800000,fp0
+	fnop			; vector 52
+	fmove.l	fpsr,d0
+	chkl	d0,$01002080,45
+	move.l	(cnt).l,d0
+	sub.l	d6,d0
+	chkl	d0,1,46
+	fmove.l	#0,fpcr
+	fmovem.x	fp0,(fbuf+$40).l
+	move.l	(fbuf+$40).l,d0
+	chkl	d0,$FFFF0000,47	; -inf kept
+	move.l	(fbuf+$44).l,d0
+	chkl	d0,$00000000,48
+	; DZ: 2 / 0: I, the default infinity positive
+	move.l	(cnt).l,d6
+	fmove.l	#$0400,fpcr
+	fmovem.x	cc_two,fp0
+	fmove.l	#0,fpsr
+	fdiv.b	#0,fp0
+	fnop			; vector 50
+	fmove.l	fpsr,d0
+	chkl	d0,$02000410,50
+	move.l	(cnt).l,d0
+	sub.l	d6,d0
+	chkl	d0,1,51
+	fmove.l	#0,fpcr
+	fmovem.x	fp0,(fbuf+$40).l
+	move.l	(fbuf+$40).l,d0
+	chkl	d0,$40000000,52	; 2 kept
+	fmove.l	#0,fpsr
+
 	move.w	#$600D,(DONEREG).l
 	bra.s	*
 
@@ -233,5 +294,8 @@ unexp:
 
 	even
 snan_x:	dc.l	$7FFF0000,$A0000000,1
+cc_snan:	dc.l	$FFFF0000,$00000000,$00000001
+cc_minf:	dc.l	$FFFF0000,$00000000,$00000000
+cc_two:	dc.l	$40000000,$80000000,$00000000
 inex_x:	dc.l	$3FFF0000,$80000080,0
 inexd_x:	dc.l	$3FFF0000,$80000000,$00000400
