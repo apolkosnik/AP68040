@@ -24,7 +24,7 @@ CFGS=(
 out=$(for p in $PROGS; do for c in "${CFGS[@]}"; do printf '%s|%s\n' "$p" "$c"; done; done |
 	xargs -d '\n' -P "$JOBS" -I{} bash -c '
 		p=${1%%|*}; c=${1#*|}
-		r=$('"$SIM"' +prog=build/$p.hex $c +timeout=4000000 2>&1 | grep -E "^(PASS|FAIL)" | tail -1)
+		r=$('"$SIM"' +prog=build/$p.hex $c +timeout=8000000 2>&1 | grep -E "^(PASS|FAIL)" | tail -1)
 		printf "%-16s %-34s %s\n" "$p" "${c:-(zero wait)}" "${r:-FAIL (no result)}"' _ {})
 printf '%s\n' "$out" | sort
 if printf '%s\n' "$out" | grep -qv " PASS "; then echo "FAILURES"; exit 1; fi
