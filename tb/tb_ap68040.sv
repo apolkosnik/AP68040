@@ -63,11 +63,15 @@
 //   $F2C4 word  random snoop traffic from the alternate master: bit 15    //
 //               on, bits 7:0 bus clocks between transfers (see t_snstress)//
 //               bit 14: instead, SC 01 long writes to $D014 only          //
+//               bit 13: hold the bus a random 0-31 bus clocks before each //
+//               transfer (t_snkill)                                       //
 //   $F2E0 long  (read) split copyback stores whose second line a snoop    //
 //               took between the two parts (the DMU's fallback)          //
 //   $F2E4 long  (read) Bcc/DBcc mispredicted in EX (write 0 clears)      //
 //   $F2E8 long  (read) the core's options: bit 0 the loop exit predictor  //
 //               (t_loops checks its predictions only when it is there)    //
+//   $F2F0 long  (read) kills that landed while the DMU's engine sat in    //
+//               E_S_START frozen by a snoop (t_snkill, write 0 clears)    //
 //   $F164 word  (read) interrupts accepted on an IPEND claim alone: at   //
 //               or below the boundary mask, after the request qualified   //
 //               against an earlier, lower mask                            //
@@ -113,6 +117,7 @@ logic        dbg_retire, dbg_halted;
 // at $A000 (SC 01: they must never go backwards) and reads/writes of the
 // shared words at $B000 (each value names its writer and address)
 logic        rs_en, rs_split;
+logic        rs_rhold;             // hold the bus 0-31 bus clocks before each transfer
 int          fb_cnt;
 logic  [7:0] rs_gap, rs_cnt;
 logic  [2:0] rs_op;
@@ -290,6 +295,7 @@ endfunction
 // MMIO and error injection
 //--------------------------------------------------------------------------
 int          result;          // 0 running, 1 pass, 2 fail
+logic        dmu_bad = 1'b0;  // a DMU self-check tripped (checked at the end)
 int          errors;
 int          cycles;
 int          stamp_prev;
@@ -367,6 +373,9 @@ end
 // snoops: lookups by where the line was (cache, push buffer, queued push,
 // miss), dirty supplies, sinks, invalidations, snoop-forced refetches
 int snc [8];
+int klc [6];                  // kills against the engine (PROF)
+longint snkwin = 0;
+initial if (!$value$plusargs("snkwin=%d", snkwin)) snkwin = 0;
 initial for (int i = 0; i < 8; i++) snc[i] = 0;
 always_ff @(posedge clk) if (rsti_n) begin
 	if (dut.dmu.sn_look) begin
@@ -376,6 +385,25 @@ always_ff @(posedge clk) if (rsti_n) begin
 	if (dut.snoop.st == dut.snoop.S_SRC && dut.snoop.bclk_en && !dut.snoop.ta_oe) snc[4]++;
 	if (dut.snoop.dc_wr) snc[5]++;
 	if (dut.snoop.dc_inv) snc[6]++;
+	// kills against the DMU's engine: all, with the engine in E_S_START,
+	// under a snoop freeze, both (t_snkill's case)
+	if (dut.be.kill_now) begin
+		klc[0]++;
+		if (dut.dmu.sim_es_s) klc[1]++;
+		if (dut.dmu.sn_frz) klc[2]++;
+		if (dut.dmu.sim_es_s && dut.dmu.sn_frz) klc[3]++;
+	end
+	if (dut.dmu.sim_es_s) begin klc[4]++; if (dut.dmu.sn_frz) klc[5]++; end
+	// +snkwin=<cycle>: the bus, the master, the snooper and the engine,
+	// every clock from 60 before that cycle to 10 after (how t_snkill's
+	// timing was found: the cycle of a kill from "PROF kills")
+	if (snkwin != 0 && cycles >= snkwin - 60 && cycles <= snkwin + 10)
+		$display("SNKW c=%0d cpu: ts=%b a_oe=%b bb=%b bg_n=%b | am.st=%0d dly=%0d ts=%b bb=%b | sn_req=%b sn_ph=%0d snoop.st=%0d | e_st=%0d job=%b hold1=%b m1.v=%b stale=%b dc2.v=%b kill=%b | be: ag=%b/%03x dc1=%b/%03x dc2=%b/%03x ex=%b/%03x wb=%b/%03x adv=%b%b%b%b%b",
+		         cycles, !ts_n && a_oe, a_oe, bb_oe ? bb_n_o : 1'b1, am_bg_n, am.st, am.dly, !am_ts_n, am_bb_n,
+		         dut.dmu.sn_req, dut.dmu.sn_ph, dut.snoop.st, dut.dmu.e_st, dut.dmu.e_job, dut.dmu.dm_hold1, dut.dmu.m1.v, dut.dmu.m1_stale, dut.dmu.m2.r.v,
+		         dut.be.kill_now, dut.be.ag_v, dut.be.ag_u.pc[11:0], dut.be.dc1_v, dut.be.dc1_u.pc[11:0], dut.be.dc2_v, dut.be.dc2_u.pc[11:0],
+		         dut.be.ex_v, dut.be.ex_u.pc[11:0], dut.be.wb_v, dut.be.wb_u.pc[11:0],
+		         dut.be.adv_ag, dut.be.adv_dc1, dut.be.adv_dc2, dut.be.adv_ex, dut.be.adv_wb);
 	if (dut.sn_ihit) snc[7]++;
 end
 // BTB: followed, overruled at a branch's end, restarted (flag inside)
@@ -474,6 +502,9 @@ task automatic prof_report();
 	$display("PROF BTB: followed %0d, overruled at the end %0d, restarted %0d", btc[0], btc[1], btc[2]);
 	$display("PROF snoops: hit cache %0d, push buffer %0d, queued push %0d, miss %0d; supplied %0d, sunk %0d, invalidated %0d, I-side refetches %0d",
 	         snc[0], snc[1], snc[2], snc[3], snc[4], snc[5], snc[6], snc[7]);
+	$display("PROF kills: %0d, engine in E_S_START %0d, under a snoop freeze %0d, both %0d; E_S_START clocks %0d, frozen %0d",
+	         klc[0], klc[1], klc[2], klc[3], klc[4], klc[5]);
+	for (int i = 0; i < 6; i++) klc[i] = 0;
 	for (int i = 0; i < 8; i++) snc[i] = 0;
 	$display("PROF loads at DC1: fast %0d, miss %0d, set written since lookup %0d, engine busy %0d, other %0d",
 	         lsl[0], lsl[1], lsl[2], lsl[3], lsl[4]);
@@ -609,6 +640,10 @@ always_ff @(posedge clk) begin
 	// Bcc/DBcc mispredictions (t_loops)
 	if (rsti_n && dut.be.adv_ex && dut.be.ex_mispred && dut.be.ex_bdb && !dut.be.flush)
 		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
+	// kills (a redirect or exception) landing while the DMU's engine sits
+	// in E_S_START frozen by a snoop: the coincidence t_snkill needs
+	if (rsti_n && dut.be.kill_now && dut.dmu.sn_frz && dut.dmu.sim_es_s)
+		mem.mem[16'hF2F0 >> 2] <= mem.mem[16'hF2F0 >> 2] + 32'd1;
 	// the core's options, for the programs that check what they do
 	mem.mem[16'hF2E8 >> 2] <= {31'd0, 1'(`AP_LOOP_PRED)};
 end
@@ -686,7 +721,7 @@ always_ff @(posedge clk) begin
 		fetch_stall <= '0;
 		am_go       <= 1'b0;
 		pins_r      <= 2'b00;
-		rs_en <= 1'b0; rs_split <= 1'b0; rs_gap <= '0; rs_cnt <= '0; rs_op <= '0; rs_k <= '0; rs_seq <= '0;
+		rs_en <= 1'b0; rs_split <= 1'b0; rs_rhold <= 1'b0; rs_gap <= '0; rs_cnt <= '0; rs_op <= '0; rs_k <= '0; rs_seq <= '0;
 		rs_busy <= 1'b0; rs_ops <= 0;
 		for (int i = 0; i < 64; i++) rs_last[i] <= 0;
 		am_n        <= '0;
@@ -709,7 +744,10 @@ always_ff @(posedge clk) begin
 				rs_seq <= rs_seq + 1'd1;
 				am_n   <= 3'd1;
 				am_trig_en <= 1'b0;
-				am_delay <= '0;
+				// (bit 13: a random hold before TS, so the transfer's start
+				// is not locked to the clock the CPU's last transfer freed
+				// the bus; t_snkill needs the snoop to land in one clock)
+				am_delay <= rs_rhold ? 16'($urandom % 32) : '0;
 				if (rs_split) begin     // write $D014, SC 01 (t_cbsplit)
 					rs_op <= 3'd1;
 					am_x_addr[0] <= 32'h0000_D014;
@@ -873,6 +911,7 @@ always_ff @(posedge clk) begin
 				16'hF2C4: begin
 					rs_en    <= w[15];
 					rs_split <= w[14];
+					rs_rhold <= w[13];
 					rs_gap   <= w[7:0];
 					if (!w[15]) $display("snoop traffic: %0d transfers", rs_ops);
 				end
@@ -1084,7 +1123,12 @@ initial begin
 	end
 	if (prof) prof_report();
 	if (pcprof) pcprof_dump();
-	if (result == 1 && errors == 0 && halt_bad == 0)
+	// the DMU's own checks (its "FAIL: DMU:" lines): a run that tripped
+	// one has failed whatever the program says
+	dmu_bad = dut.dmu.sim_xchk || dut.dmu.sim_kchk;
+	if (dmu_bad)
+		$display("FAIL: a DMU self-check tripped (tag compare %0d, dead job %0d)", dut.dmu.sim_xchk, dut.dmu.sim_kchk);
+	if (result == 1 && errors == 0 && halt_bad == 0 && !dmu_bad)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)
 		$display("FAIL %s: %s at pc=%h, last test %0d", prog,
