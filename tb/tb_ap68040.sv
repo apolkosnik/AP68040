@@ -296,7 +296,7 @@ endfunction
 //--------------------------------------------------------------------------
 // MMIO and error injection
 //--------------------------------------------------------------------------
-int          result;          // 0 running, 1 pass, 2 fail
+int          result /*verilator public_flat_rw*/;  // 0 running, 1 pass, 2 fail (public: Verilator 5.020 otherwise lost the always_ff update the initial loop polls)
 int          errors;
 int          cycles;
 int          stamp_prev;
