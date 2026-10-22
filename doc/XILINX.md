@@ -378,6 +378,42 @@ Dual issue, even if it reached 56.72, buys only IPC -- **1.10 to 1.25x** on
 register-poor, memory-heavy 68k code -- for +5,000 to +8,000 LUTs on a die at
 92.79 % slice occupancy.
 
+## 9. Dual issue as built
+
+Measured on the shipping configuration (`FPU_PIPE`, `LOOP_PRED`,
+`EARLY_RES` 0), Dhrystone 2.1 and Whetstone by `tb/run_bench.sh` at 56.72
+MHz, area by `syn/vivado_ooc.sh` (Vivado 2023.2, xc7a100t, 17.630 ns):
+
+| step | Dhrystone cycles | DMIPS | LUTs | slices | BRAM tiles | WNS |
+|---|---|---|---|---|---|---|
+| single issue | 1,007 | 32.06 | | | | |
+| + dual issue (`DUAL`) | 912 | 35.40 | 31,560 | 9,168 | 29 | +1.97 |
+| + second-slot (Ay) loads | 892 | 36.19 | 31,396 | 8,878 | 29 | +2.39 |
+| + BTB target words (`BTIC`) | 878 | 36.77 | 31,663 | 9,024 | 31 | +1.38 |
+| + 8 KB caches (`CSB` 7) | 878 | 36.77 | 31,747 | 8,876 | 31 | +2.05 |
+
+* In total 12.8 % fewer Dhrystone cycles (1.15x per clock); 2.06x the
+  incumbent pipelined core's 17.82 DMIPS in the Minimig.  Whetstone is
+  flat (about 581,600 cycles a loop): FPU work issues alone.
+* Random generated programs (`tb/run_dualrand.sh`, 400 seeds): 6.4 %
+  fewer cycles with dual issue, every checkpoint identical to the
+  single-issue core.
+* Dhrystone and Whetstone fit 4 KB caches, so the 8 KB caches show
+  nothing there; they cost no block RAM (the 4 KB arrays used half of
+  theirs) and about 84 LUTs.  CINVA/CPUSHA scan twice the sets.
+* Tried and dropped: d16(An) loads in the second slot (+369 LUTs, +227
+  slices, no Dhrystone gain: those loads follow another memory access);
+  branch folding.  A second data cache port is the next lever for
+  loads (estimated +1.5 to 2 % Dhrystone for 2,000 to 3,000 LUTs).
+* The BTB target words' first version kept their valid bits in flip-
+  flops: +1,654 LUTs.  In LUT RAM with a clearing sweep: +267.
+
+Verification: `tb/run_tests.sh` 175/175 (with `t_ld1`, `t_btic`);
+`tb/run_dualrand.sh` 400 seeds; the WinUAE cputest corpus fails only
+the 21 slices the scalar core fails too (13 ODD_EXC trace, 8 ODD_IRQ
+EXT/SWAP), checked through the second-slot loads; the BTIC and 8 KB
+builds' corpus runs were not complete at the time of writing.
+
 ## Verification status
 
 **One item is unverified and must not be glossed.**  The memory-template
