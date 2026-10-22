@@ -92,6 +92,7 @@ module ap68040_backend
 	output logic        lp_tk,
 	output logic        lp_mp,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
+	output logic        dm_pastc,       // the level-7 vector fetch: read past the cache
 	output logic  [1:0] dm_ack,         // acknowledge cycle: 1 IACK, 2 BKPT
 	input  logic        dm_hold1,       // the DMU holds DC1
 	// WB maintenance (CINV/CPUSH/PFLUSH/PTEST) in the DMU
@@ -646,6 +647,14 @@ always_ff @(posedge clk) begin
 end
 assign lp_we = lp_we_q && !flush;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP) && !ag_m1;
+// A level-7 interrupt's handler fetch (the routine's last uop: the vector
+// read, cond 15, a branch to the loaded address) reads past the data
+// cache: a system's NMI monitor answers that read itself (the Amiga's
+// HRTMon/Action Replay overlay), and a vector line cached by the level 4-6
+// autovectors beside it would hide the override.  A dirty line is pushed.
+logic exc_l7;   // the exception being taken is a level-7 interrupt
+assign dm_pastc = exc_l7 && !ag_m1 && (ag_u.mfc == MFC_SUP) && (ag_u.mem == M_LD) &&
+                  (ag_u.br == BR_A) && (ag_u.cond == 4'hF);
 // acknowledge cycles (TT=3): 1 interrupt, 2 breakpoint
 assign dm_ack     = ag_m1 ? 2'd0 : (ag_u.mfc == MFC_IACK) ? 2'd1 : (ag_u.mfc == MFC_BKPT) ? 2'd2 : 2'd0;
 always_comb begin
@@ -1752,6 +1761,7 @@ always_ff @(posedge clk) begin
 		halted  <= 1'b0;
 		rst_seq <= 1'b1;
 		exc_kind <= EK_RESET;
+		exc_l7   <= 1'b0;
 		exc_ssp <= R_ISP;
 		redir_pc <= 32'd0;
 		ras_rtp <= '0;
@@ -1765,6 +1775,7 @@ always_ff @(posedge clk) begin
 			rst_seq  <= 1'b0;
 			exc_go   <= 1'b1;
 			exc_kind <= EK_RESET;
+			exc_l7   <= 1'b0;
 			exc_ssp  <= R_ISP;
 		end
 
@@ -2157,6 +2168,7 @@ dc1_a1  <= ag_s.agop ? ag1_val :
 			xw_ph    <= 3'd1;          // T8-T13 (and T5-T7) first, then exc_go
 			xi_f7    <= (x_fmt == 4'h7);
 			exc_kind <= x_kind;
+			exc_l7   <= take_irq && !(adv_wb && wb_is_exc) && (irq_lvl == 3'd7);
 			exc_ssp  <= x_ssp;
 			xi_sr    <= x_osr;
 			xi_vecw  <= vw;

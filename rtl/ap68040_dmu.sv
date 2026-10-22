@@ -73,6 +73,7 @@ module ap68040_dmu
 	input  logic        dm_locke,
 	input  logic        dm_super,
 	input  logic        dm_noalloc,
+	input  logic        dm_pastc,       // read past the cache (a hit pushed and invalidated first)
 	input  logic  [1:0] dm_ack,         // acknowledge cycle: 1 IACK, 2 BKPT
 	input  logic  [2:0] iack_lvl,
 	input  logic        dm_older,       // uops older than DC2 still in EX or WB
@@ -200,6 +201,7 @@ typedef struct packed {
 	logic        locke;
 	logic        smode;    // FC2
 	logic        noalloc;
+	logic        pastc;    // read past the cache: the level-7 vector fetch
 	logic  [1:0] ack;      // acknowledge cycle (TT=3): 1 IACK, 2 BKPT
 } req_t;
 
@@ -677,11 +679,11 @@ wire  [4:0] m1_end   = {1'b0, m1.a[3:0]} + {2'b00, nbytes(m1.msz)};
 wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
 wire  [7:0] lsd_q    = lsd[m1.a[CSH:4]];
 wire        m1_sfast = ((m1.mem == M_LD) || (m1.mem == M_ST && x_dc1.cm == 2'b01)) &&
-                       m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
+                       m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit && !m1.pastc &&
                        !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) && !m1.lock;
 // (locked accesses -- TAS, CAS, CAS2 -- are noncachable (MC68040UM 7.4.1):
 // the slow path pushes and invalidates a hit first)
-wire        m1_fast  = (m1.mem == M_LD || m1.mem == M_RMW) && !m1.lock &&
+wire        m1_fast  = (m1.mem == M_LD || m1.mem == M_RMW) && !m1.lock && !m1.pastc &&
                        x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
                        !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) &&
                        (m1.msz != SZ_Q) && !m1_split;
@@ -1107,6 +1109,7 @@ always_ff @(posedge clk) begin
 			m1.locke   <= dm_locke;
 			m1.smode   <= dm_super;
 			m1.noalloc <= dm_noalloc;
+			m1.pastc   <= dm_pastc;
 			m1.ack     <= dm_ack;
 			m1_tp      <= transp_of(dm_va, dm_super, dm_fc, dm_ack);
 			m1_aset    <= tc_p ? dm_va[16:13] : dm_va[15:12];
@@ -1371,7 +1374,8 @@ always_ff @(posedge clk) begin
 		else begin
 			logic cach, alloc, rd, move16;
 			move16 = (m2.r.msz == SZ_Q);
-			cach   = dc_en && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16;
+			cach   = dc_en && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16 &&
+			         !m2.r.pastc;
 			alloc  = cach && !m2.r.noalloc;
 			rd     = (m2.r.mem == M_LD) || (m2.r.mem == M_RMW);
 			if (e_x.flt) begin
@@ -1467,8 +1471,10 @@ always_ff @(posedge clk) begin
 				// first (4.3.2, 4.6.2; with LOCK for a locked access); the
 				// bus access goes in program order.  With the data cache
 				// disabled (CACR.DE clear, CDIS) the cache's contents are
-				// left alone
-				if (e_x.hit && dc_en && (m2.r.lock || e_x.cm[1] || move16)) begin
+				// left alone.  So is a read past the cache (the level-7
+				// vector fetch: a system may answer it from elsewhere, an
+				// NMI monitor's override; a dirty vector is pushed first)
+				if (e_x.hit && dc_en && (m2.r.lock || e_x.cm[1] || move16 || m2.r.pastc)) begin
 					f_set  <= e_va[CSH:4];
 					f_way  <= e_x.way;
 					pv_lock <= m2.r.lock;
@@ -1489,7 +1495,7 @@ always_ff @(posedge clk) begin
 					bo.tt    <= move16 ? TT_MOVE16 : fc_tt(m2.r.fc);
 					bo.tm    <= fc_tm(m2.r.fc);
 					bo.upa   <= e_x.upa;
-					bo.ci    <= e_x.cm[1];
+					bo.ci    <= e_x.cm[1] || m2.r.pastc;
 					bo.lock  <= m2.r.lock;
 					bo.locke <= 1'b0;
 					bo.ack   <= m2.r.ack;

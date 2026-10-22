@@ -75,7 +75,12 @@ module ap68040
 	// debug / test
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
-	output logic        dbg_halted
+	output logic        dbg_halted,
+	// for a system's external caches and monitors: VBR (the NMI vector's
+	// address), CACR, and a pulse for every completed CINV/CPUSH
+	output logic [31:0] dbg_vbr,
+	output logic [31:0] dbg_cacr,
+	output logic        dbg_cmaint
 );
 
 // reset synchronizer: two bus clocks, so the reset and the release of the
@@ -230,7 +235,7 @@ logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
-logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older, dm_s1;
+logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_pastc, dm_older, dm_s1;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic        bht_dis;
@@ -257,7 +262,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older), .dm_s1(dm_s1),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_pastc(dm_pastc), .dm_ack(dm_ack), .dm_older(dm_older), .dm_s1(dm_s1),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
@@ -282,7 +287,7 @@ ap68040_dmu #(.DC1_ATC(DC1_ATC)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
-	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
+	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_pastc(dm_pastc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
 	.dm_older(dm_older), .dm_s1(dm_s1),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
@@ -404,5 +409,11 @@ ap68040_useq #(.DUAL(DUAL)) useq (
 	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.uq_n(uq_n), .uq0(uq0), .uq0s(uq0s), .uq_pop(uo_rdy && uq_n != 2'd0)
 );
+
+assign dbg_vbr  = vbr;
+assign dbg_cacr = cacr;
+// (mt_op 1 and 2: MT_CINV and MT_CPUSH of the DMU)
+always_ff @(posedge clk)
+	dbg_cmaint <= nreset && mt_done && (mt_op == 3'd1 || mt_op == 3'd2);
 
 endmodule
