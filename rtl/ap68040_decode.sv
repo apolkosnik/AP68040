@@ -25,7 +25,8 @@
 module ap68040_decode
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
-	parameter bit LOOP_PRED = 1          // the loop exit predictor
+	parameter bit LOOP_PRED = 1,         // the loop exit predictor
+	parameter bit DUAL      = 1          // second-slot companions (see s1_t)
 )
 (
 	input  logic        clk,
@@ -40,6 +41,7 @@ module ap68040_decode
 	input  logic  [7:0] win_fdem,     // the faulted fetch was a demand fetch
 	input  logic  [7:0] win_fatc,     // ... an ATC (MMU) fault
 	input  logic  [7:0] win_bt,       // the word ends a branch the fetch BTB took
+	input  logic  [7:0] win_s1,       // the word is a second-slot operation word
 	input  logic [31:0] bt_tgt,       // its target (the first flagged word's)
 	input  pd_t         pd0,
 	input  pd_t         pd0_n,         // pd0 next cycle (the attribute ROM's address)
@@ -49,6 +51,7 @@ module ap68040_decode
 	input  logic        smode,
 
 	output logic  [2:0] consume,
+	output logic        consume_t,      // ... one word past a BTB-taken branch's end (a companion)
 	output logic        d_redir_v,
 	output logic [31:0] d_redir_pc,
 
@@ -242,7 +245,7 @@ endfunction
 // the head's attributes: a ROM (block RAM) read with the head's entry a
 // cycle ahead, so it lines up with pd0 -- not a 276-entry table in logic
 pla_t a0;
-(* romstyle = "M10K" *) logic [$bits(pla_t)-1:0] attr_rom [0:511];
+(* romstyle = "M10K" *) (* rom_style = "block" *) logic [$bits(pla_t)-1:0] attr_rom [0:511];
 initial begin
 `include "gen/ap68040_attr_rom.svh"
 end
@@ -723,11 +726,26 @@ always_comb begin
 	bt_j = 3'd0;
 	for (int i = 7; i >= 0; i--) if (win_bt[i] && bt_lm[i]) bt_j = 3'(i);
 end
+// A companion: the one-word second-slot instruction right after a fast-
+// path decode, taken with it (consumed in the same cycle, carried in the
+// record), when it is the instruction the front end predicts next: the
+// fall-through when D1 predicts none of its own redirects, or a branch
+// target the fetch BTB took (the words after the branch's end came from
+// there) and D1 agrees.  The word is consumed by the first test alone (a
+// D1 redirect empties the queue anyway), off the record's.
+wire [2:0] c_at = pd0.tot[2:0];
+wire c_cons = DUAL && (ph == PH_IDLE) && pd0.legal && fast &&
+              (pd0.tot <= 4'd6) && (pd0.tot < qcnt) && (nrec.exc == 8'd0) &&
+              win_s1[c_at] && !win_flt[c_at] && !win_bt[c_at] && (!bt_any || bt_end);
+wire c_ok = c_cons && (bt_end ? (nrec.pred && teq) : !nrec.pred);
 // the record as it enters the FIFO: refetched at WB if a flag was inside
 // the instruction (now, or in an earlier part)
 dinst_t nrec_q;
 always_comb begin
 	nrec_q = nrec;
+	nrec_q.c_v   = c_ok;
+	nrec_q.c_opw = win[c_at];
+	nrec_q.c_tk  = bt_end;
 	if (jsr_k && nrec.exc == 8'd0) nrec_q.rt = UA_JSR_K;
 	if (fpg && nrec.exc == 8'd0) nrec_q.rt = fpu_k(nrec.ext1, nrec.ea0.m, nrec.rt);
 	nrec_q.ras.v  = 1'b1;
@@ -833,7 +851,9 @@ always_ff @(posedge clk) begin
 	end
 end
 
-assign consume = fire ? use_n[2:0] : 3'd0;
+// (c_cons: use_n is pd0.tot <= 6, so the sum fits)
+assign consume   = fire ? (use_n[2:0] + {2'd0, c_cons}) : 3'd0;
+assign consume_t = fire && c_cons && bt_end;
 
 always_ff @(posedge clk) begin
 	if (!nreset) begin

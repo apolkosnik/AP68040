@@ -35,6 +35,7 @@ predictor):
 | `EARLY_RES` | 0 | 1: early results in AG (a base or index need not wait for EX) |
 | `DC1_ATC` | 0 | 1: DC1's own ATC read port and a tag compare against all four ATC ways' pages (timing; 0 reads the main port at a registered set) |
 | `SKID` | 0 | 1: a skid register between D2 and AG |
+| `DUAL` | 1 | 1: dual issue -- a second slot beside the uop that ends a single-uop instruction (see Dual issue) |
 | `DIV_STEPS` | 2 | quotient bits per clock of the integer divider (2 or 4) |
 
 What each costs in ALMs and in cycles is measured in STATUS.md.  The
@@ -188,6 +189,53 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   the back-end stages behind it go when it completes at WB, and AG takes
   nothing in between.
 
+### Dual issue (`DUAL`)
+
+A restricted second slot, in the 68060's manner but smaller: the second
+instruction of a pair is a one-word instruction on registers, and the
+first is any single-uop instruction except an FPU, RTE, SR-writing,
+serializing or upd2 one.  The second slot's instructions (`s1_dec`,
+`ap68040_pkg.sv`):
+
+* data registers, in EX by a second ALU (`ap68040_alu1`, the S1_* subset):
+  MOVEQ; ADDQ/SUBQ #q,Dn; ADD/SUB/AND/OR/CMP Dy or Ay,Dx; EOR Dx,Dy; MOVE
+  Dy or Ay,Dx; TST, CLR, NOT, NEG Dn; EXT, EXTB, SWAP;
+* address registers, in AG by a second adder, as the microcode runs them:
+  ADDQ/SUBQ #q,An; MOVEA.W/L Dy or Ay,Ax.
+
+The front end: the fetch marks each queue word that is such an operation
+word (`win_s1`, decoded in F2).  D1 takes the word after a fast-path
+decode with it (the companion: `dinst_t.c_v/c_opw`, consumed in the same
+cycle) when it is the instruction the front end predicts next: the fall-
+through, or the first word of a target the fetch BTB took (D1 agreeing;
+`c_tk`).  D2 issues the companion beside the uop that ends the instruction
+when that uop is the whole instruction, may be paired, and writes no
+register the companion reads or writes; otherwise the companion is a uop
+of its own in the next issue cycle.  Under trace (T1/T0) nothing pairs.
+
+The back end carries the second slot (`s1_t`) in step with the first:
+* AG: its operand A is read as the pair enters AG (read port 5, the
+  cycle's AG and EX writes laid over it, then EX's writes followed); B is
+  read in AG through port 2, the upd2 register's, which the first slot
+  does not use.  An address register form waits, like an AG update, for
+  every older writer of its source and destination, and writes the front
+  file through port 1 (the upd2 port) as the pair leaves AG.
+* DC1, DC2: its operands follow EX's writes as the first slot's do; both
+  slots' writers are interlock sources for younger bases and indexes.
+* EX: the second ALU; a data result goes to the front file through port 1
+  and is broadcast with the first slot's (the two write different
+  registers).  AG holds an upd2 or an address-register second slot while
+  a second slot in EX writes (port 1).  CCR: the second slot's flags over
+  the first's.
+* WB: the second slot commits with the first unless the first takes an
+  exception or redirects (a mispredicted branch, a store into the code
+  ahead): it is then fetched again.  Its result goes to the back file
+  through a third write port; the instruction boundary (interrupts, the
+  stacked PC) is after it, at the first slot's next PC + 2 (the branch's
+  target, for a taken one).
+
+What it costs and gains is in doc/XILINX.md.
+
 ### Register files
 
 D0-D7, A0-A6, USP, ISP, MSP and the microcode temporaries T0-T13.  Two
@@ -195,7 +243,9 @@ copies, both MLAB (`ap68040_rf`, write ports and five read ports through a
 live-value table): the front file (newest values; three write ports: AG's
 two address updates and EX's result) and the back file (architectural; two
 write ports: WB's update and result, or the exception entry's pairs).
-`fv[r]` marks registers whose front copy is current; a redirect or an
+With `DUAL` both have a sixth read port (the second slot's A), the front
+file's port 1 also takes the second slot's writes, and the back file has
+a third write port (the second slot's WB).  `fv[r]` marks registers whose front copy is current; a redirect or an
 exception clears `fv`, so the back file is read again with no copy.
 Exception entry writes the routine's operands (vector address, PC, SR,
 address, format/vector word, SSW, EA, WB3A, WB3D) into the back file over

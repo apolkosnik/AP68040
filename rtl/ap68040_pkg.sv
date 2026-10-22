@@ -106,6 +106,13 @@ localparam logic [2:0] MFC_BKPT = 3'd6;  // breakpoint acknowledge read (TT=3, T
 // control flow
 // internal exception codes of instruction fetch faults (uop.exc); real
 // vectors otherwise.  The back end turns them into vector 2.
+// both caches: four ways of 2**CSB sets of 16-byte lines (CSB 6: 4 Kbytes,
+// the MC68040's; 7: 8 Kbytes), set PA[CSH:4], physically tagged PA[31:CSH+1]
+// (CSB <= 8: the set stays within the 4K page offset, LA = PA there)
+localparam int CSB = 7;
+localparam int CSH = CSB + 3;
+localparam int CTW = 28 - CSB;
+
 // fetch BTB: 2**BTB_AW entries indexed by PC[BTB_AW+1:2], tagged PC[31:BTB_AW+2]
 localparam int BTB_AW = 8;
 localparam int BTB_TW = 30 - BTB_AW;
@@ -270,6 +277,49 @@ typedef struct packed {
 } uop_t;
 
 //--------------------------------------------------------------------------
+// Dual issue: the second slot.  A one-word instruction on data registers
+// that follows a single-uop instruction (D1 takes its operation word with
+// the record: dinst_t.c_v/c_opw) runs beside that uop through the back end,
+// in step with it: it reads at most two registers at AG, has no address,
+// no memory access, no branch and no exception, and its ALU op is one of
+// S1_*.  It is younger than the uop beside it and depends on none of its
+// registers; it commits at WB only when that uop does without a redirect.
+// Address-register forms (agop: ADDQ/SUBQ #q,An, MOVEA Ry,Ax) are AG's, as
+// in the microcode: Ax = a_reg (its low word sign-extended with sxw) + imm,
+// written to the front file as the pair leaves AG and to the back file at
+// WB; in EX they are a MOV of that value with no register write.
+// Loads (ld: MOVE/MOVEA.L/ALU/TST (Ay)) go beside a uop that has no memory
+// access of its own: the pair's access is theirs, at the address a_reg
+// (read at AG as operand A), and the load data is operand A in EX.  Only
+// the data cache's fast path answers it (a hit, nothing in the way): for
+// anything else the DMU reports a fault at once, and WB commits the first
+// slot and fetches the load again, to run alone.
+//--------------------------------------------------------------------------
+localparam logic [3:0]
+	S1_MOV  = 4'd0,  S1_ADD  = 4'd1,  S1_SUB  = 4'd2,  S1_CMP  = 4'd3,
+	S1_AND  = 4'd4,  S1_OR   = 4'd5,  S1_EOR  = 4'd6,  S1_NOT  = 4'd7,
+	S1_NEG  = 4'd8,  S1_CLR  = 4'd9,  S1_EXT  = 4'd10, S1_EXTB = 4'd11,
+	S1_SWAP = 4'd12;
+
+typedef struct packed {
+	logic        v;         // the slot holds an instruction
+	logic  [3:0] op;        // S1_*
+	logic  [1:0] sz;
+	logic  [4:0] ccr_we;    // X N Z V C
+	logic        a_imm;     // operand A is imm (else a_reg, if a_v; else zero)
+	logic        a_v;
+	logic  [4:0] a_reg;
+	logic  [7:0] imm;       // signed
+	logic        b_v;       // operand B is b_reg (else zero)
+	logic  [4:0] b_reg;
+	logic        d_v;       // EX writes d_reg (data register forms)
+	logic  [4:0] d_reg;
+	logic        agop;      // AG writes d_reg (address register forms)
+	logic        sxw;       // ... from a_reg's low word, sign-extended
+	logic        ld;        // a load: operand A is the data at (a_reg)
+} s1_t;
+
+//--------------------------------------------------------------------------
 // Decoded instruction (D1 -> D2)
 //--------------------------------------------------------------------------
 // EA mode index, MC68040 order
@@ -331,6 +381,122 @@ typedef struct packed {
 	logic        bst;     // Bcc: the static prediction (backward taken)
 	logic  [1:0] bhc;     // Bcc: its history counter as D1 read it
 	ras_snap_t   ras;     // D1's return stack before this instruction
+	logic        c_v;     // a companion: the one-word instruction that follows,
+	logic [15:0] c_opw;   // ... its operation word (see s1_t),
+	logic        c_tk;    // ... at the target (a branch the fetch BTB took), else pc + 2 ilen
 } dinst_t;
+
+// the companion's operation word as a second-slot instruction: the same
+// uop the microcode makes of it (the sequencer checks the two agree in
+// simulation for every such instruction it runs from the microcode).
+// v = 0: not one of them.  Register An with n = 7 is given as 7 + 8: the
+// sequencer maps it to USP, ISP or MSP.
+function automatic s1_t s1_dec(input logic [15:0] w);
+	s1_t s;
+	logic [1:0] z;
+	logic [4:0] dx, dy, ry, ay;
+	s = '0;
+	z  = w[7:6];
+	dx = {2'b00, w[11:9]};
+	dy = {2'b00, w[2:0]};
+	ry = {1'b0, w[3], w[2:0]};              // mode 000 Dy, 001 Ay
+	ay = {2'b01, w[2:0]};                   // mode 010 (Ay)
+	s.imm = w[7:0];
+	case (w[15:12])
+		4'h7: if (!w[8]) begin                                   // MOVEQ
+			s.v = 1'b1; s.op = S1_MOV; s.sz = SZ_L; s.ccr_we = 5'h0F;
+			s.a_imm = 1'b1; s.d_v = 1'b1; s.d_reg = dx;
+		end
+		4'h5: if (z != 2'd3 && w[5:3] == 3'd0) begin            // ADDQ/SUBQ #q,Dy
+			s.v = 1'b1; s.op = w[8] ? S1_SUB : S1_ADD; s.sz = z; s.ccr_we = 5'h1F;
+			s.a_imm = 1'b1; s.imm = (w[11:9] == 3'd0) ? 8'd8 : {5'd0, w[11:9]};
+			s.b_v = 1'b1; s.b_reg = dy; s.d_v = 1'b1; s.d_reg = dy;
+		end
+		else if ((z == SZ_W || z == SZ_L) && w[5:3] == 3'd1) begin   // ADDQ/SUBQ #q,Ay
+			logic [7:0] q;
+			q = (w[11:9] == 3'd0) ? 8'd8 : {5'd0, w[11:9]};
+			s.v = 1'b1; s.agop = 1'b1; s.op = S1_MOV; s.sz = SZ_L;
+			s.a_v = 1'b1; s.a_reg = ry; s.imm = w[8] ? -q : q; s.d_reg = ry;
+		end
+		4'h8, 4'h9, 4'hB, 4'hC, 4'hD:
+			if (z != 2'd3 && !w[8] &&
+			    (w[5:3] == 3'd0 || w[5:3] == 3'd2 ||
+			     (w[5:3] == 3'd1 && z != SZ_B && (w[15:12] == 4'h9 || w[15:12] == 4'hB || w[15:12] == 4'hD)))) begin
+				// OR/SUB/CMP/AND/ADD Dy, Ay or (Ay),Dx
+				s.v = 1'b1; s.sz = z;
+				case (w[15:12])
+					4'h8: begin s.op = S1_OR;  s.ccr_we = 5'h0F; end
+					4'h9: begin s.op = S1_SUB; s.ccr_we = 5'h1F; end
+					4'hB: begin s.op = S1_CMP; s.ccr_we = 5'h0F; end
+					4'hC: begin s.op = S1_AND; s.ccr_we = 5'h0F; end
+					default: begin s.op = S1_ADD; s.ccr_we = 5'h1F; end
+				endcase
+				s.a_v = 1'b1; s.a_reg = ry; s.b_v = 1'b1; s.b_reg = dx;
+				s.d_v = (w[15:12] != 4'hB); s.d_reg = dx;
+				if (w[5:3] == 3'd2) begin s.ld = 1'b1; s.a_reg = ay; end
+			end
+			else if (w[15:12] == 4'hB && z != 2'd3 && w[8] && w[5:3] == 3'd0) begin
+				// EOR Dx,Dy
+				s.v = 1'b1; s.op = S1_EOR; s.sz = z; s.ccr_we = 5'h0F;
+				s.a_v = 1'b1; s.a_reg = dx; s.b_v = 1'b1; s.b_reg = dy;
+				s.d_v = 1'b1; s.d_reg = dy;
+			end
+		4'h1, 4'h2, 4'h3:                                         // MOVE Dy/Ay,Dx
+			if (w[8:6] == 3'd1 && w[15:12] != 4'h1 && w[5:4] == 2'd0) begin
+				// MOVEA Dy/Ay,Ax
+				s.v = 1'b1; s.agop = 1'b1; s.op = S1_MOV; s.sz = SZ_L;
+				s.a_v = 1'b1; s.a_reg = ry; s.imm = 8'd0; s.sxw = (w[15:12] == 4'h3);
+				s.d_reg = {2'b01, w[11:9]};
+			end
+			else if (w[8:6] == 3'd0 && (w[5:3] == 3'd0 || (w[5:3] == 3'd1 && w[15:12] != 4'h1))) begin
+				s.v = 1'b1; s.op = S1_MOV; s.ccr_we = 5'h0F;
+				s.sz = (w[15:12] == 4'h1) ? SZ_B : (w[15:12] == 4'h3) ? SZ_W : SZ_L;
+				s.a_v = 1'b1; s.a_reg = ry;
+				s.b_v = 1'b1; s.b_reg = dx;
+				s.d_v = 1'b1; s.d_reg = dx;
+			end
+			else if (w[8:6] == 3'd0 && w[5:3] == 3'd2) begin        // MOVE (Ay),Dx
+				s.v = 1'b1; s.ld = 1'b1; s.op = S1_MOV; s.ccr_we = 5'h0F;
+				s.sz = (w[15:12] == 4'h1) ? SZ_B : (w[15:12] == 4'h3) ? SZ_W : SZ_L;
+				s.a_v = 1'b1; s.a_reg = ay;
+				s.b_v = 1'b1; s.b_reg = dx;
+				s.d_v = 1'b1; s.d_reg = dx;
+			end
+			else if (w[8:6] == 3'd1 && w[15:12] == 4'h2 && w[5:3] == 3'd2) begin   // MOVEA.L (Ay),Ax
+				s.v = 1'b1; s.ld = 1'b1; s.op = S1_MOV; s.sz = SZ_L;
+				s.a_v = 1'b1; s.a_reg = ay;
+				s.d_v = 1'b1; s.d_reg = {2'b01, w[11:9]};
+			end
+		4'h4: if (w[5:3] == 3'd2) begin
+			if (w[11:8] == 4'hA && z != 2'd3) begin                  // TST (Ay)
+				s.v = 1'b1; s.ld = 1'b1; s.op = S1_MOV; s.sz = z; s.ccr_we = 5'h0F;
+				s.a_v = 1'b1; s.a_reg = ay;
+			end
+		end
+		else if (w[5:3] == 3'd0) begin
+			if (w[11:8] == 4'hA && z != 2'd3) begin                  // TST Dy
+				s.v = 1'b1; s.op = S1_MOV; s.sz = z; s.ccr_we = 5'h0F;
+				s.a_v = 1'b1; s.a_reg = dy;
+			end
+			else if ((w[11:8] == 4'h2 || w[11:8] == 4'h4 || w[11:8] == 4'h6) && z != 2'd3) begin
+				// CLR / NEG / NOT Dy
+				s.v = 1'b1; s.sz = z;
+				s.op = (w[11:8] == 4'h2) ? S1_CLR : (w[11:8] == 4'h4) ? S1_NEG : S1_NOT;
+				s.ccr_we = (w[11:8] == 4'h4) ? 5'h1F : 5'h0F;
+				s.b_v = 1'b1; s.b_reg = dy; s.d_v = 1'b1; s.d_reg = dy;
+			end
+			else if (w[11:6] == 6'b100010 || w[11:6] == 6'b100011 || w[11:6] == 6'b100111 ||
+			         w[11:6] == 6'b100001) begin
+				// EXT.W, EXT.L, EXTB.L, SWAP Dy
+				s.v = 1'b1; s.ccr_we = 5'h0F;
+				s.op = (w[8:6] == 3'd7) ? S1_EXTB : (w[8:6] == 3'd1) ? S1_SWAP : S1_EXT;
+				s.sz = (w[8:6] == 3'd2 || w[8:6] == 3'd1) ? SZ_W : SZ_L;
+				s.b_v = 1'b1; s.b_reg = dy; s.d_v = 1'b1; s.d_reg = dy;
+			end
+		end
+		default: ;
+	endcase
+	s1_dec = s;
+endfunction
 
 endpackage

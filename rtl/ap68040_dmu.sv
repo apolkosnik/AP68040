@@ -5,8 +5,9 @@
 //                                                                          //
 // Mirrors the back end's DC1, DC2, EX and WB stages for memory uops.       //
 //                                                                          //
-// Data cache (MC68040UM section 4): 4 Kbytes, four ways of 64 sets of     //
-// 16-byte lines, physically tagged (PA31-10; the set is PA9-4 = LA9-4).    //
+// Data cache (MC68040UM section 4): four ways of 2**CSB sets of 16-byte   //
+// lines (pkg: 8 Kbytes; the 68040's 4 with CSB 6), physically tagged      //
+// (PA31-CSH+1; the set is PA[CSH:4] = LA[CSH:4]).                          //
 // A valid and a dirty bit per line; replacement takes the first invalid   //
 // way, else a 2-bit counter.  Copyback and write-through cachable,        //
 // serialized and nonserialized cache-inhibited modes.  Read-modify-write  //
@@ -75,6 +76,7 @@ module ap68040_dmu
 	input  logic  [1:0] dm_ack,         // acknowledge cycle: 1 IACK, 2 BKPT
 	input  logic  [2:0] iack_lvl,
 	input  logic        dm_older,       // uops older than DC2 still in EX or WB
+	input  logic        dm_s1,          // DC2's load is a second slot's: the fast path only
 	input  logic        adv_dc1,
 	input  logic        adv_dc2,
 	input  logic        adv_ex,
@@ -301,19 +303,19 @@ endfunction
 // engine's or the snoop's (valid; a snoop freezes the engine), at the
 // scan's (dirty), and at the write's set, which forms the word written
 // (the ways not written keep their bits).  A clear of every line (CINVA,
-// reset) sweeps the 64 sets (E_M_CLR)
-(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lsd [64];    // DC1's set
-(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lse [64];    // lv_ra
-(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lsw [64];    // the write's set
-logic  [5:0] lv_ra;                // the engine copy's read: see below
+// reset) sweeps the sets (E_M_CLR)
+(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lsd [1<<CSB];    // DC1's set
+(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lse [1<<CSB];    // lv_ra
+(* ramstyle = "MLAB, no_rw_check" *) logic [7:0] lsw [1<<CSB];    // the write's set
+logic [CSB-1:0] lv_ra;                // the engine copy's read: see below
 wire   [3:0] lvd_q;                // DC1's set (m1)
 wire   [3:0] lve_q;                // the engine's (or the snoop's) set
-logic  [5:0] clr_i;                // the clear sweep's set
+logic [CSB-1:0] clr_i;                // the clear sweep's set
 logic        clr_rst;              // ... after reset (else CINVA: then E_M_IC)
 // synthesis translate_off
-logic [3:0]  lv  [64];              // (simulation: the flip-flop model, checked)
+logic [3:0]  lv  [1<<CSB];          // (simulation: the flip-flop model, checked)
 // synthesis translate_off
-initial for (int i = 0; i < 64; i++) lv[i] = 4'd0;
+initial for (int i = 0; i < (1 << CSB); i++) lv[i] = 4'd0;
 // synthesis translate_on
 // synthesis translate_on
 // dirty [set][way] (the push writes the whole line): read at the scan's
@@ -321,12 +323,12 @@ initial for (int i = 0; i < 64; i++) lv[i] = 4'd0;
 // (they never read at once: a snoop freezes the engine).  No clear: every
 // read is of a valid line, and whatever makes a line valid writes its
 // dirty bit
-logic  [5:0] ld_ra;
+logic [CSB-1:0] ld_ra;
 wire   [7:0] lsm_q = lse[lv_ra];
 wire   [3:0] ld_q  = lsm_q[7:4];
 // the maintenance scan's set, its valid and dirty bits: a copy the write
 // port keeps current (the scan's decision reads 4 bits, not 256)
-logic  [5:0] sc_set;
+logic [CSB-1:0] sc_set;
 logic  [3:0] sc_lv, sc_ld;
 logic [1:0]  rrc;                  // replacement counter
 
@@ -334,7 +336,7 @@ logic [1:0]  rrc;                  // replacement counter
 logic        steal, steal_q;
 logic [31:0] st_la;                // engine lookup address (logical, for the ATC)
 logic        st_fc2;
-logic  [5:0] st_set;               // engine data/tag set
+logic [CSB-1:0] st_set;               // engine data/tag set
 
 // snoop port phases: A presents the snooped set, B compares, H holds the
 // cache for the snooper's action, R re-reads the owner's address
@@ -354,22 +356,22 @@ logic  [3:0] bo_got;               // a line read: the long words that arrived
 // The lookup set: AG's address (late: register read, address adders)
 // passes one LUT; the other choices are registers, merged beforehand.
 // Each way's RAMs get their own copy of that LUT (fanout 18, not 72).
-wire  [5:0] la_alt   = sn_rset ? sn_pa[9:4] : steal ? st_set : m1.a[9:4];
+wire [CSB-1:0] la_alt = sn_rset ? sn_pa[CSH:4] : steal ? st_set : m1.a[CSH:4];
 wire        la_ag    = adv_ag && !sn_rset && !steal;
 
 // tags: port A for lookups (DC1 or stolen), port B for engine reads/writes
-logic [21:0] tq_a [4];
+logic [CTW-1:0] tq_a [4];
 // the tags as the RAM read them, without the same-edge write laid over:
 // DC1's compare.  Tags are written only by the engine's fill (tw_b), and a
 // DC1 lookup with the engine busy is stale (m1_stale) and not used, so the
 // bypass's compare and multiplexer stay off DC1's hit
-logic [21:0] tq_r [4];
+logic [CTW-1:0] tq_r [4];
 logic        m1_stale;          // DC1's lookup is not to be used (below)
-logic [21:0] tq_b [4];
+logic [CTW-1:0] tq_b [4];
 logic        tw_b;
-logic  [5:0] tset_b;
+logic [CSB-1:0] tset_b;
 logic  [1:0] tway_b;
-logic [21:0] twd_b;
+logic [CTW-1:0] twd_b;
 
 // data: write port for stores and fills, read port for DC1 / engine
 logic  [63:0] dqc;                 // DC1's two long words, every clock
@@ -379,7 +381,7 @@ logic         dq_new;              // DC2 took a new uop at the last edge: dqc
 xres_t        x_dc1;               // DC1's translation and lookup
 logic [127:0] dq_rn [4];           // unregistered output (engine)
 logic         dw;
-logic  [5:0]  dw_set;
+logic [CSB-1:0] dw_set;
 logic  [1:0]  dw_way;
 logic [15:0]  dw_be;
 logic  [1:0]  dw_src;              // 0 dw_word on every long word, 1 bo_line, 2 pv_line
@@ -387,7 +389,7 @@ logic [31:0]  dw_word;
 logic [127:0] dw_wdata;
 // the previous cycle's RAM write (it landed at the last edge)
 logic         dwq;
-logic  [5:0]  dwq_set;
+logic [CSB-1:0] dwq_set;
 logic  [1:0]  dwq_way, dwq_src;
 logic [15:0]  dwq_be;
 logic [31:0]  dwq_word;
@@ -421,7 +423,7 @@ endfunction
 // the WB fast store of this cycle (its RAM write is dw next cycle): merged
 // into DC2's copy now, so a load behind it does not wait for that write
 logic         wfm;
-logic  [5:0]  wfm_set;
+logic [CSB-1:0] wfm_set;
 logic  [1:0]  wfm_way;
 logic [15:0]  wfm_be;
 logic [31:0]  wfm_word;
@@ -430,14 +432,14 @@ logic         dwp;            // this cycle's dw was merged a cycle ago (wfm)
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
-		(* keep *) wire [5:0] la_set_n = la_ag ? dm_va[9:4] : la_alt;
-		ap68040_tdp #(.AW(6), .DW(22)) tag (
+		(* keep *) wire [CSB-1:0] la_set_n = la_ag ? dm_va[CSH:4] : la_alt;
+		ap68040_tdp #(.AW(CSB), .DW(CTW)) tag (
 			.clk(clk),
-			.addr_a(la_set_n), .we_a(1'b0), .wd_a(22'd0), .q_a(tq_a[gw]),
+			.addr_a(la_set_n), .we_a(1'b0), .wd_a('0), .q_a(tq_a[gw]),
 			.qa_raw(tq_r[gw]), .qa_bv(), .qa_bd(),
 			.addr_b(tset_b), .we_b(tw_b && tway_b == 2'(gw)), .wd_b(twd_b), .q_b(tq_b[gw])
 		);
-		ap68040_sdp_be #(.AW(6), .NB(16), .OREG(0)) dat (
+		ap68040_sdp_be #(.AW(CSB), .NB(16), .OREG(0)) dat (
 			.clk(clk),
 			.we(dw && dw_way == 2'(gw)), .waddr(dw_set), .wbe(dw_be), .wdata(dw_wdata),
 			.raddr(la_set_n), .oce(1'b1), .q(dq_rn[gw])
@@ -467,16 +469,16 @@ always_ff @(posedge clk) begin
 	l = '0;
 	for (int j = 0; j < 4; j++) if (d1_mj[j]) l = l | pair(dq_rn[j], m1.a[3:2]);
 	dqc <= l;
-	mc_v[0] <= dwq && dwq_src == 2'd0 && dwq_set == m1.a[9:4] && d1_mj[dwq_way];
-	mc_v[1] <= dw && dw_src == 2'd0 && dw_set == m1.a[9:4] && d1_mj[dw_way];
-	mc_v[2] <= wfm && wfm_set == m1.a[9:4] && d1_mj[wfm_way];
+	mc_v[0] <= dwq && dwq_src == 2'd0 && dwq_set == m1.a[CSH:4] && d1_mj[dwq_way];
+	mc_v[1] <= dw && dw_src == 2'd0 && dw_set == m1.a[CSH:4] && d1_mj[dw_way];
+	mc_v[2] <= wfm && wfm_set == m1.a[CSH:4] && d1_mj[wfm_way];
 	mc_be[0] <= dwq_be; mc_w[0] <= dwq_word;
 	mc_be[1] <= dw_be;  mc_w[1] <= dw_word;
 	mc_be[2] <= wfm_be; mc_w[2] <= wfm_word;
 	h2 = dq2;
-	if (dw && dw_src == 2'd0 && dw_set == m2.r.a[9:4] && dw_way == m2.x.way)
+	if (dw && dw_src == 2'd0 && dw_set == m2.r.a[CSH:4] && dw_way == m2.x.way)
 		h2 = mrg2(h2, m2.r.a[3:2], dw_be, dw_word);
-	if (wfm && wfm_set == m2.r.a[9:4] && wfm_way == m2.x.way)
+	if (wfm && wfm_set == m2.r.a[CSH:4] && wfm_way == m2.x.way)
 		h2 = mrg2(h2, m2.r.a[3:2], wfm_be, wfm_word);
 	dqh2 <= h2;
 	dq_new <= adv_dc1;
@@ -533,12 +535,12 @@ ap68040_atc #(.SAME_SEARCH(0), .EXT_SET(1)) datc (
 function automatic xres_t xlate(input logic [31:0] la, input logic s, input logic wr,
                                 input logic alt,
                                 input logic hitv, input atce_t e,
-                                input logic [21:0] t0, input logic [21:0] t1,
-                                input logic [21:0] t2, input logic [21:0] t3,
+                                input logic [CTW-1:0] t0, input logic [CTW-1:0] t1,
+                                input logic [CTW-1:0] t2, input logic [CTW-1:0] t3,
                                 input logic [3:0] valid);
 	xres_t x;
 	logic tt0, tt1;
-	logic [21:0] tg;
+	logic [CTW-1:0] tg;
 	x = '0;
 	tt0 = ttr_hit(dtt0, la, s);
 	tt1 = ttr_hit(dtt1, la, s);
@@ -573,7 +575,7 @@ function automatic xres_t xlate(input logic [31:0] la, input logic s, input logi
 		else x.ok = 1'b1;
 	end
 	else x.walk = 1'b1;
-	tg = x.pa[31:10];
+	tg = x.pa[31:CSH+1];
 	if (x.ok && !x.flt) begin
 		if (valid[0] && t0 == tg) begin x.hit = 1'b1; x.way = 2'd0; end
 		if (valid[1] && t1 == tg) begin x.hit = 1'b1; x.way = 2'd1; end
@@ -607,7 +609,7 @@ function automatic logic transp_of(input logic [31:0] a, input logic s, input lo
 endfunction
 always_comb begin
 	logic        transp;
-	logic [21:0] tq [4];
+	logic [CTW-1:0] tq [4];
 	logic  [3:0] mj;
 	tq[0] = tq_r[0]; tq[1] = tq_r[1]; tq[2] = tq_r[2]; tq[3] = tq_r[3];
 	transp = m1_tp;
@@ -615,19 +617,19 @@ always_comb begin
 		logic ma;
 		ma = 1'b0;
 		for (int i = 0; i < 4; i++)
-			if (atc_hvd[i] && tq[j] == {atc_wpad[i][19:1], tc_p ? m1.a[12] : atc_wpad[i][0], m1.a[11:10]})
+			if (atc_hvd[i] && tq[j] == {atc_wpad[i][19:1], tc_p ? m1.a[12] : atc_wpad[i][0], m1.a[11:CSH+1]})
 				ma = 1'b1;
-		mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:10]) : ma);
+		mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:CSH+1]) : ma);
 	end
 	if (!DC1_ATC) begin
 		// the main port's entry (its hit and page), compared with each way's
 		// tag beside the untranslated address: the registered transparency
 		// selects, so the TTR compare and the translation's address select
 		// stay off the tag compare
-		logic [21:0] tpa;
-		tpa = {atc_e.pa[19:1], tc_p ? m1.a[12] : atc_e.pa[0], m1.a[11:10]};
+		logic [CTW-1:0] tpa;
+		tpa = {atc_e.pa[19:1], tc_p ? m1.a[12] : atc_e.pa[0], m1.a[11:CSH+1]};
 		for (int j = 0; j < 4; j++)
-			mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:10]) : (atc_hit && tq[j] == tpa));
+			mj[j] = lvd_q[j] && (transp ? (tq[j] == m1.a[31:CSH+1]) : (atc_hit && tq[j] == tpa));
 	end
 	d1_hit = |mj;
 	d1_way = mj[3] ? 2'd3 : mj[2] ? 2'd2 : mj[1] ? 2'd1 : 2'd0;
@@ -673,7 +675,7 @@ always_comb begin
 end
 wire  [4:0] m1_end   = {1'b0, m1.a[3:0]} + {2'b00, nbytes(m1.msz)};
 wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
-wire  [7:0] lsd_q    = lsd[m1.a[9:4]];
+wire  [7:0] lsd_q    = lsd[m1.a[CSH:4]];
 wire        m1_sfast = ((m1.mem == M_LD) || (m1.mem == M_ST && x_dc1.cm == 2'b01)) &&
                        m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
                        !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) && !m1.lock;
@@ -715,7 +717,7 @@ wire st_older = (m3.r.v && (m3.r.mem == M_ST || m3.r.mem == M_RMW)) ||
 // read the RAM makes the captured line stale: the engine reads it again
 
 // (a store that left WB is still being written this cycle: dw)
-wire fast_now = m2.r.v && m2.fast && !hzf && !(dw && !dwp && dw_set == m2.r.a[9:4]);
+wire fast_now = m2.r.v && m2.fast && !hzf && !(dw && !dwp && dw_set == m2.r.a[CSH:4]);
 // (the operand from DC2's two long words: its bytes start at a[1:0] of the
 // first; a split load's bytes past the line are masked by its user)
 wire [31:0] fast_data = take({dq2, 64'd0}, {2'd0, m2.r.a[1:0]}, nbytes(m2.r.msz));
@@ -737,7 +739,7 @@ typedef enum logic [5:0] {
 	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE, E_M_CLR,
 	E_FILL, E_FILLW, E_FILL_W, E_FILL_INS, E_PUSHV, E_PUSHVW, E_PUSHV_W, E_PUSHV_B,
 	E_BUS, E_BUS_W,
-	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
+	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DESCW2, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
 	E_TW_LKW, E_TW_DONE,
 	E_I_DONE
 } est_t;
@@ -792,14 +794,14 @@ logic  [2:0] bo_pn;               // bytes in the piece on the bus
 logic [31:0] bo_pa;               // address of the piece on the bus
 
 // fill/push state
-logic  [5:0] f_set;
+logic [CSB-1:0] f_set;
 // the dirty RAM's one read: the snoop's compare, the scan's set, else the
 // fill/push set
 // (the dirty bits share the valid copy's read: the states that read
 // one and not the other are given the other's set)
 always_comb ld_ra = lv_ra;
 logic  [1:0] f_way;
-logic [21:0] f_tag;
+logic [CTW-1:0] f_tag;
 logic        pv_v;                // push buffer holds a dirty line
 logic [127:0] pv_line;
 logic [27:0] pv_lpa;              // its line address
@@ -816,7 +818,7 @@ logic [127:0] mv_line;            // MOVE16 line buffer
 assign dw_wdata = (dw_src == 2'd1) ? bo_line : (dw_src == 2'd2) ? pv_line : {4{dw_word}};
 
 // maintenance scan
-logic  [7:0] ms_i;                // set*4 + way
+logic [CSB+1:0] ms_i;              // set*4 + way
 
 // table walk state
 typedef enum logic [1:0] { TW_ROOT, TW_PTR, TW_PAGE, TW_IND } twl_t;
@@ -865,12 +867,12 @@ function automatic logic [1:0] victim(input logic [3:0] valid, input logic [1:0]
 endfunction
 
 // a line targeted by a store still in EX/WB is never evicted
-function automatic logic store_holds(input logic [5:0] set, input logic [1:0] way,
+function automatic logic store_holds(input logic [CSB-1:0] set, input logic [1:0] way,
                                      input mrec_t a, input mrec_t b);
 	store_holds = (a.r.v && (a.r.mem == M_ST || a.r.mem == M_RMW) && a.x.hit &&
-	               a.x.pa[9:4] == set && a.x.way == way) ||
+	               a.x.pa[CSH:4] == set && a.x.way == way) ||
 	              (b.r.v && (b.r.mem == M_ST || b.r.mem == M_RMW) && b.x.hit &&
-	               b.x.pa[9:4] == set && b.x.way == way);
+	               b.x.pa[CSH:4] == set && b.x.way == way);
 endfunction
 
 // SSW of an access error (MC68040UM figure 8-6): ATC (an ATC fault, clear
@@ -900,7 +902,7 @@ wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
 assign wfm      = wb_fast && !sn_frz;
-assign wfm_set  = m4.x.pa[9:4];
+assign wfm_set  = m4.x.pa[CSH:4];
 assign wfm_way  = m4.x.way;
 assign wfm_be   = wbf_be;
 assign wfm_word = wbf_word;
@@ -916,7 +918,7 @@ wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
 
 // a fast load behind an older store to its line waits for it (merged into
 // its copy) instead of taking the engine
-wire fast_wait = m2.r.v && m2.fast && (hzf || (dw && !dwp && dw_set == m2.r.a[9:4]));
+wire fast_wait = m2.r.v && m2.fast && (hzf || (dw && !dwp && dw_set == m2.r.a[CSH:4]));
 // (not while an older store is in EX: it reaches WB, which has the engine
 // first, before DC2's job -- the bus sees a store before a younger load's
 // access, whatever the timing)
@@ -924,6 +926,15 @@ wire ex_st    = m3.r.v && (m3.r.mem != M_LD);
 wire dc2_slow = m2.r.v && !fast_now && !fast_wait && !(st_simple && !e_job) && !e_dc2_done && !e_job &&
                 !ex_st;
 wire wb_slow  = wb_st && !wb_fast && !wb_fs && !wfs_p1 && !e_wst_done;
+// A second slot's load is answered by the fast path or not at all: what
+// would take the engine -- a miss, a noncachable or split access, a table
+// search, a fault -- ends it with a fault at once, which the back end
+// takes as the signal to run it again alone (no bus or ATC activity, so
+// nothing the 68040 would not have done)
+logic s1_rep;
+always_ff @(posedge clk)
+	if (!nreset || adv_dc2 || kill_now) s1_rep <= 1'b0;
+	else if (dm_s1 && dc2_slow) s1_rep <= 1'b1;
 
 // store ready: the fast store answers in its own WB cycle (the engine's
 // stores through the registered pulse)
@@ -985,7 +996,7 @@ logic  [1:0] tw_hwq;
 always_comb begin
 	tw_hw_h = 1'b0; tw_hw_w = 2'd0;
 	for (int i = 0; i < 4; i++)
-		if (lve_q[i] && tq_b[i] == tw_da[31:10]) begin tw_hw_h = 1'b1; tw_hw_w = 2'(i); end
+		if (lve_q[i] && tq_b[i] == tw_da[31:CSH+1]) begin tw_hw_h = 1'b1; tw_hw_w = 2'(i); end
 end
 // the data RAM's way for the engine's line readers, one select (and one
 // line multiplexer) for them, every input a flip-flop: the snooper's way
@@ -1076,7 +1087,7 @@ always_ff @(posedge clk) begin
 		// the valid/dirty write port: at most one writer per cycle (the
 		// WB fast store runs only with the engine idle, the snoop port
 		// only with it frozen), applied at the end of this block
-		logic [5:0] vp_set;
+		logic [CSB-1:0] vp_set;
 		logic [3:0] vp_wm;               // ways written
 		logic       vp_lwe, vp_lv;       // valid: write, value
 		logic       vp_dwe, vp_dv;       // dirty: write, value
@@ -1099,13 +1110,13 @@ always_ff @(posedge clk) begin
 			m1.ack     <= dm_ack;
 			m1_tp      <= transp_of(dm_va, dm_super, dm_fc, dm_ack);
 			m1_aset    <= tc_p ? dm_va[16:13] : dm_va[15:12];
-			m1_stale   <= (dw && dw_src != 2'd0 && dw_set == dm_va[9:4]) || !e_quiet;
+			m1_stale   <= (dw && dw_src != 2'd0 && dw_set == dm_va[CSH:4]) || !e_quiet;
 		end
 		else begin
 			if (adv_dc1) m1.v <= 1'b0;
 			m1_tp <= transp_of(m1.a, m1.smode, m1.fc, m1.ack);
 			m1_aset <= tc_p ? m1.a[16:13] : m1.a[15:12];
-			if ((dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) || !e_quiet) m1_stale <= 1'b1;
+			if ((dw && dw_src != 2'd0 && dw_set == m1.a[CSH:4]) || !e_quiet) m1_stale <= 1'b1;
 			// held, the RAMs and the ATC read DC1's own set again every
 			// clock (la_alt): a clock with the engine quiet and no write to
 			// that set makes the lookup good again from the next one
@@ -1117,19 +1128,19 @@ always_ff @(posedge clk) begin
 			m2.x     <= x_dc1;
 			m2.split <= m1_split;
 			m2.x1    <= '0;
-			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
+			m2.fast  <= m1_fast && !m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[CSH:4]) &&
 			            (e_st == E_IDLE);
 			// (a store reads nothing: the copy's state does not matter; its
 			// first part's lookup is trusted as the general path does)
 			m2.sfast <= m1_sfast && (m1.mem == M_ST ||
-			            (!m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[9:4]) &&
+			            (!m1_stale && !(dw && dw_src != 2'd0 && dw_set == m1.a[CSH:4]) &&
 			             (e_st == E_IDLE)));
 		end
 		else begin
 			if (adv_dc2) m2.r.v <= 1'b0;
-			if ((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || (e_st != E_IDLE)) m2.fast <= 1'b0;
+			if ((dw && dw_src != 2'd0 && dw_set == m2.r.a[CSH:4]) || (e_st != E_IDLE)) m2.fast <= 1'b0;
 			// its own split lookup (a read) leaves the copy as it was
-			if (((dw && dw_src != 2'd0 && dw_set == m2.r.a[9:4]) || !e_quiet) && m2.r.mem != M_ST)
+			if (((dw && dw_src != 2'd0 && dw_set == m2.r.a[CSH:4]) || !e_quiet) && m2.r.mem != M_ST)
 				m2.sfast <= 1'b0;
 		end
 
@@ -1149,12 +1160,12 @@ always_ff @(posedge clk) begin
 		//--------------------------------------------------------------
 		if (wb_fast && !sn_frz) begin
 			dw      <= 1'b1;
-			dw_set  <= m4.x.pa[9:4];
+			dw_set  <= m4.x.pa[CSH:4];
 			dw_way  <= m4.x.way;
 			dw_be   <= wbf_be;
 			dw_src  <= 2'd0;
 			dw_word <= wbf_word;
-			vp_set = m4.x.pa[9:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+			vp_set = m4.x.pa[CSH:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 			// answered this cycle: kept only if WB does not move
 			st_rdy_r   <= !adv_wb;
 			st_fault_r <= 1'b0;
@@ -1162,24 +1173,24 @@ always_ff @(posedge clk) begin
 		end
 		if (wb_fs && !sn_frz) begin
 			dw      <= 1'b1;
-			dw_set  <= m4.x.pa[9:4];
+			dw_set  <= m4.x.pa[CSH:4];
 			dw_way  <= m4.x.way;
 			dw_be   <= bmask(m4.r.a[3:0], wfs_n0);
 			dw_src  <= 2'd0;
 			dw_word <= lanes32(wfs_acc, m4.r.a[1:0]);
-			vp_set = m4.x.pa[9:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+			vp_set = m4.x.pa[CSH:4]; vp_wm[m4.x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 			wfs_p1  <= 1'b1;
 		end
 		if (wfs_p1 && !sn_frz) begin
 			wfs_p1 <= 1'b0;
 			if (m4.x1.hit) begin
 				dw      <= 1'b1;
-				dw_set  <= m4.x1.pa[9:4];
+				dw_set  <= m4.x1.pa[CSH:4];
 				dw_way  <= m4.x1.way;
 				dw_be   <= bmask(4'd0, nbytes(m4.r.msz) - wfs_n0);
 				dw_src  <= 2'd0;
 				dw_word <= lanes32(wfs_acc << (8 * wfs_n0), 2'd0);
-				vp_set = m4.x1.pa[9:4]; vp_wm[m4.x1.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+				vp_set = m4.x1.pa[CSH:4]; vp_wm[m4.x1.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 				st_rdy_r   <= !adv_wb;
 				st_fault_r <= 1'b0;
 				e_wst_done <= !adv_wb;
@@ -1200,8 +1211,8 @@ always_ff @(posedge clk) begin
 		// the walk's line compare, registered (see tw_hhq)
 		tw_hhq <= tw_hw_h;
 		tw_hwq <= tw_hw_w;
-		tw_hvq <= tw_busy && !sn_frz && (f_set == tw_da[9:4]);
-		if (tw_busy) f_set <= tw_da[9:4];   // (lv_ra: the walk's set)
+		tw_hvq <= tw_busy && !sn_frz && (f_set == tw_da[CSH:4]);
+		if (tw_busy) f_set <= tw_da[CSH:4];   // (lv_ra: the walk's set)
 
 		//--------------------------------------------------------------
 		// engine (frozen while the snooper has the cache)
@@ -1223,7 +1234,7 @@ always_ff @(posedge clk) begin
 				e_st <= E_M_START;
 			else if (wb_slow)
 				e_st <= E_W_START;
-			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now)
+			else if (((dc2_slow && !dm_s1) || (e_job && m2.r.v && !e_dc2_done)) && !kill_now)
 				e_st <= E_S_START;
 			else if (iw_req && !iw_done) begin
 				e_ret <= E_I_DONE;
@@ -1254,7 +1265,7 @@ always_ff @(posedge clk) begin
 				steal  <= 1'b1;
 				st_la  <= {m2.r.a[31:4] + 28'd1, 4'd0};
 				st_fc2 <= m2.r.smode;
-				st_set <= m2.r.a[9:4] + 6'd1;
+				st_set <= m2.r.a[CSH:4] + 1'd1;
 				e_st   <= E_SP_W;
 			end
 			else
@@ -1274,7 +1285,7 @@ always_ff @(posedge clk) begin
 			else if (!e_kill && m2.sfast && m2.r.mem == M_LD && e_x.ok && !e_x.flt && !e_x.walk &&
 			    e_x.hit && !e_x.cm[1] &&
 			    !hz && !st_line(m3, e_x.pa[31:4]) && !st_line(m4, e_x.pa[31:4]) &&
-			    !sp_dw && !(dw && (dw_set == m2.r.a[9:4] || dw_set == st_set))) begin
+			    !sp_dw && !(dw && (dw_set == m2.r.a[CSH:4] || dw_set == st_set))) begin
 				// the first part from DC2's copy, the rest from the stolen read
 				// (DC2's bytes are fast_data's: its low bytes, past the
 				// line, give way to the stolen read's)
@@ -1308,7 +1319,7 @@ always_ff @(posedge clk) begin
 			steal  <= 1'b1;
 			st_la  <= e_va;
 			st_fc2 <= m2.r.smode;
-			st_set <= e_va[9:4];
+			st_set <= e_va[CSH:4];
 			e_st   <= E_S_XLW;
 		end
 		E_S_XLW: e_st <= E_S_XL2;      // the RAMs register the stolen address
@@ -1411,7 +1422,7 @@ always_ff @(posedge clk) begin
 				// write replaces all of it, 4.3.2) -- unless the data cache
 				// is disabled, which leaves its contents alone
 				if (e_x.hit && dc_en) begin
-					vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1;
+					vp_set = e_va[CSH:4]; vp_wm[e_x.way] = 1'b1;
 					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 					e_x.hit <= 1'b0;
 				end
@@ -1420,8 +1431,8 @@ always_ff @(posedge clk) begin
 			else if (m2.r.mem == M_ST) begin
 				// a store: a copyback miss allocates the line for WB
 				if (alloc && e_x.cm == 2'b01 && !e_x.hit) begin
-					f_set  <= e_va[9:4];
-					f_tag  <= e_x.pa[31:10];
+					f_set  <= e_va[CSH:4];
+					f_tag  <= e_x.pa[31:CSH+1];
 					f_way  <= victim(lve_q, rrc);
 					e_sret <= E_S_XL;
 					e_st   <= E_FILL;
@@ -1444,8 +1455,8 @@ always_ff @(posedge clk) begin
 				e_st  <= E_IDLE;
 			end
 			else if (alloc && rd && !e_x.hit) begin
-				f_set  <= e_va[9:4];
-				f_tag  <= e_x.pa[31:10];
+				f_set  <= e_va[CSH:4];
+				f_tag  <= e_x.pa[31:CSH+1];
 				f_way  <= victim(lve_q, rrc);
 				e_sret <= E_S_XL;
 				e_st   <= E_FILL;
@@ -1458,7 +1469,7 @@ always_ff @(posedge clk) begin
 				// disabled (CACR.DE clear, CDIS) the cache's contents are
 				// left alone
 				if (e_x.hit && dc_en && (m2.r.lock || e_x.cm[1] || move16)) begin
-					f_set  <= e_va[9:4];
+					f_set  <= e_va[CSH:4];
 					f_way  <= e_x.way;
 					pv_lock <= m2.r.lock;
 					pv_for  <= 2'd0;
@@ -1496,7 +1507,7 @@ always_ff @(posedge clk) begin
 			// multiplexer selects f_way: the hit way's, for the operand
 			// and for a MOVE16 source)
 			steal  <= 1'b1;
-			st_set <= e_va[9:4];
+			st_set <= e_va[CSH:4];
 			f_way  <= e_x.way;
 			e_st   <= E_S_RDW;
 		end
@@ -1581,7 +1592,7 @@ always_ff @(posedge clk) begin
 				// pushed if dirty and invalidated before the bus write
 				// (4.3.2, 4.6.2) -- unless the data cache is disabled, which
 				// leaves its contents alone
-				f_set   <= e_va[9:4];
+				f_set   <= e_va[CSH:4];
 				f_way   <= e_x.way;
 				pv_lock <= m4.r.lock;
 				pv_for  <= 2'd1;
@@ -1592,14 +1603,14 @@ always_ff @(posedge clk) begin
 			else begin
 			if (upd) begin
 				dw      <= 1'b1;
-				dw_set  <= e_va[9:4];
+				dw_set  <= e_va[CSH:4];
 				dw_way  <= e_x.way;
 				dw_be   <= be;
 				dw_src  <= 2'd0;
 				dw_word <= lanes32(e_acc, e_va[1:0]);
 				if (e_x.cm == 2'b01)
 					if (be != 16'd0) begin
-						vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
+						vp_set = e_va[CSH:4]; vp_wm[e_x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 					end
 			end
 			if (upd && e_x.cm == 2'b01) begin
@@ -1688,7 +1699,7 @@ always_ff @(posedge clk) begin
 					end
 					else begin
 						// scan one set (line), or every set (page, all)
-						ms_i <= (mt_scope == 2'd1) ? {mt_addr[9:4], 2'b00} : 8'd0;
+						ms_i <= (mt_scope == 2'd1) ? {mt_addr[CSH:4], 2'b00} : '0;
 						e_st <= E_M_SCAN;
 					end
 				end
@@ -1698,8 +1709,8 @@ always_ff @(posedge clk) begin
 			// every line invalid, a set a cycle (CINVA; and after reset)
 			vp_set = clr_i; vp_wm = 4'hF;
 			vp_lwe = 1'b1; vp_lv = 1'b0;
-			clr_i <= clr_i + 6'd1;
-			if (clr_i == 6'd63) begin
+			clr_i <= clr_i + 1'd1;
+			if (&clr_i) begin
 				clr_rst <= 1'b0;
 				e_st    <= clr_rst ? E_IDLE : E_M_IC;
 			end
@@ -1735,10 +1746,10 @@ always_ff @(posedge clk) begin
 			else e_st <= E_M_DONE;
 		end
 		E_M_SCAN: begin
-			tset_b <= ms_i[7:2];
+			tset_b <= ms_i[CSB+1:2];
 			steal  <= 1'b1;
-			st_set <= ms_i[7:2];
-			sc_set <= ms_i[7:2];
+			st_set <= ms_i[CSB+1:2];
+			sc_set <= ms_i[CSB+1:2];
 			e_st   <= E_M_SCANW;
 		end
 		E_M_SCANW: begin
@@ -1748,12 +1759,12 @@ always_ff @(posedge clk) begin
 			e_st <= E_M_SCAN2;
 		end
 		E_M_SCAN2: begin
-			logic [5:0] s; logic [1:0] w; logic m;
-			s = ms_i[7:2]; w = ms_i[1:0];
+			logic [CSB-1:0] s; logic [1:0] w; logic m;
+			s = ms_i[CSB+1:2]; w = ms_i[1:0];
 			m = sc_lv[w] && ((mt_scope == 2'd3) ||
-			                 (mt_scope == 2'd1 && tq_b[w] == mt_addr[31:10]) ||
-			                 (mt_scope == 2'd2 && (tc_p ? tq_b[w][21:3] == mt_addr[31:13]
-			                                            : tq_b[w][21:2] == mt_addr[31:12])));
+			                 (mt_scope == 2'd1 && tq_b[w] == mt_addr[31:CSH+1]) ||
+			                 (mt_scope == 2'd2 && (tc_p ? tq_b[w][CTW-1:12-CSH] == mt_addr[31:13]
+			                                            : tq_b[w][CTW-1:11-CSH] == mt_addr[31:12])));
 			if (m && mt_op == MT_CPUSH && sc_ld[w]) begin
 				// push (it is invalidated with the push)
 				f_set   <= s;
@@ -1768,9 +1779,9 @@ always_ff @(posedge clk) begin
 					vp_set = s; vp_wm[w] = 1'b1;
 					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 				end
-				if ((mt_scope == 2'd1 && w == 2'd3) || ms_i == 8'hFF) e_st <= E_M_IC;
+				if ((mt_scope == 2'd1 && w == 2'd3) || &ms_i) e_st <= E_M_IC;
 				else begin
-					ms_i <= ms_i + 8'd1;
+					ms_i <= ms_i + 1'd1;
 					e_st <= (w == 2'd3) ? E_M_SCAN : E_M_SCAN2;
 				end
 			end
@@ -2026,13 +2037,18 @@ always_ff @(posedge clk) begin
 			// descriptor read: from the data cache if the line is there
 			// (cachable write-through, no allocate, 3.2.5), else from the bus
 			steal  <= 1'b1;
-			st_set <= tw_da[9:4];
-			tset_b <= tw_da[9:4];
+			st_set <= tw_da[CSH:4];
+			tset_b <= tw_da[CSH:4];
 			e_st   <= E_TW_DESCW;
 		end
-		E_TW_DESCW: e_st <= E_TW_DLK;   // (the tags of the set valid: the compare registers)
+		// (the set's tags arrive a cycle after tset_b, port B's address,
+		// and the compare registers a cycle after that: an earlier compare
+		// laid the walk's new valid bits over the previous set's tags)
+		E_TW_DESCW:  e_st <= E_TW_DESCW2;
+		E_TW_DESCW2: e_st <= E_TW_DLK;
 		E_TW_DLK: begin
-			if (tw_hhq && dc_en) begin
+			if (!tw_hvq) ;                    // (a snoop had the set: the compare registers now)
+			else if (tw_hhq && dc_en) begin
 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
 				e_st <= E_TW_EVAL;
 			end
@@ -2136,7 +2152,7 @@ always_ff @(posedge clk) begin
 			e_wret <= caller;
 			if (h && ld_q[w]) begin
 				// a dirty copy: pushed (E_PUSHV invalidates it), then back here
-				f_set   <= tw_da[9:4];
+				f_set   <= tw_da[CSH:4];
 				f_way   <= w;
 				pv_lock <= lk;
 				pv_for  <= 2'd3;
@@ -2145,7 +2161,7 @@ always_ff @(posedge clk) begin
 			end
 			else begin
 				if (h) begin
-					vp_set = tw_da[9:4]; vp_wm[w] = 1'b1;
+					vp_set = tw_da[CSH:4]; vp_wm[w] = 1'b1;
 					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 				end
 				bo.line <= 1'b0; bo.tt <= TT_NORMAL;
@@ -2286,12 +2302,12 @@ always_ff @(posedge clk) begin
 		// same set would miss it: present the set once more
 		SN_A:    if (!dw && !tw_b) sn_ph <= SN_B;
 		SN_B: begin
-			logic [5:0] s;
+			logic [CSB-1:0] s;
 			logic h; logic [1:0] w;
-			s = sn_pa[9:4];
+			s = sn_pa[CSH:4];
 			h = 1'b0; w = 2'd0;
 			for (int i = 0; i < 4; i++)
-				if (lve_q[i] && tq_a[i] == sn_pa[31:10]) begin h = 1'b1; w = 2'(i); end
+				if (lve_q[i] && tq_a[i] == sn_pa[31:CSH+1]) begin h = 1'b1; w = 2'(i); end
 			sn_way <= w;
 			sn_look <= 1'b1;
 			sn_pvm <= pv_v && pv_lpa == sn_pa[31:4];
@@ -2322,8 +2338,8 @@ always_ff @(posedge clk) begin
 			sn_ph <= SN_H;
 		end
 		SN_H: begin
-			logic [5:0] s;
-			s = sn_pa[9:4];
+			logic [CSB-1:0] s;
+			s = sn_pa[CSH:4];
 			// (a line found in a way is invalidated below)
 			if (sn_inv && sn_pvm) pv_v <= 1'b0;
 			if (sn_inv && sn_bom) bo_cancel <= 1'b1;
@@ -2350,7 +2366,7 @@ always_ff @(posedge clk) begin
 		endcase
 		// a snooped line leaves the cache (found in a way: invalidated)
 		if (sn_ph == SN_H && sn_inv && sn_src == 2'd0) begin
-			vp_set = sn_pa[9:4]; vp_wm[sn_way] = 1'b1;
+			vp_set = sn_pa[CSH:4]; vp_wm[sn_way] = 1'b1;
 			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 			// (the records' hits on it: at the valid/dirty write port)
 		end
@@ -2366,30 +2382,30 @@ always_ff @(posedge clk) begin
 		// set, whatever the way: its way and translation come late, and its
 		// set is the untranslated page offset; a lost hit sends the access
 		// to the engine, which looks the line up again)
-		if (vp_lwe && !vp_lv && (|vp_wm) && adv_dc1 && m1.a[9:4] == vp_set) m2.x.hit <= 1'b0;
+		if (vp_lwe && !vp_lv && (|vp_wm) && adv_dc1 && m1.a[CSH:4] == vp_set) m2.x.hit <= 1'b0;
 		if (vp_lwe && !vp_lv) begin
 			for (int j = 0; j < 4; j++) if (vp_wm[j]) begin
 				if (!adv_dc1) begin
-					if (m2.x.hit && m2.x.pa[9:4] == vp_set && m2.x.way == 2'(j)) m2.x.hit <= 1'b0;
-					if (m2.x1.hit && m2.x1.pa[9:4] == vp_set && m2.x1.way == 2'(j)) m2.x1.hit <= 1'b0;
+					if (m2.x.hit && m2.x.pa[CSH:4] == vp_set && m2.x.way == 2'(j)) m2.x.hit <= 1'b0;
+					if (m2.x1.hit && m2.x1.pa[CSH:4] == vp_set && m2.x1.way == 2'(j)) m2.x1.hit <= 1'b0;
 				end
 				if (adv_dc2) begin
-					if (m2.x.hit && m2.x.pa[9:4] == vp_set && m2.x.way == 2'(j)) m3.x.hit <= 1'b0;
-					if (m2.x1.hit && m2.x1.pa[9:4] == vp_set && m2.x1.way == 2'(j)) m3.x1.hit <= 1'b0;
+					if (m2.x.hit && m2.x.pa[CSH:4] == vp_set && m2.x.way == 2'(j)) m3.x.hit <= 1'b0;
+					if (m2.x1.hit && m2.x1.pa[CSH:4] == vp_set && m2.x1.way == 2'(j)) m3.x1.hit <= 1'b0;
 				end
 				else begin
-					if (m3.x.hit && m3.x.pa[9:4] == vp_set && m3.x.way == 2'(j)) m3.x.hit <= 1'b0;
-					if (m3.x1.hit && m3.x1.pa[9:4] == vp_set && m3.x1.way == 2'(j)) m3.x1.hit <= 1'b0;
+					if (m3.x.hit && m3.x.pa[CSH:4] == vp_set && m3.x.way == 2'(j)) m3.x.hit <= 1'b0;
+					if (m3.x1.hit && m3.x1.pa[CSH:4] == vp_set && m3.x1.way == 2'(j)) m3.x1.hit <= 1'b0;
 				end
 				if (adv_ex) begin
-					if (m3.x.hit && m3.x.pa[9:4] == vp_set && m3.x.way == 2'(j)) m4.x.hit <= 1'b0;
-					if (m3.x1.hit && m3.x1.pa[9:4] == vp_set && m3.x1.way == 2'(j)) m4.x1.hit <= 1'b0;
+					if (m3.x.hit && m3.x.pa[CSH:4] == vp_set && m3.x.way == 2'(j)) m4.x.hit <= 1'b0;
+					if (m3.x1.hit && m3.x1.pa[CSH:4] == vp_set && m3.x1.way == 2'(j)) m4.x1.hit <= 1'b0;
 				end
 				else begin
-					if (m4.x.hit && m4.x.pa[9:4] == vp_set && m4.x.way == 2'(j)) m4.x.hit <= 1'b0;
-					if (m4.x1.hit && m4.x1.pa[9:4] == vp_set && m4.x1.way == 2'(j)) m4.x1.hit <= 1'b0;
+					if (m4.x.hit && m4.x.pa[CSH:4] == vp_set && m4.x.way == 2'(j)) m4.x.hit <= 1'b0;
+					if (m4.x1.hit && m4.x1.pa[CSH:4] == vp_set && m4.x1.way == 2'(j)) m4.x1.hit <= 1'b0;
 				end
-				if (e_x.hit && e_x.pa[9:4] == vp_set && e_x.way == 2'(j)) e_x.hit <= 1'b0;
+				if (e_x.hit && e_x.pa[CSH:4] == vp_set && e_x.way == 2'(j)) e_x.hit <= 1'b0;
 			end
 		end
 
@@ -2432,6 +2448,7 @@ always_ff @(posedge clk)
 assign sn_line = (sn_src == 2'd0) ? dq_w : (sn_src == 2'd1) ? pv_line : bo_line;
 
 assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) ||
+                 (e_st == E_TW_DESCW2) ||
                  (e_st == E_TW_DLK) || (e_st == E_TW_DBUS) || (e_st == E_TW_EVAL) ||
                  (e_st == E_TW_UPD) || (e_st == E_TW_LKW) || (e_st == E_TW_UPD_W) ||
                  (e_st == E_TW_DONE) ||
@@ -2440,7 +2457,7 @@ assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DE
 
 // DC2 answer
 // once the engine has taken the DC2 uop, only its completion releases it
-assign dc2_rdy = !m2.r.v || e_dc2_done || (!e_job && (fast_now || st_simple));
+assign dc2_rdy = !m2.r.v || e_dc2_done || s1_rep || (!e_job && (fast_now || st_simple));
 assign ldata   = e_dc2_done ? e_ldata : fast_data;
 // for AG's capture of a load into a base or index (a short path): the long
 // word of the line the address points at -- the operand itself for an
@@ -2451,7 +2468,7 @@ assign ldata_al  = e_dc2_done ? e_ldata :
 assign ldata_alv = e_dc2_done ||
                    (m2.r.msz == SZ_L && m2.r.a[1:0] == 2'd0) ||
                    (m2.r.msz == SZ_W && !m2.r.a[0]);
-assign fault   = e_dc2_done && e_flt;
+assign fault   = (e_dc2_done && e_flt) || s1_rep;
 assign fvec    = 8'd2;
 assign faddr   = e_faddr;
 assign fssw    = e_fssw;
@@ -2462,22 +2479,22 @@ assign lvd_q = lsd_q[3:0];
 wire  [7:0] lse_q = lse[lv_ra];
 assign lve_q = lse_q[3:0];
 always_comb
-	lv_ra = (sn_ph == SN_B)                            ? sn_pa[9:4] :
-	        (e_st == E_SP_2)                           ? m2.r.a[9:4] + 6'd1 :
+	lv_ra = (sn_ph == SN_B)                            ? sn_pa[CSH:4] :
+	        (e_st == E_SP_2)                           ? CSB'(m2.r.a[CSH:4] + 1'd1) :
 	        (e_st == E_S_XL2 || e_st == E_S_ACT ||
-	         e_st == E_W_PART)                         ? e_va[9:4] :
+	         e_st == E_W_PART)                         ? e_va[CSH:4] :
 	        (e_st == E_M_SCANW || e_st == E_M_SCAN2)   ? sc_set : f_set;
 	// (a walk's set through f_set, which follows tw_da a cycle late while
 	// the walk runs: the walk's decode stays off this read address)
-initial for (int i = 0; i < 64; i++) begin
+initial for (int i = 0; i < (1 << CSB); i++) begin
 	lsd[i] = 8'd0; lse[i] = 8'd0; lsw[i] = 8'd0;
 end
 // synthesis translate_off
 // the copies against the flip-flop model (after reset's sweep)
 always_ff @(posedge clk)
-	if (nreset && !clr_rst && (lvd_q != lv[m1.a[9:4]] || lve_q != lv[lv_ra])) begin
+	if (nreset && !clr_rst && (lvd_q != lv[m1.a[CSH:4]] || lve_q != lv[lv_ra])) begin
 		$display("FAIL: dmu: valid RAM %b/%b, model %b/%b (sets %0d %0d)",
-		         lvd_q, lve_q, lv[m1.a[9:4]], lv[lv_ra], m1.a[9:4], lv_ra);
+		         lvd_q, lve_q, lv[m1.a[CSH:4]], lv[lv_ra], m1.a[CSH:4], lv_ra);
 		$finish;
 	end
 // synthesis translate_on
