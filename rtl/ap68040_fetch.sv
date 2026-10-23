@@ -227,6 +227,12 @@ pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
 logic  [1:0]  f3_b;
 logic  [1:0]  f3_s;            // s1_dec(f3_w[i]).v, decoded in F2
+// (each word's s1_dec a named result: Vivado 2023.2 synthesizes the
+// member of a function call's result, `s1_dec(w).v`, as a constant 0 --
+// f3_s_reg removed, no second-slot word ever marked, dual issue off on
+// the board while every simulator paired)
+s1_t          f2_s1 [2];
+always_comb for (int i = 0; i < 2; i++) f2_s1[i] = s1_dec(f2_w[i]);
 logic [30:0]  f3_t;
 ap68040_pdrom pdrom (.clk(clk), .a0(f2_w[0][15:3]), .a1(f2_w[1][15:3]), .q0(f3_r[0]), .q1(f3_r[1]));
 genvar gp;
@@ -731,7 +737,7 @@ qpc_r <= cfl ? {tq[0], 1'b0} + {30'd0, consume_t, 1'b0} : qpc_r + {28'd0, consum
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
 		f3_b  <= f2_b; f3_t <= f2_t;
 		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
-		for (int i = 0; i < 2; i++) f3_s[i] <= s1_dec(f2_w[i]).v;
+		for (int i = 0; i < 2; i++) f3_s[i] <= f2_s1[i].v;
 		f2_n  <= '0;
 		f2_b  <= '0;
 		// the target words of the BTB-taken branch F1 delivered (when
