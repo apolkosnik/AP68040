@@ -135,6 +135,7 @@ module ap68040_fetch
 	input  logic        sn_inv_all,    // ... or every line
 	output logic        sn_inv_done,
 	output logic        sn_ihit,       // ... and removed a valid line (or the line buffer)
+	output logic [191:0] dbg_f,        // observation only (a system's logic analyser)
 
 	// BIU client
 	output logic        b_req,
@@ -1145,5 +1146,10 @@ always_ff @(posedge clk)
 		$finish;
 	end
 // synthesis translate_on
+
+// observation only: what F0/F1 and the miss engine are doing
+assign dbg_f = {13'd0, f0_go, tw_hit, f1_go, f1_deliver, f1_bkind, f1_bt, f1_v,
+                fras_n, fras_tp, fnew, busy, stale, 3'(st),
+                fras[fras_tp], f1_btgt, m_la, f1_pc, fpc};
 
 endmodule

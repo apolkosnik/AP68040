@@ -78,7 +78,7 @@ ap68040 dut (
 	.br_n(br_n), .bg_n(1'b0), .bb_n_i(1'b1), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted),
-	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint()
+	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint(), .dbg_fe()
 );
 
 logic        xfer_v, xfer_rd;

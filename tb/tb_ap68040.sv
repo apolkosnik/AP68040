@@ -187,7 +187,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted),
-	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint()
+	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint(), .dbg_fe()
 );
 
 // slave

@@ -80,7 +80,10 @@ module ap68040
 	// address), CACR, and a pulse for every completed CINV/CPUSH
 	output logic [31:0] dbg_vbr,
 	output logic [31:0] dbg_cacr,
-	output logic        dbg_cmaint
+	output logic        dbg_cmaint,
+	// observation only: the fetch unit, the decoder's queue, the redirects,
+	// D1's BTB writes and WB's PC (384 bits, see the assignment)
+	output logic [383:0] dbg_fe
 );
 
 // reset synchronizer: two bus clocks, so the reset and the release of the
@@ -378,7 +381,7 @@ ap68040_fetch #(.BTIC(BTIC)) fetch (
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
 	.sn_inv(sn_ic), .sn_inv_pa(sn_ic_pa), .sn_inv_all(sn_ic_all), .sn_inv_done(sn_ic_done),
-	.sn_ihit(sn_ihit),
+	.sn_ihit(sn_ihit), .dbg_f(dbg_f),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b1), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
@@ -415,5 +418,9 @@ assign dbg_cacr = cacr;
 // (mt_op 1 and 2: MT_CINV and MT_CPUSH of the DMU)
 always_ff @(posedge clk)
 	dbg_cmaint <= nreset && mt_done && (mt_op == 3'd1 || mt_op == 3'd2);
+
+logic [191:0] dbg_f;
+assign dbg_fe = {20'd0, consume, qcnt, d_redir_v, redir_v, btb_we, btb_wkind, btb_wslot, btb_wtgt,
+                 d_redir_pc, redir_pc, qpc, dbg_pc, dbg_f};
 
 endmodule
