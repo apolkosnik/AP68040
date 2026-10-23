@@ -1111,6 +1111,7 @@ qpc_r <= cfl ? {tq[0], 1'b0} + {30'd0, consume_t, 1'b0} : qpc_r + {28'd0, consum
 	if (nreset && frw) fras[frwa] <= frwd;
 	// the valid RAMs' one write (both copies)
 	if (nreset) begin
+		dbg_iw <= {iw_v, iw_m, 7'(iw_set)};
 		if (iw_m != 4'd0) begin
 			ivf[iw_set] <= (ivo_q & ~iw_m) | (iw_m & {4{iw_v}});
 			ivo[iw_set] <= (ivo_q & ~iw_m) | (iw_m & {4{iw_v}});
@@ -1148,10 +1149,14 @@ always_ff @(posedge clk)
 // synthesis translate_on
 
 // observation only: what F0/F1 and the miss engine are doing
+logic [11:0] dbg_iw;   // the valid RAMs' write as it was made: {v, ways, set}
 assign dbg_f = {13'd0, f0_go, tw_hit, f1_go, f1_deliver, f1_bkind, f1_bt, f1_v,
                 fras_n, fras_tp, fnew, busy, stale, 3'(st),
                 // (bits 96..157: the head of the queue as D1 sees it)
                 12'd0, cnt, qh, qp0.legal, qp0.slow, qp0.b, qp0.tot, qw[1], qw[0],
-                m_la, f1_pc, fpc};
+                m_la, f1_pc,
+                // (bits 0..31: the cache's writes, in place of F0's address)
+                c_dwe, m_way, m_vclr, m_alloc, m_tci, c_we, c_wway, inv_busy,
+                dbg_iw, rr, ivo_q, b_rvalid, b_rbeat, 1'b0};
 
 endmodule
