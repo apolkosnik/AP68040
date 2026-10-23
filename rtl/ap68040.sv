@@ -23,7 +23,8 @@ module ap68040
 	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
-	parameter bit         BTIC         = 1       // the fetch BTB's target words
+	parameter bit         BTIC         = 1,      // the fetch BTB's target words
+	parameter logic [2:0] S1_CLASSES   = 3'b111  // DUAL: the second slot's classes {load, An, Dn} (a debug switch)
 )(
 
 	input  logic        clk,
@@ -367,7 +368,7 @@ logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch #(.BTIC(BTIC)) fetch (
+ap68040_fetch #(.BTIC(BTIC), .S1_CLASSES(S1_CLASSES)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),

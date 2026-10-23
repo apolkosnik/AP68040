@@ -67,7 +67,8 @@
 module ap68040_fetch
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
-	parameter bit BTIC = 1          // the BTB entries' target words
+	parameter bit BTIC = 1,         // the BTB entries' target words
+	parameter logic [2:0] S1_CLASSES = 3'b111   // second-slot classes marked: {load, An, Dn}
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -417,12 +418,11 @@ logic        m_rrinc;            // ... the set was full: the replacement counte
 // being fetched (the burst's first) is kept for a fill that is not
 // allocated (TCI, a later beat's bus error), which delivers it alone.
 wire         c_dwe = (st == S_FILL) && b_rvalid && m_alloc && !m_vclr;
-// Each way's write enable is a bit of a one-hot vector built here, not a
+// Each way's write enable is a bit of a one-hot vector (c_dwe_w with m_way, c_we_w), not a
 // `== 2'(genvar)` compare in the port list: Vivado 2023.2 synthesis
 // evaluates that compare wrongly for some ways, finds their write enables
 // equal (or constant 0), and merges or removes the RAMs (Synth 8-223
 // decloning, 8-7257), so a fill of one way lands in another.
-wire [3:0] c_dwe_w = c_dwe ? 4'b0001 << m_way  : 4'b0000;
 wire [3:0] c_we_w  = c_we  ? 4'b0001 << c_wway : 4'b0000;
 genvar gw;
 generate
@@ -474,6 +474,7 @@ logic [31:0] m_pa;
 logic  [1:0] m_upa;
 logic        m_s, m_dem, m_ci, m_alloc;
 logic  [1:0] m_way;
+wire [3:0] c_dwe_w = c_dwe ? 4'b0001 << m_way  : 4'b0000;
 
 // invalidation
 logic        inv_busy, inv_hold, inv_ph;
@@ -737,7 +738,8 @@ qpc_r <= cfl ? {tq[0], 1'b0} + {30'd0, consume_t, 1'b0} : qpc_r + {28'd0, consum
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
 		f3_b  <= f2_b; f3_t <= f2_t;
 		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
-		for (int i = 0; i < 2; i++) f3_s[i] <= f2_s1[i].v;
+		for (int i = 0; i < 2; i++)
+			f3_s[i] <= f2_s1[i].v && (f2_s1[i].ld ? S1_CLASSES[2] : f2_s1[i].agop ? S1_CLASSES[1] : S1_CLASSES[0]);
 		f2_n  <= '0;
 		f2_b  <= '0;
 		// the target words of the BTB-taken branch F1 delivered (when
