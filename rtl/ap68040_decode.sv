@@ -708,6 +708,14 @@ end
 // refetched at WB (EXC_SNR): this check stays off the consume path.
 logic [7:0] bt_lm, bt_lb;
 logic       bt_any, bt_end, bt_restart, part_bt;
+// D1 has pushed a record to be refetched at WB: it decodes nothing more
+// until the back end's flush.  The words behind a flag inside an
+// instruction are the old target's, their PCs off by the overlap: decoded,
+// they would train the BTB from a stream that is not the program's, and
+// one of them can write back the very entry just dropped (a DBF a word
+// off whose last word is the flagged one), so every refetch meets it again
+// and nothing retires (the Minimig demo hang, tb t_addxloop case 3).
+logic       bt_hold;
 logic [2:0] bt_j;
 always_comb begin
 	// the consumed words, and the last of them (tables, no arithmetic)
@@ -778,7 +786,7 @@ end
 // (two records; a full FIFO has room in the clock the sequencer pops one,
 // or D1 would wait a clock behind every pop: 28% on Dhrystone)
 wire room  = (rq_n != 2'd2) || rq_pop_e;
-wire stall = flush || hold_redir || d_redir_v || !room;
+wire stall = flush || hold_redir || d_redir_v || !room || bt_hold;
 wire fire  = (go || go_part) && !stall;
 wire push  = fire && go;
 wire pop   = rq_pop && (rq_n != 2'd0);
@@ -878,6 +886,7 @@ always_ff @(posedge clk) begin
 		btb_wkind  <= '0;
 		btb_wtgt   <= '0;
 		part_bt    <= 1'b0;
+		bt_hold    <= 1'b0;
 		part_call  <= 1'b0;
 		part_ret   <= 1'b0;
 		part_fpg   <= 1'b0;
@@ -903,6 +912,8 @@ always_ff @(posedge clk) begin
 		// the flag of an earlier part stays with the instruction
 		if (fire) part_bt <= go_part && (part_bt || bt_restart);
 		if (flush) part_bt <= 1'b0;
+		if (fire && go && (bt_restart || part_bt)) bt_hold <= 1'b1;
+		if (flush) bt_hold <= 1'b0;
 
 		// the return stack follows the records in program order.  A call
 		// writes the slot above the top while it waits in D1, push or not
