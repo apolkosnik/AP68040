@@ -24,7 +24,13 @@ module ap68040
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
 	parameter bit         BTIC         = 1,      // the fetch BTB's target words
-	parameter logic [2:0] S1_CLASSES   = 3'b111, // DUAL: the second slot's classes {load, An, Dn} (a debug switch)
+	// DUAL: the second slot's classes {load, An, Dn}.  Loads are off: on the
+	// Minimig (2026-10-23) a second-slot MOVE (Ay),Dx returned wrong data
+	// now and then -- the hard-disk boot read garbage, and PFS3 wrote it
+	// back -- while every simulation of it passes; Dn and An alone boot
+	// (0.89x / 0.87x a 68060 at 50 MHz, both 0.88x).  tb_ap68040 keeps all
+	// three on (AP_S1C) so the regression still covers the loads.
+	parameter logic [2:0] S1_CLASSES   = 3'b011,
 	parameter logic [3:0] S1_LDMASK    = 4'b1111, // ... the loads: {TST, ALU, MOVEA.L, MOVE} (a debug switch)
 	parameter bit         S1_LDTK      = 1       // ... a load companion at a BTB-taken target (a debug switch)
 )(
