@@ -37,6 +37,7 @@
 //               off)                                                       //
 //   $F16C word  nonzero: after each fetch beat of that line's long word at //
 //               +4, rewrite its upper word to MOVEQ #n,D0 (n counts them)  //
+//   $F178 long  a read counter: each read returns the reads so far     //
 //   $F16E word  IPL skew: bits 2:0 the IPL bits that change one clock    //
 //               after the others (from now on), bits 6:4 a level raised   //
 //               after bits 15:8 clocks (t_iplglitch); +iplskew=<mask>     //
@@ -171,8 +172,11 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `ifndef AP_BTIC
 `define AP_BTIC 1
 `endif
+`ifndef AP_S1C
+`define AP_S1C 3'b111
+`endif
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
-          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC), .DUAL(`AP_DUAL), .BTIC(`AP_BTIC)) dut (
+          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC), .DUAL(`AP_DUAL), .BTIC(`AP_BTIC), .S1_CLASSES(`AP_S1C)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
@@ -689,6 +693,11 @@ always_ff @(posedge clk) begin
 		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
 	// the core's options, for the programs that check what they do
 	mem.mem[16'hF2E8 >> 2] <= {31'd0, 1'(`AP_LOOP_PRED)};
+	// $F178: a device register that counts its reads -- each read returns
+	// the count so far, then the count goes up -- so a read on a path the
+	// core discards (a mispredicted branch) shows as a skipped value
+	if (rsti_n && ev && ev_rd && !ev_err && ev_tt == 2'd0 && ev_addr[15:2] == 14'(16'hF178 >> 2))
+		mem.mem[16'hF178 >> 2] <= mem.mem[16'hF178 >> 2] + 32'd1;
 end
 int          cap;
 

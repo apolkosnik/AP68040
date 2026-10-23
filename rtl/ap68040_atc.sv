@@ -88,12 +88,11 @@ logic [$bits(slot_t)-1:0] wqs [4];      // SAME_SEARCH 0: the simulation's copy
 // synthesis translate_on
 slot_t sd [4];
 
-// Each way's write enable is a bit of a one-hot vector built here, not a
+// Each way's write enable is a bit of a one-hot vector (wr_w, with wway), not a
 // `== 2'(genvar)` compare in the port list: Vivado 2023.2 synthesis
 // evaluates that compare wrongly for some ways, finds their write enables
 // equal (or constant 0), and merges or removes the RAMs (Synth 8-223
 // decloning, 8-7257), so an install of one way lands in another.
-wire [3:0] wr_w = wr ? 4'b0001 << wway : 4'b0000;
 genvar w;
 generate
 	for (w = 0; w < 4; w++) begin : g_way
@@ -159,6 +158,7 @@ always_ff @(posedge clk)
 
 // install way: the same page if present (an M-bit update), else invalid, else rr
 logic [1:0] wway;
+wire [3:0] wr_w = wr ? 4'b0001 << wway : 4'b0000;
 always_comb begin
 	logic found;
 	found = 1'b0;

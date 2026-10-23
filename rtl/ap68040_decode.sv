@@ -26,7 +26,8 @@ module ap68040_decode
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
 	parameter bit LOOP_PRED = 1,         // the loop exit predictor
-	parameter bit DUAL      = 1          // second-slot companions (see s1_t)
+	parameter bit DUAL      = 1,         // second-slot companions (see s1_t)
+	parameter bit S1_LDTK   = 1          // a load may be the companion at a BTB-taken target (a debug switch)
 )
 (
 	input  logic        clk,
@@ -747,7 +748,9 @@ wire [2:0] c_at = pd0.tot[2:0];
 wire c_cons = DUAL && (ph == PH_IDLE) && pd0.legal && fast &&
               (pd0.tot <= 4'd6) && (pd0.tot < qcnt) && (nrec.exc == 8'd0) &&
               win_s1[c_at] && !win_flt[c_at] && !win_bt[c_at] && (!bt_any || bt_end);
-wire c_ok = c_cons && (bt_end ? (nrec.pred && teq) : !nrec.pred);
+s1_t c_s1;
+always_comb c_s1 = s1_dec(win[c_at]);
+wire c_ok = c_cons && (bt_end ? (nrec.pred && teq) : !nrec.pred) && (S1_LDTK || !bt_end || !c_s1.ld);
 // the record as it enters the FIFO: refetched at WB if a flag was inside
 // the instruction (now, or in an earlier part)
 dinst_t nrec_q;

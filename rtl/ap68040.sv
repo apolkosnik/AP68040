@@ -23,7 +23,16 @@ module ap68040
 	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
-	parameter bit         BTIC         = 1       // the fetch BTB's target words
+	parameter bit         BTIC         = 1,      // the fetch BTB's target words
+	// DUAL: the second slot's classes {load, An, Dn}.  Loads are off: on the
+	// Minimig (2026-10-23) a second-slot MOVE (Ay),Dx returned wrong data
+	// now and then -- the hard-disk boot read garbage, and PFS3 wrote it
+	// back -- while every simulation of it passes; Dn and An alone boot
+	// (0.89x / 0.87x a 68060 at 50 MHz, both 0.88x).  tb_ap68040 keeps all
+	// three on (AP_S1C) so the regression still covers the loads.
+	parameter logic [2:0] S1_CLASSES   = 3'b011,
+	parameter logic [3:0] S1_LDMASK    = 4'b1111, // ... the loads: {TST, ALU, MOVEA.L, MOVE} (a debug switch)
+	parameter bit         S1_LDTK      = 1       // ... a load companion at a BTB-taken target (a debug switch)
 )(
 
 	input  logic        clk,
@@ -367,7 +376,7 @@ logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch #(.BTIC(BTIC)) fetch (
+ap68040_fetch #(.BTIC(BTIC), .S1_CLASSES(S1_CLASSES), .S1_LDMASK(S1_LDMASK)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
@@ -397,7 +406,7 @@ ap68040_fetch #(.BTIC(BTIC)) fetch (
 );
 assign b_wdata[1] = '0;
 
-ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL)) dec (
+ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL), .S1_LDTK(S1_LDTK)) dec (
 	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d), .dbg_pd(dbg_pd),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),

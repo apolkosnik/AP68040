@@ -67,7 +67,9 @@
 module ap68040_fetch
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
-	parameter bit BTIC = 1          // the BTB entries' target words
+	parameter bit BTIC = 1,         // the BTB entries' target words
+	parameter logic [2:0] S1_CLASSES = 3'b111,  // second-slot classes marked: {load, An, Dn}
+	parameter logic [3:0] S1_LDMASK  = 4'b1111  // ... of the loads: {TST (Ay), ALU (Ay),Dx, MOVEA.L (Ay),Ax, MOVE (Ay),Dx}
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -227,6 +229,17 @@ pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
 logic  [1:0]  f3_b;
 logic  [1:0]  f3_s;            // s1_dec(f3_w[i]).v, decoded in F2
+// (each word's s1_dec a named result: Vivado 2023.2 synthesizes the
+// member of a function call's result, `s1_dec(w).v`, as a constant 0 --
+// f3_s_reg removed, no second-slot word ever marked, dual issue off on
+// the board while every simulator paired)
+s1_t          f2_s1 [2];
+always_comb for (int i = 0; i < 2; i++) f2_s1[i] = s1_dec(f2_w[i]);
+// a second-slot load's kind, for S1_LDMASK: 0 MOVE (Ay),Dx, 1 MOVEA.L (Ay),Ax,
+// 2 ADD/SUB/AND/OR/CMP (Ay),Dx, 3 TST (Ay)
+function automatic logic [1:0] s1_ldk(input s1_t s);
+	s1_ldk = !s.d_v && s.op == S1_MOV ? 2'd3 : s.op != S1_MOV ? 2'd2 : s.d_reg[3] ? 2'd1 : 2'd0;
+endfunction
 logic [30:0]  f3_t;
 ap68040_pdrom pdrom (.clk(clk), .a0(f2_w[0][15:3]), .a1(f2_w[1][15:3]), .q0(f3_r[0]), .q1(f3_r[1]));
 genvar gp;
@@ -411,12 +424,11 @@ logic        m_rrinc;            // ... the set was full: the replacement counte
 // being fetched (the burst's first) is kept for a fill that is not
 // allocated (TCI, a later beat's bus error), which delivers it alone.
 wire         c_dwe = (st == S_FILL) && b_rvalid && m_alloc && !m_vclr;
-// Each way's write enable is a bit of a one-hot vector built here, not a
+// Each way's write enable is a bit of a one-hot vector (c_dwe_w with m_way, c_we_w), not a
 // `== 2'(genvar)` compare in the port list: Vivado 2023.2 synthesis
 // evaluates that compare wrongly for some ways, finds their write enables
 // equal (or constant 0), and merges or removes the RAMs (Synth 8-223
 // decloning, 8-7257), so a fill of one way lands in another.
-wire [3:0] c_dwe_w = c_dwe ? 4'b0001 << m_way  : 4'b0000;
 wire [3:0] c_we_w  = c_we  ? 4'b0001 << c_wway : 4'b0000;
 genvar gw;
 generate
@@ -468,6 +480,7 @@ logic [31:0] m_pa;
 logic  [1:0] m_upa;
 logic        m_s, m_dem, m_ci, m_alloc;
 logic  [1:0] m_way;
+wire [3:0] c_dwe_w = c_dwe ? 4'b0001 << m_way  : 4'b0000;
 
 // invalidation
 logic        inv_busy, inv_hold, inv_ph;
@@ -731,7 +744,9 @@ qpc_r <= cfl ? {tq[0], 1'b0} + {30'd0, consume_t, 1'b0} : qpc_r + {28'd0, consum
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
 		f3_b  <= f2_b; f3_t <= f2_t;
 		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
-		for (int i = 0; i < 2; i++) f3_s[i] <= s1_dec(f2_w[i]).v;
+		for (int i = 0; i < 2; i++)
+			f3_s[i] <= f2_s1[i].v && (f2_s1[i].ld ? S1_CLASSES[2] && S1_LDMASK[s1_ldk(f2_s1[i])] :
+			                          f2_s1[i].agop ? S1_CLASSES[1] : S1_CLASSES[0]);
 		f2_n  <= '0;
 		f2_b  <= '0;
 		// the target words of the BTB-taken branch F1 delivered (when
