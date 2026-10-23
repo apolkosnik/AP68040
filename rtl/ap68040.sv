@@ -390,7 +390,7 @@ ap68040_fetch #(.BTIC(BTIC)) fetch (
 assign b_wdata[1] = '0;
 
 ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL)) dec (
-	.clk(clk), .nreset(nreset), .flush(fe_flush),
+	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .win_s1(win_s1), .bt_tgt(bt_tgt),
@@ -420,7 +420,8 @@ always_ff @(posedge clk)
 	dbg_cmaint <= nreset && mt_done && (mt_op == 3'd1 || mt_op == 3'd2);
 
 logic [191:0] dbg_f;
-assign dbg_fe = {20'd0, consume, qcnt, d_redir_v, redir_v, btb_we, btb_wkind, btb_wslot, btb_wtgt,
+logic   [9:0] dbg_d;
+assign dbg_fe = {dbg_d, 10'd0, consume, qcnt, d_redir_v, redir_v, btb_we, btb_wkind, btb_wslot, btb_wtgt,
                  d_redir_pc, redir_pc, qpc, dbg_pc, dbg_f};
 
 endmodule

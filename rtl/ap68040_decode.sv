@@ -51,6 +51,7 @@ module ap68040_decode
 	input  logic        smode,
 
 	output logic  [2:0] consume,
+	output logic  [9:0] dbg_d,          // observation only: ph, use_n, go, go_part, fast
 	output logic        consume_t,      // ... one word past a BTB-taken branch's end (a companion)
 	output logic        d_redir_v,
 	output logic [31:0] d_redir_pc,
@@ -992,5 +993,7 @@ always_ff @(posedge clk) begin
 		end
 	end
 end
+
+assign dbg_d = {2'(ph), use_n, go, go_part, fast, 1'b0};
 
 endmodule

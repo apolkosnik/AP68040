@@ -1150,6 +1150,8 @@ always_ff @(posedge clk)
 // observation only: what F0/F1 and the miss engine are doing
 assign dbg_f = {13'd0, f0_go, tw_hit, f1_go, f1_deliver, f1_bkind, f1_bt, f1_v,
                 fras_n, fras_tp, fnew, busy, stale, 3'(st),
-                fras[fras_tp], f1_btgt, m_la, f1_pc, fpc};
+                // (bits 96..157: the head of the queue as D1 sees it)
+                12'd0, cnt, qh, qp0.legal, qp0.slow, qp0.b, qp0.tot, qw[1], qw[0],
+                m_la, f1_pc, fpc};
 
 endmodule
