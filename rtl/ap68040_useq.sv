@@ -837,15 +837,24 @@ function automatic logic s1_indep(input uop_t u, input s1_t c);
 			s1_indep = 1'b0;
 endfunction
 // the companion as a uop of its own
-function automatic uop_t s1_uop(input s1_t c, input logic [31:0] pc, input ras_snap_t ras);
+// (the whole instruction: first and last, from the template t, uop_fl --
+// Quartus 17.0 takes a member named first or last neither assigned in a
+// function nor named in an assignment pattern, only assigned in an always
+// block; uop_fl is passed in, as the front end reports a module variable
+// read only inside a function as never read)
+uop_t uop_fl;
+always_comb begin
+	uop_fl       = '0;
+	uop_fl.first = 1'b1;
+	uop_fl.last  = 1'b1;
+end
+function automatic uop_t s1_uop(input uop_t t, input s1_t c, input logic [31:0] pc, input ras_snap_t ras);
 	uop_t u;
-	u = '0;
+	u = t;
 	u.pc    = pc;
 	u.ilen  = 4'd1;
 	u.ras   = ras;
 	u.ras.k = 2'd0;
-	u.first = 1'b1;
-	u.last  = 1'b1;
 	if (c.ld) begin
 		// the load's access, as the microcode has it: (Ay) the base
 		u.ag     = 1'b1;
@@ -1026,7 +1035,7 @@ always_ff @(posedge clk) begin
 		if (c_emit) cq_v <= 1'b0;
 		if (done && cs.v && !c_pair) begin
 			cq_v <= 1'b1;
-			cq_u <= s1_uop(cs, src.c_tk ? src.target : src.pc + {27'd0, src.ilen, 1'b0}, src.ras);
+			cq_u <= s1_uop(uop_fl, cs, src.c_tk ? src.target : src.pc + {27'd0, src.ilen, 1'b0}, src.ras);
 		end
 
 		if (emit) begin
@@ -1138,7 +1147,7 @@ always_ff @(posedge clk)
 		c = s1_dec(src.opw);
 		if (c.a_reg == 5'd15) c.a_reg = sp_reg;
 		if (c.d_reg == 5'd15) c.d_reg = sp_reg;
-		r = s1_uop(c, nu.pc, nu.ras);
+		r = s1_uop(uop_fl, c, nu.pc, nu.ras);
 		if (c.agop ? (!nu.ag || !nu.upd_v || nu.upd_reg != r.upd_reg || nu.d_v || nu.ccr_we != 5'd0 ||
 		              nu.mem != M_NONE || nu.br != BR_NONE || nu.upd2_v || nu.pinc || nu.ser ||
 		              nu.base_v != r.base_v || (r.base_v && (nu.base != r.base || nu.disp != r.disp)) ||
