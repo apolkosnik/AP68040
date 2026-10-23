@@ -24,7 +24,9 @@ module ap68040
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
 	parameter bit         BTIC         = 1,      // the fetch BTB's target words
-	parameter logic [2:0] S1_CLASSES   = 3'b111  // DUAL: the second slot's classes {load, An, Dn} (a debug switch)
+	parameter logic [2:0] S1_CLASSES   = 3'b111, // DUAL: the second slot's classes {load, An, Dn} (a debug switch)
+	parameter logic [3:0] S1_LDMASK    = 4'b1111, // ... the loads: {TST, ALU, MOVEA.L, MOVE} (a debug switch)
+	parameter bit         S1_LDTK      = 1       // ... a load companion at a BTB-taken target (a debug switch)
 )(
 
 	input  logic        clk,
@@ -368,7 +370,7 @@ logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch #(.BTIC(BTIC), .S1_CLASSES(S1_CLASSES)) fetch (
+ap68040_fetch #(.BTIC(BTIC), .S1_CLASSES(S1_CLASSES), .S1_LDMASK(S1_LDMASK)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
@@ -398,7 +400,7 @@ ap68040_fetch #(.BTIC(BTIC), .S1_CLASSES(S1_CLASSES)) fetch (
 );
 assign b_wdata[1] = '0;
 
-ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL)) dec (
+ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL), .S1_LDTK(S1_LDTK)) dec (
 	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d), .dbg_pd(dbg_pd),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),

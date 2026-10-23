@@ -68,7 +68,8 @@ module ap68040_fetch
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
 	parameter bit BTIC = 1,         // the BTB entries' target words
-	parameter logic [2:0] S1_CLASSES = 3'b111   // second-slot classes marked: {load, An, Dn}
+	parameter logic [2:0] S1_CLASSES = 3'b111,  // second-slot classes marked: {load, An, Dn}
+	parameter logic [3:0] S1_LDMASK  = 4'b1111  // ... of the loads: {TST (Ay), ALU (Ay),Dx, MOVEA.L (Ay),Ax, MOVE (Ay),Dx}
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -234,6 +235,11 @@ logic  [1:0]  f3_s;            // s1_dec(f3_w[i]).v, decoded in F2
 // the board while every simulator paired)
 s1_t          f2_s1 [2];
 always_comb for (int i = 0; i < 2; i++) f2_s1[i] = s1_dec(f2_w[i]);
+// a second-slot load's kind, for S1_LDMASK: 0 MOVE (Ay),Dx, 1 MOVEA.L (Ay),Ax,
+// 2 ADD/SUB/AND/OR/CMP (Ay),Dx, 3 TST (Ay)
+function automatic logic [1:0] s1_ldk(input s1_t s);
+	s1_ldk = !s.d_v && s.op == S1_MOV ? 2'd3 : s.op != S1_MOV ? 2'd2 : s.d_reg[3] ? 2'd1 : 2'd0;
+endfunction
 logic [30:0]  f3_t;
 ap68040_pdrom pdrom (.clk(clk), .a0(f2_w[0][15:3]), .a1(f2_w[1][15:3]), .q0(f3_r[0]), .q1(f3_r[1]));
 genvar gp;
@@ -739,7 +745,8 @@ qpc_r <= cfl ? {tq[0], 1'b0} + {30'd0, consume_t, 1'b0} : qpc_r + {28'd0, consum
 		f3_b  <= f2_b; f3_t <= f2_t;
 		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
 		for (int i = 0; i < 2; i++)
-			f3_s[i] <= f2_s1[i].v && (f2_s1[i].ld ? S1_CLASSES[2] : f2_s1[i].agop ? S1_CLASSES[1] : S1_CLASSES[0]);
+			f3_s[i] <= f2_s1[i].v && (f2_s1[i].ld ? S1_CLASSES[2] && S1_LDMASK[s1_ldk(f2_s1[i])] :
+			                          f2_s1[i].agop ? S1_CLASSES[1] : S1_CLASSES[0]);
 		f2_n  <= '0;
 		f2_b  <= '0;
 		// the target words of the BTB-taken branch F1 delivered (when
