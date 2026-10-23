@@ -35,7 +35,14 @@ predictor):
 | `EARLY_RES` | 0 | 1: early results in AG (a base or index need not wait for EX) |
 | `DC1_ATC` | 0 | 1: DC1's own ATC read port and a tag compare against all four ATC ways' pages (timing; 0 reads the main port at a registered set) |
 | `SKID` | 0 | 1: a skid register between D2 and AG |
+| `DUAL` | 1 | 1: dual issue -- a second slot beside the uop that ends a single-uop instruction (see Dual issue) |
+| `BTIC` | 1 | 1: the fetch BTB's entries keep their target's first long word (see Branch prediction) |
 | `DIV_STEPS` | 2 | quotient bits per clock of the integer divider (2 or 4) |
+
+The cache size is a package constant, not a parameter: `CSB` in
+`ap68040_pkg.sv` gives both caches 2^CSB sets of four 16-byte lines (7: 8
+KB each, the default; 6: the MC68040's 4 KB).  `CSH` and `CTW` (the set's
+top address bit, the tag width) follow from it.
 
 What each costs in ALMs and in cycles is measured in STATUS.md.  The
 defaults are the configuration the 20,000-ALM goal is measured on.
@@ -188,6 +195,66 @@ Not provided: the multiplexed bus mode CDIS selects at reset, DLE, JTAG.
   the back-end stages behind it go when it completes at WB, and AG takes
   nothing in between.
 
+### Dual issue (`DUAL`)
+
+A restricted second slot, in the 68060's manner but smaller: the second
+instruction of a pair is a one-word instruction on registers, and the
+first is any single-uop instruction except an FPU, RTE, SR-writing,
+serializing or upd2 one.  The second slot's instructions (`s1_dec`,
+`ap68040_pkg.sv`):
+
+* data registers, in EX by a second ALU (`ap68040_alu1`, the S1_* subset):
+  MOVEQ; ADDQ/SUBQ #q,Dn; ADD/SUB/AND/OR/CMP Dy or Ay,Dx; EOR Dx,Dy; MOVE
+  Dy or Ay,Dx; TST, CLR, NOT, NEG Dn; EXT, EXTB, SWAP;
+* address registers, in AG by a second adder, as the microcode runs them:
+  ADDQ/SUBQ #q,An; MOVEA.W/L Dy or Ay,Ax;
+* loads from (Ay), beside a first slot with no memory access of its own:
+  MOVE (Ay),Dx; MOVEA.L (Ay),Ax; ADD/SUB/AND/OR/CMP (Ay),Dx; TST (Ay).
+
+The front end: the fetch marks each queue word that is such an operation
+word (`win_s1`, decoded in F2).  D1 takes the word after a fast-path
+decode with it (the companion: `dinst_t.c_v/c_opw`, consumed in the same
+cycle) when it is the instruction the front end predicts next: the fall-
+through, or the first word of a target the fetch BTB took (D1 agreeing;
+`c_tk`).  D2 issues the companion beside the uop that ends the instruction
+when that uop is the whole instruction, may be paired, and writes no
+register the companion reads or writes; otherwise the companion is a uop
+of its own in the next issue cycle.  Under trace (T1/T0) nothing pairs.
+
+The back end carries the second slot (`s1_t`) in step with the first:
+* AG: its operand A is read as the pair enters AG (read port 5, the
+  cycle's AG and EX writes laid over it, then EX's writes followed); B is
+  read in AG through port 2, the upd2 register's, which the first slot
+  does not use.  An address register form waits, like an AG update, for
+  every older writer of its source and destination, and writes the front
+  file through port 1 (the upd2 port) as the pair leaves AG.
+* DC1, DC2: its operands follow EX's writes as the first slot's do; both
+  slots' writers are interlock sources for younger bases and indexes.
+* EX: the second ALU; a data result goes to the front file through port 1
+  and is broadcast with the first slot's (the two write different
+  registers).  AG holds an upd2 or an address-register second slot while
+  a second slot in EX writes (port 1).  CCR: the second slot's flags over
+  the first's.
+* WB: the second slot commits with the first unless the first takes an
+  exception or redirects (a mispredicted branch, a store into the code
+  ahead): it is then fetched again.  Its result goes to the back file
+  through a third write port; the instruction boundary (interrupts, the
+  stacked PC) is after it, at the first slot's next PC + 2 (the branch's
+  target, for a taken one).
+
+Second-slot loads (`s1_t.ld`) take the pair's AG, DC1 and DC2: the
+first slot makes no access, so the DMU's lookup port is the load's
+(`dm_s1`).  Only DC2's fast path answers one -- a hit within one line,
+read from DC2's copy as a first-slot load is.  Anything else (a miss, a
+cache-inhibited or serialized page, an operand across a line, a table
+walk, a fault) starts nothing: the DMU marks it (`s1_rep`), WB commits the
+first slot alone and redirects to the load's PC, and the load runs again
+as a first-slot instruction.  So the bus, the ATC and the exception frames
+see exactly what they would without dual issue.  The load's datum is the
+second ALU's operand A; its flags and result commit with the pair.
+
+What it costs and gains is in doc/XILINX.md.
+
 ### Register files
 
 D0-D7, A0-A6, USP, ISP, MSP and the microcode temporaries T0-T13.  Two
@@ -195,7 +262,9 @@ copies, both MLAB (`ap68040_rf`, write ports and five read ports through a
 live-value table): the front file (newest values; three write ports: AG's
 two address updates and EX's result) and the back file (architectural; two
 write ports: WB's update and result, or the exception entry's pairs).
-`fv[r]` marks registers whose front copy is current; a redirect or an
+With `DUAL` both have a sixth read port (the second slot's A), the front
+file's port 1 also takes the second slot's writes, and the back file has
+a third write port (the second slot's WB).  `fv[r]` marks registers whose front copy is current; a redirect or an
 exception clears `fv`, so the back file is read again with no copy.
 Exception entry writes the routine's operands (vector address, PC, SR,
 address, format/vector word, SSW, EA, WB3A, WB3D) into the back file over
@@ -223,6 +292,19 @@ up to five cycles before the routine starts.
   for a return the top of the fetch's own return stack, resynchronized from
   D1's on every redirect.  D1 checks every flagged word and rewrites or
   drops a wrong entry.
+* **Target words** (`BTIC`): beside each BTB entry, a block RAM keeps the
+  long word its target starts in, filled from the first cache hit the
+  entry's redirect makes there (not for returns, nor for a target long
+  word that holds a BTB branch or a word that could end a change of
+  flow).  A hit with them hands the words to F2 in the cycle the redirect
+  would lose -- the target's first word in the branch's own chunk when
+  that chunk is one word, where D1 looks for a companion -- and sends F0
+  to the long word after.  The words are a copy of the instruction cache:
+  each entry is tagged with the target it was filled from and the S bit,
+  and a sweep of the valid bits (LUT RAM; the words are not used while it
+  runs) drops them all on CINV/CPUSH of the instruction cache, a snooped
+  invalidation, an I-ATC flush, or a change of CACR.IE, TC (E, P), ITT0/1
+  (match fields, CM), CDIS or MDIS.  `tb/asm/t_btic.s` checks each.
 * EX verifies direction and target of every prediction; a misprediction
   redirects the front end as the branch leaves EX.
 
@@ -245,13 +327,15 @@ up to five cycles before the routine starts.
 
 ## Data memory unit (`ap68040_dmu.sv`)
 
-* Data cache: 4 KB, 4 ways of 64 sets of 16-byte lines, physically tagged
-  (PA31-10), indexed by PA9-4 (= LA9-4).  Tags and data in M10K; valid and
+* Data cache: 8 KB (`CSB` 7), 4 ways of 128 sets of 16-byte lines,
+  physically tagged (PA31-11), indexed by PA10-4 (= LA10-4: the set stays
+  within the 4 KB page offset, so no aliasing).  The instruction cache is
+  the same shape.  Tags and data in M10K; valid and
   dirty bits in LUT RAM, packed per set.  Modes from the ATC/TTR CM field:
   copyback, write-through, cache-inhibited serialized and nonserialized;
   an untranslated access with no TTR match is cachable write-through.
   Reset leaves the caches and ATCs alone (8.2.1); CINVA clears a cache in
-  a sweep of its 64 sets.
+  a sweep of its sets.
 * The fast path: a load that hits, within one line, answers from DC2's copy;
   a copyback store that hits writes the RAM in its WB cycle.
 * An operand across a line whose first part hits: one stolen lookup of the
@@ -268,8 +352,9 @@ up to five cycles before the routine starts.
   readers share one line multiplexer; its operand extractor selects its
   way from the job's registered way; a table walk's descriptor lookup
   compares the tags of its set every cycle the walk runs and uses the
-  registered hit and way (a snoop that freezes the engine invalidates
-  them for a cycle).  With the data cache disabled (CACR or CDIS)
+  registered hit and way, two cycles after it sets the tag port's address
+  (the tags arrive a cycle late, then the compare registers; a snoop that
+  freezes the engine invalidates them for a cycle).  With the data cache disabled (CACR or CDIS)
   accesses bypass it and leave its lines alone.
 * Table walks (MC68040UM 3.2): root, pointer and page descriptors,
   indirect descriptors, 4 KB/8 KB pages, accumulated write protection, U

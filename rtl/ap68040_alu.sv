@@ -284,3 +284,88 @@ always_comb begin
 end
 
 endmodule
+
+//--------------------------------------------------------------------------
+// ap68040_alu1: the second slot's ALU (ap68040_pkg s1_t), the S1_* subset
+// of ap68040_alu with the same results and flags.  X is produced only by
+// ADD/SUB/NEG; the other ops never have it in their flag mask.
+//--------------------------------------------------------------------------
+module ap68040_alu1
+	import ap68040_pkg::*;
+(
+	input  logic  [3:0] op,
+	input  logic  [1:0] sz,
+	input  logic [31:0] a,
+	input  logic [31:0] b,
+	output logic [31:0] res,
+	output logic  [4:0] flags_out   // X N Z V C
+);
+
+logic [31:0] m;
+always_comb
+	case (sz)
+		SZ_B:    m = 32'h0000_00FF;
+		SZ_W:    m = 32'h0000_FFFF;
+		default: m = 32'hFFFF_FFFF;
+	endcase
+function automatic logic msb(input logic [31:0] v, input logic [1:0] s);
+	msb = (s == SZ_B) ? v[7] : (s == SZ_W) ? v[15] : v[31];
+endfunction
+
+wire        sub   = (op == S1_SUB) || (op == S1_CMP) || (op == S1_NEG);
+wire [31:0] am    = a & m;
+wire [31:0] bm    = b & m;
+wire [31:0] add_l = (op == S1_NEG) ? 32'd0 : bm;
+wire [31:0] add_r = (op == S1_NEG) ? bm : am;
+wire [32:0] sum   = sub ? ({1'b0, add_l} - {1'b0, add_r}) : ({1'b0, add_l} + {1'b0, add_r});
+wire        s_c   = (sz == SZ_B) ? sum[8] : (sz == SZ_W) ? sum[16] : sum[32];
+wire        s_n   = msb(sum[31:0], sz);
+wire        s_z   = (sum[31:0] & m) == 32'd0;
+wire        l_n   = (op == S1_NEG) ? 1'b0 : msb(b, sz);
+wire        r_n   = (op == S1_NEG) ? msb(b, sz) : msb(a, sz);
+wire        s_v   = sub ? ((l_n != r_n) && (s_n != l_n)) : ((l_n == r_n) && (s_n != l_n));
+
+always_comb begin
+	logic [31:0] l;
+	res = b;
+	flags_out = 5'd0;
+	case (op)
+		S1_ADD, S1_SUB, S1_NEG: begin
+			res = (sum[31:0] & m) | (b & ~m);
+			flags_out = {s_c, s_n, s_z, s_v, s_c};
+		end
+		S1_CMP: flags_out = {1'b0, s_n, s_z, s_v, s_c};
+		S1_AND, S1_OR, S1_EOR, S1_NOT, S1_MOV, S1_CLR: begin
+			case (op)
+				S1_AND:  l = bm & am;
+				S1_OR:   l = bm | am;
+				S1_EOR:  l = bm ^ am;
+				S1_NOT:  l = ~bm & m;
+				S1_MOV:  l = am;
+				default: l = 32'd0;
+			endcase
+			res = (l & m) | (b & ~m);
+			flags_out = {1'b0, msb(l, sz), l == 32'd0, 1'b0, 1'b0};
+		end
+		S1_EXT: begin
+			if (sz == SZ_W) begin
+				res = {b[31:16], {8{b[7]}}, b[7:0]};
+				flags_out = {1'b0, b[7], b[7:0] == 8'd0, 1'b0, 1'b0};
+			end
+			else begin
+				res = {{16{b[15]}}, b[15:0]};
+				flags_out = {1'b0, b[15], b[15:0] == 16'd0, 1'b0, 1'b0};
+			end
+		end
+		S1_EXTB: begin
+			res = {{24{b[7]}}, b[7:0]};
+			flags_out = {1'b0, b[7], b[7:0] == 8'd0, 1'b0, 1'b0};
+		end
+		default: begin    // S1_SWAP
+			res = {b[15:0], b[31:16]};
+			flags_out = {1'b0, b[15], b == 32'd0, 1'b0, 1'b0};
+		end
+	endcase
+end
+
+endmodule

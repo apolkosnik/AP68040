@@ -5,7 +5,8 @@
 ;
 ; User data goes through MOVES (SFC = DFC = 1) under DTT0, whose CM field
 ; selects the mode; supervisor data (the bench registers, the memory
-; checks) is noncachable (DTT1).  Lines of one set are $400 apart.
+; checks) is noncachable (DTT1).  Lines of one set are $800 apart (one set
+; with 4 or 8 Kbyte caches).
 ;   write-through (CM 00)
 ;   1    a read miss fills the line (4 reads); a read hit makes none
 ;   2    a write hit updates the line and writes through (1 write, and the
@@ -33,11 +34,11 @@ WLO	equ	$F2D0
 WHI	equ	$F2D4
 WRD	equ	$F2D8
 WWR	equ	$F2DC
-L0	equ	$9C00		; five lines of one set
-L1	equ	$A000
-L2	equ	$A400
+L0	equ	$9000		; five lines of one set
+L1	equ	$9800
+L2	equ	$A000
 L3	equ	$A800
-L4	equ	$AC00
+L4	equ	$B000
 
 failt	macro
 	move.w	#\1,d7

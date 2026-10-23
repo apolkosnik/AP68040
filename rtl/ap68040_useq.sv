@@ -17,6 +17,9 @@
 
 module ap68040_useq
 	import ap68040_pkg::*, ap68040_upkg::*;
+#(
+	parameter bit DUAL = 1              // pair records' companions (s1_t)
+)
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -31,6 +34,7 @@ module ap68040_useq
 
 	input  logic        smode,
 	input  logic        master,     // M bit
+	input  logic        trace,      // T1 or T0: every instruction alone
 
 	input  logic        exc_go,
 	input  logic        exc_pend,   // the back end prepares an exception entry: issue nothing
@@ -40,7 +44,9 @@ module ap68040_useq
 	// uop FIFO towards the back end: uq0 is the head
 	output logic  [1:0] uq_n,
 	output uop_t        uq0,
-	input  logic        uq_pop      // the back end takes uq0 this cycle
+	output s1_t         uq0s,       // ... and the second slot beside it
+	input  logic        uq_pop,     // the back end takes uq0 this cycle
+	output logic [19:0] dbg_pu      // observation only: dual-issue events (see the end)
 );
 
 
@@ -78,6 +84,7 @@ assign uw = uw_q;
 
 // uop FIFO
 uop_t        uq1;
+s1_t         uq1s;
 wire         room_out = (uq_n != 2'd2);
 
 //--------------------------------------------------------------------------
@@ -786,10 +793,130 @@ end
 // sequencing.  uw_q is read one cycle ahead: the next address is chosen
 // from the current word and the records, and the ROM output registered.
 //--------------------------------------------------------------------------
-wire step = uw_v && room_out && !flush && !exc_go && !exc_pend;
+//--------------------------------------------------------------------------
+// the record's companion (D1's c_v/c_opw): beside the instruction's uop
+// when that is the whole instruction and the pair may issue together,
+// else a uop of its own in the next issue cycle (cq_v)
+//--------------------------------------------------------------------------
+s1_t   cs;                       // the companion, its registers named
+always_comb begin
+	cs = s1_dec(src.c_opw);
+	cs.v = DUAL && src.c_v && !exc_mode;
+	// (operand A and an address-register destination can be A7: the active
+	// stack)
+	if (cs.a_reg == 5'd15) cs.a_reg = sp_reg;
+	if (cs.d_reg == 5'd15) cs.d_reg = sp_reg;
+end
+// what the uop beside a companion may be: one with no change of flow, no
+// serialization or SR write, not the FPU's, and no upd2 (the second slot
+// reads and writes the register file through the upd2 ports)
+// (a change of flow too: the companion is the instruction the front end
+// predicted after it, and goes with it when EX finds otherwise)
+function automatic logic s0_ok(input uop_t u);
+	s0_ok = u.first && u.last && (u.exc == 8'd0) && !u.ser &&
+	        !u.upd2_v && (u.dyn == 3'd0) && !u.exr &&
+	        (u.op != OP_FPU) && (u.op != OP_RTE) && (u.op != OP_RTEF) &&
+	        (u.op != OP_MISC) && (u.op != OP_SRLOG) && (u.op != OP_SPW) &&
+	        (u.op != OP_CHKSR) && (u.op != OP_IACKV);
+endfunction
+// what the uop beside a load companion may be: one with no memory access
+// (the pair's access is the load's) and none of EX's traps
+function automatic logic s0_ld(input uop_t u);
+	s0_ld = (u.mem == M_NONE) && (u.op <= OP_DBCC) && (u.op != OP_TAS);
+endfunction
+// the companion touches no register the uop writes
+function automatic logic s1_indep(input uop_t u, input s1_t c);
+	logic [4:0] r [3];
+	logic       rv [3];
+	s1_indep = 1'b1;
+	r[0] = c.a_reg; rv[0] = c.a_v && !c.a_imm;
+	r[1] = c.b_reg; rv[1] = c.b_v;
+	r[2] = c.d_reg; rv[2] = c.d_v || c.agop;
+	for (int i = 0; i < 3; i++)
+		if (rv[i] && ((u.d_v && u.d_reg == r[i]) || (u.upd_v && u.upd_reg == r[i])))
+			s1_indep = 1'b0;
+endfunction
+// the companion as a uop of its own
+function automatic uop_t s1_uop(input s1_t c, input logic [31:0] pc, input ras_snap_t ras);
+	uop_t u;
+	u = '0;
+	u.pc    = pc;
+	u.ilen  = 4'd1;
+	u.ras   = ras;
+	u.ras.k = 2'd0;
+	u.first = 1'b1;
+	u.last  = 1'b1;
+	if (c.ld) begin
+		// the load's access, as the microcode has it: (Ay) the base
+		u.ag     = 1'b1;
+		u.base_v = 1'b1;
+		u.base   = c.a_reg;
+		u.mem    = M_LD;
+		u.msz    = c.sz;
+	end
+	if (c.agop) begin
+		// AG's, as the microcode has them: ADDQ/SUBQ base + disp (QUICK_A),
+		// MOVEA the source as an index (VAL0: a word sign-extended)
+		u.ag      = 1'b1;
+		u.upd_v   = 1'b1;
+		u.upd_reg = c.d_reg;
+		if (c.imm != 8'd0) begin
+			u.base_v = 1'b1; u.base = c.a_reg; u.disp = {{24{c.imm[7]}}, c.imm};
+		end
+		else begin
+			u.idx_v = 1'b1; u.idx = c.a_reg; u.idx_l = !c.sxw;
+		end
+		return u;
+	end
+	case (c.op)
+		S1_MOV:  u.op = OP_MOV;
+		S1_ADD:  u.op = OP_ADD;
+		S1_SUB:  u.op = OP_SUB;
+		S1_CMP:  u.op = OP_CMP;
+		S1_AND:  u.op = OP_AND;
+		S1_OR:   u.op = OP_OR;
+		S1_EOR:  u.op = OP_EOR;
+		S1_NOT:  u.op = OP_NOT;
+		S1_NEG:  u.op = OP_NEG;
+		S1_CLR:  u.op = OP_CLR;
+		S1_EXTB: u.op = OP_EXTB;
+		S1_SWAP: u.op = OP_SWAP;
+		default: u.op = OP_EXT;
+	endcase
+	u.sz     = c.sz;
+	u.ccr_we = c.ccr_we;
+	u.a_src  = c.ld ? OS_MEM : c.a_imm ? OS_IMM : c.a_v ? OS_REG : OS_ZERO;
+	u.a_reg  = c.a_reg;
+	u.imm    = {{24{c.imm[7]}}, c.imm};
+	u.b_src  = c.b_v ? OS_REG : OS_ZERO;
+	u.b_reg  = c.b_reg;
+	u.d_v    = c.d_v;
+	u.d_reg  = c.d_reg;
+	s1_uop = u;
+endfunction
+logic  cq_v;                     // an unpaired companion waits to issue
+uop_t  cq_u;
+wire   c_emit = cq_v && room_out && !flush && !exc_go && !exc_pend;
+
+wire step = uw_v && room_out && !flush && !exc_go && !exc_pend && !cq_v;
 wire emit = step && !n_jump;
 wire stay = n_ptr || n_mv_pre || (uw.loop && !nu.last);   // same word again
 wire done = emit && !stay && uw.last;                       // instruction ends
+// the companion issues beside the uop that ends the instruction
+wire c_pair = done && cs.v && !trace && s0_ok(nu) && s1_indep(nu, cs) && (!cs.ld || s0_ld(nu));
+s1_t ns;                          // the slot beside the uop written
+always_comb begin
+	ns = cs;
+	ns.v = c_pair;
+end
+// (the uop written: the sequencer's, or the waiting companion's)
+uop_t wu;
+s1_t  wus;
+wire  wv = emit || c_emit;
+always_comb begin
+	wu  = c_emit ? cq_u : nu;
+	wus = c_emit ? '0 : ns;
+end
 
 assign rq_pop = done && !exc_mode;
 // The pop from the word's own bits and the record's EA modes, not the uop
@@ -841,7 +968,7 @@ end
 
 // the microcode ROM in block RAM: its address register is the sequencing
 // register (uw_q is the word at upc, read one cycle ahead as before)
-(* romstyle = "M10K" *) logic [$bits(uword_t)-1:0] urom [0:1023];
+(* romstyle = "M10K" *) (* rom_style = "block" *) logic [$bits(uword_t)-1:0] urom [0:1023];
 initial begin
 `include "gen/ap68040_ucode_init.svh"
 end
@@ -870,6 +997,10 @@ always_ff @(posedge clk) begin
 		uq_n     <= 2'd0;
 		uq0      <= '0;
 		uq1      <= '0;
+		uq0s     <= '0;
+		uq1s     <= '0;
+		cq_v     <= 1'b0;
+		cq_u     <= '0;
 	end
 	else begin
 		upc  <= na;
@@ -878,14 +1009,24 @@ always_ff @(posedge clk) begin
 		// uop FIFO: both outcomes formed without the pop (the back end's
 		// stall, a late signal), which selects between them last
 		if (uq_pop && uq_n != 2'd0) begin
-			uq0  <= (emit && uq_n == 2'd1) ? nu : uq1;
-			uq1  <= (emit && uq_n == 2'd2) ? nu : uq1;
-			uq_n <= emit ? uq_n : uq_n - 2'd1;
+			uq0  <= (wv && uq_n == 2'd1) ? wu : uq1;
+			uq1  <= (wv && uq_n == 2'd2) ? wu : uq1;
+			uq0s <= (wv && uq_n == 2'd1) ? wus : uq1s;
+			uq1s <= (wv && uq_n == 2'd2) ? wus : uq1s;
+			uq_n <= wv ? uq_n : uq_n - 2'd1;
 		end
 		else begin
-			uq0  <= (emit && uq_n == 2'd0) ? nu : uq0;
-			uq1  <= (emit && uq_n == 2'd1) ? nu : uq1;
-			uq_n <= emit ? uq_n + 2'd1 : uq_n;
+			uq0  <= (wv && uq_n == 2'd0) ? wu : uq0;
+			uq1  <= (wv && uq_n == 2'd1) ? wu : uq1;
+			uq0s <= (wv && uq_n == 2'd0) ? wus : uq0s;
+			uq1s <= (wv && uq_n == 2'd1) ? wus : uq1s;
+			uq_n <= wv ? uq_n + 2'd1 : uq_n;
+		end
+		// a companion that did not pair issues next on its own
+		if (c_emit) cq_v <= 1'b0;
+		if (done && cs.v && !c_pair) begin
+			cq_v <= 1'b1;
+			cq_u <= s1_uop(cs, src.c_tk ? src.target : src.pc + {27'd0, src.ilen, 1'b0}, src.ras);
 		end
 
 		if (emit) begin
@@ -933,6 +1074,7 @@ always_ff @(posedge clk) begin
 			mv_t11 <= 1'b0;
 			mv_fix <= 2'd0;
 			uq_n  <= 2'd0;
+			cq_v  <= 1'b0;
 			if (!exc_go) exc_mode <= 1'b0;
 		end
 		if (exc_go) begin
@@ -940,6 +1082,7 @@ always_ff @(posedge clk) begin
 			first    <= 1'b1;
 			ssp      <= exc_ssp;
 			uq_n     <= 2'd0;
+			cq_v     <= 1'b0;
 		end
 	end
 end
@@ -986,11 +1129,61 @@ always_ff @(posedge clk)
 		$display("FAIL: useq: a MOVEM offset %h for AG (merge %b)", dbg_mvo, dbg_dm);
 		$finish;
 	end
+// every second-slot instruction the microcode runs: s1_dec gives its uop
+always_ff @(posedge clk)
+	if (nreset && emit && nu.first && nu.last && !exc_mode && src.exc == 8'd0 &&
+	    s1_dec(src.opw).v) begin
+		s1_t  c;
+		uop_t r;
+		c = s1_dec(src.opw);
+		if (c.a_reg == 5'd15) c.a_reg = sp_reg;
+		if (c.d_reg == 5'd15) c.d_reg = sp_reg;
+		r = s1_uop(c, nu.pc, nu.ras);
+		if (c.agop ? (!nu.ag || !nu.upd_v || nu.upd_reg != r.upd_reg || nu.d_v || nu.ccr_we != 5'd0 ||
+		              nu.mem != M_NONE || nu.br != BR_NONE || nu.upd2_v || nu.pinc || nu.ser ||
+		              nu.base_v != r.base_v || (r.base_v && (nu.base != r.base || nu.disp != r.disp)) ||
+		              nu.idx_v != r.idx_v || (r.idx_v && (nu.idx != r.idx || nu.idx_l != r.idx_l ||
+		                                                  nu.scale != 2'd0 || nu.disp != 32'd0)) ||
+		              nu.ilen != 4'd1) :
+		    c.ld ? (r.op != nu.op || r.sz != nu.sz || r.ccr_we != nu.ccr_we || nu.a_src != OS_MEM ||
+		            nu.a_sxw || r.b_src != nu.b_src || (r.b_src == OS_REG && r.b_reg != nu.b_reg) ||
+		            r.d_v != nu.d_v || (r.d_v && r.d_reg != nu.d_reg) ||
+		            nu.mem != M_LD || nu.msz != r.msz || !nu.ag || !nu.base_v || nu.base != r.base ||
+		            nu.idx_v || nu.disp != 32'd0 || nu.dmv || nu.pinc || nu.upd_v || nu.upd2_v ||
+		            nu.mfc != r.mfc || nu.mlock || nu.mprog || nu.br != BR_NONE ||
+		            nu.ser || nu.dyn != 3'd0 || nu.ilen != 4'd1) :
+		    (r.op != nu.op || r.sz != nu.sz || r.ccr_we != nu.ccr_we ||
+		    r.a_src != nu.a_src || (r.a_src == OS_REG && r.a_reg != nu.a_reg) ||
+		    (r.a_src == OS_IMM && r.imm != nu.imm) || nu.a_sxw ||
+		    r.b_src != nu.b_src || (r.b_src == OS_REG && r.b_reg != nu.b_reg) ||
+		    r.d_v != nu.d_v || (r.d_v && r.d_reg != nu.d_reg) ||
+		    nu.mem != M_NONE || nu.ag || nu.br != BR_NONE || nu.upd_v || nu.upd2_v ||
+		    nu.ser || nu.dyn != 3'd0 || nu.ilen != 4'd1)) begin
+			$display("FAIL: useq: second-slot decode of %04x: op %0d/%0d sz %0d/%0d ccr %h/%h a %0d:%0d/%0d:%0d imm %h/%h b %0d:%0d/%0d:%0d d %b:%0d/%b:%0d (pc %h)",
+			         src.opw, r.op, nu.op, r.sz, nu.sz, r.ccr_we, nu.ccr_we,
+			         r.a_src, r.a_reg, nu.a_src, nu.a_reg, r.imm, nu.imm,
+			         r.b_src, r.b_reg, nu.b_src, nu.b_reg, r.d_v, r.d_reg, nu.d_v, nu.d_reg, nu.pc);
+			$finish;
+		end
+	end
 always_ff @(posedge clk)
 	if (nreset && emit && dbg_dm && nu.disp != dbg_dpre) begin
 		$display("FAIL: useq: a merged uop's displacement %h changed from %h", nu.disp, dbg_dpre);
 		$finish;
 	end
 // synthesis translate_on
+
+// Dual-issue events for a logic analyser's counters, registered, one-clock
+// strobes as an instruction with a companion ends:
+//   [16] cv     the instruction carries a companion
+//   [17] pair   ... and it issues beside the instruction's last uop
+//   [18] dep    ... it does not: the uop writes a register it touches
+//   [19] s0     ... it does not: that uop may not have one beside it (or
+//               trace)
+// with the instruction's operation word [15:0].
+wire pu_split = done && cs.v && !c_pair;
+wire pu_dep   = pu_split && !trace && s0_ok(nu) && (!cs.ld || s0_ld(nu)) && !s1_indep(nu, cs);
+always_ff @(posedge clk)
+	dbg_pu <= {pu_split && !pu_dep, pu_dep, c_pair, done && cs.v, src.opw};
 
 endmodule

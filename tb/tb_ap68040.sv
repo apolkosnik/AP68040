@@ -165,8 +165,14 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `ifndef AP_DC1_ATC
 `define AP_DC1_ATC 0
 `endif
+`ifndef AP_DUAL
+`define AP_DUAL 1
+`endif
+`ifndef AP_BTIC
+`define AP_BTIC 1
+`endif
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
-          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
+          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC), .DUAL(`AP_DUAL), .BTIC(`AP_BTIC)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
@@ -180,7 +186,8 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted),
+	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint(), .dbg_fe(), .dbg_pev(pev)
 );
 
 // slave
@@ -289,20 +296,29 @@ endfunction
 //--------------------------------------------------------------------------
 // MMIO and error injection
 //--------------------------------------------------------------------------
-int          result;          // 0 running, 1 pass, 2 fail
+int          result /*verilator public_flat_rw*/;  // 0 running, 1 pass, 2 fail (public: Verilator 5.020 otherwise lost the always_ff update the initial loop polls)
 int          errors;
 int          cycles;
 int          stamp_prev;
 int          insns, insn_prev;   // instructions completed (last uops retired)
 always_ff @(posedge clk) begin
 	if (!rsti_n) insns <= 0;
-	else if (dut.be.adv_wb && dut.be.wb_u.last) insns <= insns + 1;
+	else if (dut.be.adv_wb && dut.be.wb_u.last) insns <= insns + 1 + (dut.be.wb1_commit ? 1 : 0);
 end
 
 // +prof: where the cycles go between stamps.  A cycle that retires a uop
 // is "retire"; otherwise the oldest stage that holds (or the first empty
 // one, going back from WB) takes the blame.
 logic prof;
+// +pevstat: totals of the core's dual-issue event strobes (dbg_pev[57:48])
+logic [63:0] pev;
+int          pevn [10];
+initial for (int i = 0; i < 10; i++) pevn[i] = 0;
+always @(posedge clk) for (int i = 0; i < 10; i++) if (pev[48 + i]) pevn[i]++;
+task automatic pev_report();
+	$display("PEVSTAT start=%0d slow=%0d absent=%0d notslot2=%0d companion=%0d paired=%0d dep=%0d first=%0d retired=%0d retired2=%0d",
+	         pevn[0], pevn[1], pevn[2], pevn[3], pevn[4], pevn[5], pevn[6], pevn[7], pevn[8], pevn[9]);
+endtask
 int   pf [12];
 localparam int PF_RET = 0, PF_WB = 1, PF_EX = 2, PF_DC2 = 3, PF_DC1 = 4, PF_AG = 5,
                PF_FE = 6, PF_UOPS = 7, PF_REDIR = 8, PF_DREDIR = 9, PF_FQE = 10, PF_HALT = 11;
@@ -381,6 +397,59 @@ end
 // BTB: followed, overruled at a branch's end, restarted (flag inside)
 int btc [3];
 initial for (int i = 0; i < 3; i++) btc[i] = 0;
+// dual issue: companions D1 took (after a BTB-taken branch), pairs at WB
+// (beside a change of flow), companions that issued alone, of the pairs
+// the second slot's loads, and those run again alone (a fault at DC2)
+int dic [7];
+initial for (int i = 0; i < 7; i++) dic[i] = 0;
+always_ff @(posedge clk) if (rsti_n && prof) begin
+	if (dut.dec.push && dut.dec.nrec_q.c_v) begin
+		dic[0]++;
+		if (dut.dec.nrec_q.c_tk) dic[1]++;
+	end
+	if (dut.be.wb1_commit) begin
+		dic[2]++;
+		if (dut.be.wb_u.br != 3'd0) dic[3]++;
+		if (dut.be.wb_s.ld) dic[5]++;
+	end
+	if (dut.be.adv_wb && dut.be.wb_v && dut.be.wb_s.v && dut.be.wb1_flt) dic[6]++;
+	if (dut.useq.c_emit) dic[4]++;
+end
+// a BTB-taken branch's decode: paired with its target's first
+// instruction, the target not yet in the queue, there but no companion
+// (not a second-slot word), anything else
+int btp [9];
+initial for (int i = 0; i < 9; i++) btp[i] = 0;
+always_ff @(posedge clk) if (rsti_n && prof) begin
+	if (dut.fetch.tj_go && !dut.fetch.redir_any) btp[4]++;
+	// the BTB redirects without target words: a return, no words, no room
+	if (dut.fetch.f1_deliver && dut.fetch.f1_bt && !(dut.fetch.f1_bkind == 2 && dut.fetch.fras_n == 0)) begin
+		if (dut.fetch.f1_bkind == 2) btp[5]++;
+		else if (!dut.fetch.tw_hit) btp[6]++;
+		else if (!dut.fetch.f0_go) btp[7]++;   // (waits for room)
+	end
+	if (dut.fetch.tw_fill) btp[8]++;
+	if (dut.dec.push && dut.dec.ph == 0 && dut.dec.bt_end && dut.dec.nrec.pred) begin
+		if (dut.dec.c_ok) btp[0]++;
+		else if (dut.dec.pd0.tot >= dut.dec.qcnt) btp[1]++;
+		else if (!dut.dec.win_s1[dut.dec.c_at]) btp[2]++;
+		else btp[3]++;
+	end
+end
+// ... and for the target not yet fetched, the clocks until it is
+int btg [5];
+int btg_k;
+initial begin for (int i = 0; i < 5; i++) btg[i] = 0; btg_k = 0; end
+always_ff @(posedge clk) if (rsti_n && prof) begin
+	if (btg_k != 0) begin
+		if (dut.dec.qcnt != 0) begin btg[(btg_k > 4) ? 4 : btg_k]++; btg_k <= 0; end
+		else if (dut.dec.flush || dut.redir_v) btg_k <= 0;
+		else btg_k <= btg_k + 1;
+	end
+	if (dut.dec.push && dut.dec.ph == 0 && dut.dec.bt_end && dut.dec.nrec.pred &&
+	    !dut.dec.c_ok && dut.dec.pd0.tot >= dut.dec.qcnt)
+		btg_k <= 1;
+end
 always_ff @(posedge clk) if (rsti_n) begin
 	if (dut.dec.push && dut.dec.ph == 0 && dut.dec.bt_end) begin
 		if (dut.dec.nrec.pred && dut.dec.ntarget == dut.dec.bt_tgt) btc[0]++;
@@ -472,6 +541,8 @@ task automatic prof_report();
 	         100 * pf[PF_DC2] / tot, 100 * pf[PF_DC1] / tot, 100 * pf[PF_AG] / tot,
 	         100 * pf[PF_FE] / tot, 100 * pf[PF_FQE] / tot, pf[PF_REDIR], pf[PF_DREDIR]);
 	$display("PROF BTB: followed %0d, overruled at the end %0d, restarted %0d", btc[0], btc[1], btc[2]);
+	$display("PROF dual: companions %0d (at a BTB target %0d), pairs %0d (beside a change of flow %0d), alone %0d, loads %0d, run again %0d",
+	         dic[0], dic[1], dic[2], dic[3], dic[4], dic[5], dic[6]);
 	$display("PROF snoops: hit cache %0d, push buffer %0d, queued push %0d, miss %0d; supplied %0d, sunk %0d, invalidated %0d, I-side refetches %0d",
 	         snc[0], snc[1], snc[2], snc[3], snc[4], snc[5], snc[6], snc[7]);
 	for (int i = 0; i < 8; i++) snc[i] = 0;
@@ -480,6 +551,11 @@ task automatic prof_report();
 	for (int i = 0; i < 5; i++) lsl[i] = 0;
 	$display("PROF engine: DC2 jobs %0d, WB store jobs %0d, maintenance %0d, walks %0d, busy cycles %0d; fast loads held by an older store %0d cycles",
 	         ej[0], ej[1], ej[2], ej[3], ej[4], ej[5]);
+	$display("PROF BTB-taken decodes: paired %0d, target not yet fetched %0d, no companion %0d, other %0d",
+	         btp[0], btp[1], btp[2], btp[3]);
+	$display("PROF   target words used %0d (waited for room %0d); not: a return %0d, none %0d; filled %0d",
+	         btp[4], btp[7], btp[5], btp[6], btp[8]);
+	$display("PROF   target arrived after 1: %0d, 2: %0d, 3: %0d, 4+: %0d clocks", btg[1], btg[2], btg[3], btg[4]);
 	for (int i = 0; i < 6; i++) ej[i] = 0;
 	for (int i = 0; i < 16; i++) begin
 		if (ejk[i] != 0) $display("PROF   DC2 jobs mem=%0d hit=%0d split=%0d: %0d", i >> 2, (i >> 1) & 1, i & 1, ejk[i]);
@@ -606,8 +682,10 @@ always_ff @(posedge clk) begin
 	// the DMU's fallback for a split WB store whose second line went
 	if (rsti_n && dut.dmu.wfs_p1 && !dut.dmu.sn_frz && !dut.dmu.m4.x1.hit)
 		mem.mem[16'hF2E0 >> 2] <= mem.mem[16'hF2E0 >> 2] + 32'd1;
-	// Bcc/DBcc mispredictions (t_loops)
-	if (rsti_n && dut.be.adv_ex && dut.be.ex_mispred && dut.be.ex_bdb && !dut.be.flush)
+	// Bcc/DBcc mispredictions (t_loops); not a wrong-path branch WB kills
+	// as it leaves EX
+	if (rsti_n && dut.be.adv_ex && dut.be.ex_mispred && dut.be.ex_bdb && !dut.be.flush &&
+	    !dut.be.kill_now)
 		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
 	// the core's options, for the programs that check what they do
 	mem.mem[16'hF2E8 >> 2] <= {31'd0, 1'(`AP_LOOP_PRED)};
@@ -954,6 +1032,10 @@ always_ff @(posedge clk)
 		$display("%8d BUS %s a=%08x d=%08x be=%b siz=%0d tt=%0d tm=%0d%s", cycles,
 		         ev_rd ? "RD" : "WR", ev_addr, ev_data, ev_be, ev_siz, ev_tt, ev_tm,
 		         ev_err ? " TEA" : "");
+// (the second slot that commits beside it: at the first's next pc)
+always_ff @(posedge clk)
+	if (trace && dut.be.wb1_commit)
+		$display("%8d WB1 pc=%08x ld=%b", cycles, dut.be.wb_redir_pc, dut.be.wb_s.ld);
 always_ff @(posedge clk)
 	if (trace && dut.be.adv_wb)
 		$display("%8d WB pc=%08x op=%0d last=%b d=%b r%0d=%08x upd=%b r%0d=%08x st=%b exc=%0d redir=%b->%08x",
@@ -1083,6 +1165,7 @@ initial begin
 	end
 	if (prof) prof_report();
 	if (pcprof) pcprof_dump();
+	if ($test$plusargs("pevstat")) pev_report();
 	if (result == 1 && errors == 0 && halt_bad == 0)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)

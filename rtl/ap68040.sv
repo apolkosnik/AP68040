@@ -21,7 +21,9 @@ module ap68040
 	parameter bit         EARLY_RES    = 0,      // AG's early results for younger uops' base and index
 	parameter bit         DC1_ATC      = 0,      // DC1's own ATC port and tag compare (timing)
 	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
-	parameter int         DIV_STEPS    = 2       // divide steps per cycle (2 or 4)
+	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
+	parameter bit         DUAL         = 1,      // dual issue: the second slot (ap68040_pkg s1_t)
+	parameter bit         BTIC         = 1       // the fetch BTB's target words
 )(
 
 	input  logic        clk,
@@ -73,8 +75,24 @@ module ap68040
 	// debug / test
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
-	output logic        dbg_halted
+	output logic        dbg_halted,
+	// for a system's external caches and monitors: VBR (the NMI vector's
+	// address), CACR, and a pulse for every completed CINV/CPUSH
+	output logic [31:0] dbg_vbr,
+	output logic [31:0] dbg_cacr,
+	output logic        dbg_cmaint,
+	// observation only: the fetch unit, the decoder's queue, the redirects,
+	// D1's BTB writes and WB's PC (384 bits, see the assignment)
+	output logic [383:0] dbg_fe,
+	// observation only: dual-issue events, one-clock strobes, for counters
+	// (see the assignment)
+	output logic  [63:0] dbg_pev
 );
+
+// the dual-issue events behind dbg_pev
+logic  [35:0] dbg_pd;
+logic  [19:0] dbg_pu;
+logic         dbg_retire2;
 
 // reset synchronizer: two bus clocks, so the reset and the release of the
 // bus pins it begins start on a bus clock edge.  Once RSTI negates the
@@ -228,7 +246,7 @@ logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
-logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
+logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_pastc, dm_older, dm_s1;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic        bht_dis;
@@ -242,19 +260,20 @@ logic [15:0] dm_fssw, dm_st_fssw;
 
 logic  [1:0] uq_n;
 uop_t        uq0;
+s1_t         uq0s;
 logic        uo_rdy;
 
 ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES),
-                  .SKID(SKID), .DIV_STEPS(DIV_STEPS)) be (
+                  .SKID(SKID), .DIV_STEPS(DIV_STEPS), .DUAL(DUAL)) be (
 	.clk(clk), .nreset(nreset),
-	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
+	.in_v(uq_n != 2'd0), .in_u(uq0), .in_s(uq0s), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_pastc(dm_pastc), .dm_ack(dm_ack), .dm_older(dm_older), .dm_s1(dm_s1),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
@@ -272,15 +291,15 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted), .fetch_stop(be_fstop)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_retire2(dbg_retire2), .halted(dbg_halted), .fetch_stop(be_fstop)
 );
 
 ap68040_dmu #(.DC1_ATC(DC1_ATC)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
 	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
-	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
-	.dm_older(dm_older),
+	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_pastc(dm_pastc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
+	.dm_older(dm_older), .dm_s1(dm_s1),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
 	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .ldata_al(dm_ldata_al), .ldata_alv(dm_ldata_alv), .fault(dm_fault), .fvec(dm_fvec),
@@ -324,7 +343,7 @@ atce_t       iatc_went;
 
 // front end
 logic [15:0] win [8];
-logic  [7:0] win_flt, win_fdem, win_fatc, win_bt;
+logic  [7:0] win_flt, win_fdem, win_fatc, win_bt, win_s1;
 logic [31:0] bt_tgt;
 logic        btb_we, btb_wv, btb_wslot;
 logic [BTB_AW-1:0] btb_wi;
@@ -341,13 +360,14 @@ pd_t         pd0, pd0_n;
 logic  [3:0] qcnt;
 logic [31:0] qpc;
 logic  [2:0] consume;
+logic        consume_t;
 logic        d_redir_v;
 logic [31:0] d_redir_pc;
 logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch fetch (
+ap68040_fetch #(.BTIC(BTIC)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
@@ -355,8 +375,8 @@ ap68040_fetch fetch (
 	.stop(be_fstop || rsto_busy), .smode(sr[13]),
 	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1), .cdis(cdis), .mdis(mdis),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
-	.win_bt(win_bt), .bt_tgt(bt_tgt),
-	.pd0(pd0), .pd0_n(pd0_n), .qcnt(qcnt), .qpc(qpc), .consume(consume),
+	.win_bt(win_bt), .win_s1(win_s1), .bt_tgt(bt_tgt),
+	.pd0(pd0), .pd0_n(pd0_n), .qcnt(qcnt), .qpc(qpc), .consume(consume), .consume_t(consume_t),
 	.q_odd(q_odd),
 	.btb_we(btb_we), .btb_wi(btb_wi), .btb_wv(btb_wv), .btb_wtag(btb_wtag),
 	.btb_wslot(btb_wslot), .btb_wkind(btb_wkind), .btb_wtgt(btb_wtgt),
@@ -369,7 +389,7 @@ ap68040_fetch fetch (
 	.ic_inv(ic_inv), .ic_inv_scope(ic_inv_scope), .ic_inv_pa(ic_inv_pa),
 	.ic_inv_done(ic_inv_done),
 	.sn_inv(sn_ic), .sn_inv_pa(sn_ic_pa), .sn_inv_all(sn_ic_all), .sn_inv_done(sn_ic_done),
-	.sn_ihit(sn_ihit),
+	.sn_ihit(sn_ihit), .dbg_f(dbg_f),
 	.b_req(b_req[1]), .b_breq(b_breq[1]),
 	.b_gnt(b_gnt[1]), .b_done(b_done[1]), .b_err(b_err[1]),
 	.b_rvalid(b_rvalid && b_rclient == 1'b1), .b_rdata(b_rdata), .b_rbeat(b_rbeat),
@@ -377,14 +397,14 @@ ap68040_fetch fetch (
 );
 assign b_wdata[1] = '0;
 
-ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
-	.clk(clk), .nreset(nreset), .flush(fe_flush),
+ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL)) dec (
+	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d), .dbg_pd(dbg_pd),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
-	.win_bt(win_bt), .bt_tgt(bt_tgt),
+	.win_bt(win_bt), .win_s1(win_s1), .bt_tgt(bt_tgt),
 	.pd0(pd0), .pd0_n(pd0_n), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
 	.smode(sr[13]),
-	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
+	.consume(consume), .consume_t(consume_t), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp),
@@ -393,12 +413,29 @@ ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
 	.ras_o(d_ras), .ras_tp_o(d_ras_tp), .ras_n_o(d_ras_n)
 );
 
-ap68040_useq useq (
+ap68040_useq #(.DUAL(DUAL)) useq (
 	.clk(clk), .nreset(nreset), .flush(fe_flush),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
-	.smode(sr[13]), .master(sr[12]),
+	.smode(sr[13]), .master(sr[12]), .trace(sr[15] || sr[14]),
 	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
-	.uq_n(uq_n), .uq0(uq0), .uq_pop(uo_rdy && uq_n != 2'd0)
+	.uq_n(uq_n), .uq0(uq0), .uq0s(uq0s), .uq_pop(uo_rdy && uq_n != 2'd0), .dbg_pu(dbg_pu)
 );
+
+assign dbg_vbr  = vbr;
+assign dbg_cacr = cacr;
+// (mt_op 1 and 2: MT_CINV and MT_CPUSH of the DMU)
+always_ff @(posedge clk)
+	dbg_cmaint <= nreset && mt_done && (mt_op == 3'd1 || mt_op == 3'd2);
+
+logic [191:0] dbg_f;
+logic   [9:0] dbg_d;
+// [15:0] D1's head operation word, [31:16] the word after it, [47:32] the
+// sequencer's instruction word; [55:48] strobes: D1 start, slow, abs, ns1
+// (ap68040_decode), companion, pair, dep, s0 (ap68040_useq); [57:56] WB
+// retires an instruction, and a second-slot one
+assign dbg_pev = {6'd0, dbg_retire2, dbg_retire, dbg_pu[19:16], dbg_pd[35:32],
+                  dbg_pu[15:0], dbg_pd[31:0]};
+assign dbg_fe = {dbg_d, 10'd0, consume, qcnt, d_redir_v, redir_v, btb_we, btb_wkind, btb_wslot, btb_wtgt,
+                 d_redir_pc, redir_pc, qpc, dbg_pc, dbg_f};
 
 endmodule

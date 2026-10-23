@@ -33,15 +33,18 @@ module ap68040_sdp_be #(
 	localparam int SL = (NB > 4) ? 4 : NB;      // bytes per slice
 	localparam int NS = (NB + SL - 1) / SL;     // slices
 	logic [NB*8-1:0] qr;
-	genvar gs, gb;
+	genvar gs;
 	generate
 		for (gs = 0; gs < NS; gs++) begin : g_sl
-			(* ramstyle = "M10K, no_rw_check" *) logic [SL-1:0][7:0] mem [0:(1<<AW)-1];
-			for (gb = 0; gb < SL; gb++) begin : g_b
-				always_ff @(posedge clk)
-					if (we && wbe[gs*SL + gb]) mem[waddr][gb] <= wdata[(gs*SL + gb)*8 +: 8];
+			// every write to this array, and its read, in ONE process: Vivado
+			// drops an array written from several processes into flip-flops.
+			(* ramstyle = "M10K, no_rw_check" *) logic [SL*8-1:0] mem [0:(1<<AW)-1];
+			always_ff @(posedge clk) begin
+				for (int gb = 0; gb < SL; gb++)
+					if (we && wbe[gs*SL + gb])
+						mem[waddr][gb*8 +: 8] <= wdata[(gs*SL + gb)*8 +: 8];
+				qr[gs*SL*8 +: SL*8] <= mem[raddr];
 			end
-			always_ff @(posedge clk) qr[gs*SL*8 +: SL*8] <= mem[raddr];
 		end
 	endgenerate
 	generate
@@ -77,15 +80,21 @@ module ap68040_tdp #(
 	// registered addresses and one multiplexer (Quartus's inferred bypass
 	// put three logic levels in front of the users' compares; a compare of
 	// the incoming address would put it behind the address's own logic).
-	(* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
+	(* ramstyle = "M10K, no_rw_check" *) (* ram_style = "block" *) logic [DW-1:0] mem [0:(1<<AW)-1];
 	logic [DW-1:0] qa_r, qb_r, wa_d, wb_d;
 	logic [AW-1:0] ra, rb, wa_q, wb_q;
 	logic          wa_v, wb_v;
+	// one write statement per always block: Vivado infers a true dual port
+	// block RAM only in that form.
 	always_ff @(posedge clk) begin
 		if (we_a) mem[addr_a] <= wd_a;
-		if (we_b) mem[addr_b] <= wd_b;
 		qa_r <= mem[addr_a];
+	end
+	always_ff @(posedge clk) begin
+		if (we_b) mem[addr_b] <= wd_b;
 		qb_r <= mem[addr_b];
+	end
+	always_ff @(posedge clk) begin
 		ra   <= addr_a;
 		rb   <= addr_b;
 		wa_v <= we_a; wa_q <= addr_a; wa_d <= wd_a;
@@ -198,12 +207,14 @@ module ap68040_pdrom
 	output pdw_t        q0,
 	output pdw_t        q1
 );
-	(* romstyle = "M10K" *) logic [31:0] pd_rom [0:8191];
+	(* romstyle = "M10K" *) (* rom_style = "block" *) logic [31:0] pd_rom [0:8191];
 	initial begin
 `include "gen/ap68040_pd_rom.svh"
 	end
-	always_ff @(posedge clk) begin
-		q0 <= pdw_t'(pd_rom[a0]);
-		q1 <= pdw_t'(pd_rom[a1]);
-	end
+	logic [31:0] r0, r1;
+	// one read per process: Vivado maps a two-read ROM to block RAM only then
+	always_ff @(posedge clk) r0 <= pd_rom[a0];
+	always_ff @(posedge clk) r1 <= pd_rom[a1];
+	assign q0 = pdw_t'(r0);
+	assign q1 = pdw_t'(r1);
 endmodule
