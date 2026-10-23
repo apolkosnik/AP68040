@@ -83,8 +83,16 @@ module ap68040
 	output logic        dbg_cmaint,
 	// observation only: the fetch unit, the decoder's queue, the redirects,
 	// D1's BTB writes and WB's PC (384 bits, see the assignment)
-	output logic [383:0] dbg_fe
+	output logic [383:0] dbg_fe,
+	// observation only: dual-issue events, one-clock strobes, for counters
+	// (see the assignment)
+	output logic  [63:0] dbg_pev
 );
+
+// the dual-issue events behind dbg_pev
+logic  [35:0] dbg_pd;
+logic  [19:0] dbg_pu;
+logic         dbg_retire2;
 
 // reset synchronizer: two bus clocks, so the reset and the release of the
 // bus pins it begins start on a bus clock edge.  Once RSTI negates the
@@ -283,7 +291,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_retire2(), .halted(dbg_halted), .fetch_stop(be_fstop)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_retire2(dbg_retire2), .halted(dbg_halted), .fetch_stop(be_fstop)
 );
 
 ap68040_dmu #(.DC1_ATC(DC1_ATC)) dmu (
@@ -390,7 +398,7 @@ ap68040_fetch #(.BTIC(BTIC)) fetch (
 assign b_wdata[1] = '0;
 
 ap68040_decode #(.LOOP_PRED(LOOP_PRED), .DUAL(DUAL)) dec (
-	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d),
+	.clk(clk), .nreset(nreset), .flush(fe_flush), .dbg_d(dbg_d), .dbg_pd(dbg_pd),
 	.ras_rv(ras_rv), .ras_rtp(ras_rtp), .ras_rn(ras_rn),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .win_s1(win_s1), .bt_tgt(bt_tgt),
@@ -410,7 +418,7 @@ ap68040_useq #(.DUAL(DUAL)) useq (
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
 	.smode(sr[13]), .master(sr[12]), .trace(sr[15] || sr[14]),
 	.exc_go(exc_go), .exc_pend(exc_pend), .exc_kind(exc_kind), .exc_ssp(exc_ssp),
-	.uq_n(uq_n), .uq0(uq0), .uq0s(uq0s), .uq_pop(uo_rdy && uq_n != 2'd0)
+	.uq_n(uq_n), .uq0(uq0), .uq0s(uq0s), .uq_pop(uo_rdy && uq_n != 2'd0), .dbg_pu(dbg_pu)
 );
 
 assign dbg_vbr  = vbr;
@@ -421,6 +429,12 @@ always_ff @(posedge clk)
 
 logic [191:0] dbg_f;
 logic   [9:0] dbg_d;
+// [15:0] D1's head operation word, [31:16] the word after it, [47:32] the
+// sequencer's instruction word; [55:48] strobes: D1 start, slow, abs, ns1
+// (ap68040_decode), companion, pair, dep, s0 (ap68040_useq); [57:56] WB
+// retires an instruction, and a second-slot one
+assign dbg_pev = {6'd0, dbg_retire2, dbg_retire, dbg_pu[19:16], dbg_pd[35:32],
+                  dbg_pu[15:0], dbg_pd[31:0]};
 assign dbg_fe = {dbg_d, 10'd0, consume, qcnt, d_redir_v, redir_v, btb_we, btb_wkind, btb_wslot, btb_wtgt,
                  d_redir_pc, redir_pc, qpc, dbg_pc, dbg_f};
 

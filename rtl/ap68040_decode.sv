@@ -52,6 +52,7 @@ module ap68040_decode
 
 	output logic  [2:0] consume,
 	output logic  [9:0] dbg_d,          // observation only: ph, use_n, go, go_part, fast
+	output logic [35:0] dbg_pd,         // observation only: dual-issue events (see the end)
 	output logic        consume_t,      // ... one word past a BTB-taken branch's end (a companion)
 	output logic        d_redir_v,
 	output logic [31:0] d_redir_pc,
@@ -995,5 +996,22 @@ always_ff @(posedge clk) begin
 end
 
 assign dbg_d = {2'(ph), use_n, go, go_part, fast, 1'b0};
+
+// Dual-issue events for a logic analyser's counters, registered, each a
+// one-clock strobe per instruction D1 starts (wrong-path ones included):
+//   [32] start  an instruction starts at the head (fast or slow path)
+//   [33] slow   ... and it is not a one-step fast-path decode: no companion
+//   [34] abs    a fast decode whose next word is not in the queue (or the
+//               instruction is longer than six words): no companion
+//   [35] ns1    a fast decode whose next word is there but no second-slot
+//               operation word
+// with the head operation word [15:0] and the word after it [31:16].  A
+// companion taken (c_ok) is counted by the sequencer, which sees it too.
+wire pd_start = fire && (ph == PH_IDLE) && (qcnt != 4'd0);
+wire pd_fast  = pd_start && go && fast;
+wire pd_abs   = pd_fast && ((pd0.tot > 4'd6) || (pd0.tot >= qcnt));
+always_ff @(posedge clk)
+	dbg_pd <= {pd_fast && !pd_abs && !win_s1[c_at], pd_fast && pd_abs,
+	           pd_start && !pd_fast, pd_start, win[c_at], opw};
 
 endmodule

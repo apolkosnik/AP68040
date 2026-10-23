@@ -45,7 +45,8 @@ module ap68040_useq
 	output logic  [1:0] uq_n,
 	output uop_t        uq0,
 	output s1_t         uq0s,       // ... and the second slot beside it
-	input  logic        uq_pop      // the back end takes uq0 this cycle
+	input  logic        uq_pop,     // the back end takes uq0 this cycle
+	output logic [19:0] dbg_pu      // observation only: dual-issue events (see the end)
 );
 
 
@@ -1171,5 +1172,18 @@ always_ff @(posedge clk)
 		$finish;
 	end
 // synthesis translate_on
+
+// Dual-issue events for a logic analyser's counters, registered, one-clock
+// strobes as an instruction with a companion ends:
+//   [16] cv     the instruction carries a companion
+//   [17] pair   ... and it issues beside the instruction's last uop
+//   [18] dep    ... it does not: the uop writes a register it touches
+//   [19] s0     ... it does not: that uop may not have one beside it (or
+//               trace)
+// with the instruction's operation word [15:0].
+wire pu_split = done && cs.v && !c_pair;
+wire pu_dep   = pu_split && !trace && s0_ok(nu) && (!cs.ld || s0_ld(nu)) && !s1_indep(nu, cs);
+always_ff @(posedge clk)
+	dbg_pu <= {pu_split && !pu_dep, pu_dep, c_pair, done && cs.v, src.opw};
 
 endmodule

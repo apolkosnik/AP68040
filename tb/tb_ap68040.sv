@@ -187,7 +187,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted),
-	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint(), .dbg_fe()
+	.dbg_vbr(), .dbg_cacr(), .dbg_cmaint(), .dbg_fe(), .dbg_pev(pev)
 );
 
 // slave
@@ -310,6 +310,15 @@ end
 // is "retire"; otherwise the oldest stage that holds (or the first empty
 // one, going back from WB) takes the blame.
 logic prof;
+// +pevstat: totals of the core's dual-issue event strobes (dbg_pev[57:48])
+logic [63:0] pev;
+int          pevn [10];
+initial for (int i = 0; i < 10; i++) pevn[i] = 0;
+always @(posedge clk) for (int i = 0; i < 10; i++) if (pev[48 + i]) pevn[i]++;
+task automatic pev_report();
+	$display("PEVSTAT start=%0d slow=%0d absent=%0d notslot2=%0d companion=%0d paired=%0d dep=%0d first=%0d retired=%0d retired2=%0d",
+	         pevn[0], pevn[1], pevn[2], pevn[3], pevn[4], pevn[5], pevn[6], pevn[7], pevn[8], pevn[9]);
+endtask
 int   pf [12];
 localparam int PF_RET = 0, PF_WB = 1, PF_EX = 2, PF_DC2 = 3, PF_DC1 = 4, PF_AG = 5,
                PF_FE = 6, PF_UOPS = 7, PF_REDIR = 8, PF_DREDIR = 9, PF_FQE = 10, PF_HALT = 11;
@@ -1156,6 +1165,7 @@ initial begin
 	end
 	if (prof) prof_report();
 	if (pcprof) pcprof_dump();
+	if ($test$plusargs("pevstat")) pev_report();
 	if (result == 1 && errors == 0 && halt_bad == 0)
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)
