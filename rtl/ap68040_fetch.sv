@@ -411,15 +411,22 @@ logic        m_rrinc;            // ... the set was full: the replacement counte
 // being fetched (the burst's first) is kept for a fill that is not
 // allocated (TCI, a later beat's bus error), which delivers it alone.
 wire         c_dwe = (st == S_FILL) && b_rvalid && m_alloc && !m_vclr;
+// Each way's write enable is a bit of a one-hot vector built here, not a
+// `== 2'(genvar)` compare in the port list: Vivado 2023.2 synthesis
+// evaluates that compare wrongly for some ways, finds their write enables
+// equal (or constant 0), and merges or removes the RAMs (Synth 8-223
+// decloning, 8-7257), so a fill of one way lands in another.
+wire [3:0] c_dwe_w = c_dwe ? 4'b0001 << m_way  : 4'b0000;
+wire [3:0] c_we_w  = c_we  ? 4'b0001 << c_wway : 4'b0000;
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
 		ap68040_sdp_be #(.AW(CSB+2), .NB(4), .OREG(0)) dram (
-			.clk(clk), .we(c_dwe && m_way == 2'(gw)), .waddr({m_pa[CSH:4], b_rbeat}),
+			.clk(clk), .we(c_dwe_w[gw]), .waddr({m_pa[CSH:4], b_rbeat}),
 			.wbe(4'hF), .wdata(b_rdata), .raddr(fpc[CSH:2]), .oce(1'b1), .q(cd[gw])
 		);
 		ap68040_sdp_be #(.AW(CSB), .NB(3), .OREG(0)) tram (
-			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
+			.clk(clk), .we(c_we_w[gw]), .waddr(c_waddr),
 			.wbe(3'b111), .wdata(24'(c_wtag)), .raddr(c_raddr), .oce(1'b1), .q(ct[gw])
 		);
 	end

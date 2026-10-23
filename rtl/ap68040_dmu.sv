@@ -431,6 +431,13 @@ logic [15:0]  wfm_be;
 logic [31:0]  wfm_word;
 logic         dwp;            // this cycle's dw was merged a cycle ago (wfm)
 
+// Each way's write enable is a bit of a one-hot vector built here, not a
+// `== 2'(genvar)` compare in the port list: Vivado 2023.2 synthesis
+// evaluates that compare wrongly for some ways, finds their write enables
+// equal (or constant 0), and merges or removes the RAMs (Synth 8-223
+// decloning, 8-7257), so a write to one way lands in another.
+wire [3:0] tw_b_w = tw_b ? 4'b0001 << tway_b : 4'b0000;
+wire [3:0] dw_w   = dw   ? 4'b0001 << dw_way : 4'b0000;
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
@@ -439,11 +446,11 @@ generate
 			.clk(clk),
 			.addr_a(la_set_n), .we_a(1'b0), .wd_a('0), .q_a(tq_a[gw]),
 			.qa_raw(tq_r[gw]), .qa_bv(), .qa_bd(),
-			.addr_b(tset_b), .we_b(tw_b && tway_b == 2'(gw)), .wd_b(twd_b), .q_b(tq_b[gw])
+			.addr_b(tset_b), .we_b(tw_b_w[gw]), .wd_b(twd_b), .q_b(tq_b[gw])
 		);
 		ap68040_sdp_be #(.AW(CSB), .NB(16), .OREG(0)) dat (
 			.clk(clk),
-			.we(dw && dw_way == 2'(gw)), .waddr(dw_set), .wbe(dw_be), .wdata(dw_wdata),
+			.we(dw_w[gw]), .waddr(dw_set), .wbe(dw_be), .wdata(dw_wdata),
 			.raddr(la_set_n), .oce(1'b1), .q(dq_rn[gw])
 		);
 	end
