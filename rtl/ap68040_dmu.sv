@@ -1952,7 +1952,14 @@ always_ff @(posedge clk) begin
 			vp_set = f_set; vp_wm[f_way] = 1'b1;
 			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 		end
-		E_PUSHV_B: begin
+		E_PUSHV_B: if (!pv_v) begin
+			// a snoop took the buffered victim while the engine was frozen
+			// here (an SC = 10 read supplies it and empties the buffer):
+			// nothing left to push -- pushing pv_line now would write a stale
+			// copy over memory the snooping master may already have changed
+			e_st <= e_sret;
+		end
+		else begin
 			// (LOCK on a push inside a locked sequence, 4.6.2)
 			bo.line <= 1'b1; bo.rd <= 1'b0; bo.tt <= TT_NORMAL; bo.tm <= TM_PUSH;
 			bo.upa <= 2'd0; bo.ci <= 1'b0; bo.lock <= pv_lock; bo.locke <= 1'b0;
