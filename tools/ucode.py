@@ -117,7 +117,7 @@ class U:
     FIELDS = dict(op=None, sz='S', msz='S', cond=None, ccr=None,
                   a=None, b=None, d=None, sxw=None,
                   ag=None, agb=None, agw=None, dsel='CONST', const=0,
-                  mem=None, mfc=None, lock=0, locke=0, br=None, last=0, ser=0,
+                  mem=None, mfc=None, lock=0, locke=0, wi=0, br=None, last=0, ser=0,
                   noupd=0, upd2=0, jc='NEVER', jt=None, loop=0, dyn=0, dynk=0)
 
     def __init__(self, **kw):
@@ -396,12 +396,18 @@ _BFSETUP = U(op='BFSET', cond=0, sz='L', a='BFO', b='BFW', d='T0')
 # known only once BFSETUP has executed, so the head transfer (cond 14) and
 # the tail byte (cond 13) are sized at AG: the head becomes B/W/L, the tail
 # moves to +2 (n = 3), stays at +4 (n = 5) or is no transfer at all.
-def _bf_mem_load():
+# wi: the loads check write permission (and set M), as the stores after them
+# will write these bytes: BFCHG/BFCLR/BFSET/BFINS take a write-protection
+# fault before their first store, so the retried instruction starts from the
+# operand as it was (the 68040 itself finishes and leaves the store to the
+# handler: this core restarts instructions)
+def _bf_mem_load(wi=0):
     return [U(ag='LEA0', agw='T1'),
             U(ag='ADDT0', agb='T1', agw='T1'),
-            U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='T1', const=0, cond=14),
+            U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='T1', const=0, cond=14,
+              wi=wi),
             U(op='MOV', sz='B', msz='B', a='LD', b='ZERO', d='T3', ag='BASED', agb='T1', const=4,
-              cond=13),
+              cond=13, wi=wi),
             U(op='LATCH', sz='L', a='T3')]
 R('BF_TST',
   U(jc='EA0_DN', jt='BF_TST.8'),
@@ -417,7 +423,7 @@ R('BF_EXT',
   U(op='BF', cond='BFR', a='X1DL', b='EA0', d='X1DL', ccr='NZVC', last=1))
 R('BF_MOD',
   U(jc='EA0_DN', jt='BF_MOD.11'),
-  _BFSETUP, *_bf_mem_load(),
+  _BFSETUP, *_bf_mem_load(wi=1),
   U(op='BF', cond='BFM', a='X1DL', b='T2', d='T2', ccr='NZVC'),
   U(op='BFSET', cond=1, sz='L', d='T3'),
   U(op='MOV', sz='L', msz='L', a='T2', mem='ST', ag='BASED', agb='T1', const=0, cond=14),
@@ -432,12 +438,13 @@ R('CAS',
   U(op='LATCH', sz='L', a='X1DH'),
   U(op='CAS', a='X1DU', b='EA0', d='X1DH', mem='RMW', ag='EA0', lock=1, locke=1,
     ccr='NZVC', last=1))
-# CAS2: two locked reads, the compare leaves eq in EX; the first write
+# CAS2: two locked reads (checked as writes, MC68040UM 8.4.6: both pages are
+# writable before either store), the compare leaves eq in EX; the first write
 # only on a match, the second always (Du2 or the second value read, with
 # LOCKE); on a mismatch Dc1/Dc2 take the values read
 R('CAS2',
-  U(op='MOV', a='LD', d='T0', ag='BASED', agb='X1R', lock=1),
-  U(op='MOV', a='LD', d='T1', ag='BASED', agb='X2R', lock=1),
+  U(op='MOV', a='LD', d='T0', ag='BASED', agb='X1R', lock=1, wi=1),
+  U(op='MOV', a='LD', d='T1', ag='BASED', agb='X2R', lock=1, wi=1),
   U(op='CAS2C', cond=0, a='X1DH', b='T0', ccr='NZVC'),
   U(op='CAS2C', cond=1, a='X2DC', b='T1', ccr='NZVC'),
   U(op='CAS2W', cond=0, a='X1DU', mem='ST', ag='BASED', agb='X1R', lock=1),
@@ -727,6 +734,11 @@ R('EXC_FMT2',
     a='LD', br='A', cond=15, last=1))     # cond 15: the handler fetch
 _f7 = [U(op='MOV', sz='L', a='ZERO', ag='BASED', agb='SSP', const=-4 * (k + 1),
          msz='L', mem='ST', mfc='SUP') for k in range(10)]
+# PD3..PD0 (-4..-16): a failed push's line, T3..T0 (zeros otherwise; PD0 is
+# WB1D, unused: the instruction restarts)
+for _k in range(4):
+    _f7[_k] = U(op='MOV', sz='L', a='T%d' % (3 - _k), ag='BASED', agb='SSP', const=-4 * (_k + 1),
+                msz='L', mem='ST', mfc='SUP')
 _f7[7] = U(op='MOV', sz='L', a='T7', ag='BASED', agb='SSP', const=-32,
           msz='L', mem='ST', mfc='SUP')                    # WB3D
 _f7[8] = U(op='MOV', sz='L', a='T6', ag='BASED', agb='SSP', const=-36,
@@ -844,7 +856,7 @@ def val(u, name):
         a=sel(f['a']), b=sel(f['b']), d=sel(f['d']), sxw=SXW[f['sxw']],
         ag=AGM[f['ag'] or 'NONE'], agb=sel(f['agb']), agw=sel(f['agw']),
         dsel=DSEL[f['dsel']], cval=f['const'] & 0xFFFF,
-        mem=MEM[f['mem']], mfc=MFC[f['mfc']], lock=f['lock'], locke=f['locke'],
+        mem=MEM[f['mem']], mfc=MFC[f['mfc']], lock=f['lock'], locke=f['locke'], wi=f['wi'],
         br=BR[f['br']],
         last=f['last'], ser=f['ser'], noupd=f['noupd'], upd2=f['upd2'],
         jc=JC[f['jc']], jt=jt, loop=f['loop'], dyn=f['dyn'], dynk=f['dynk'])
@@ -855,7 +867,7 @@ LAYOUT = [('op_inst', 1), ('op', 7), ('sz', 2), ('msz', 3), ('cond_inst', 3),
           ('cond', 4), ('ccr_inst', 1), ('ccr', 5), ('a', 6), ('b', 6),
           ('d', 6), ('sxw', 2), ('ag', 4), ('agb', 6), ('agw', 6),
           ('dsel', 3), ('cval', 16), ('mem', 2), ('mfc', 3), ('lock', 1),
-          ('locke', 1),
+          ('locke', 1), ('wi', 1),
           ('br', 3), ('last', 1), ('ser', 1), ('noupd', 1), ('upd2', 1),
           ('jc', 6), ('jt', 10), ('loop', 1), ('dyn', 3), ('dynk', 5)]
 WIDTH = sum(w for _, w in LAYOUT)

@@ -333,6 +333,7 @@ always_comb begin
 	nu.dynk   = uw.dynk;
 	nu.mlock  = uw.lock;
 	nu.mlocke = uw.locke;
+	nu.mwi    = uw.wi;
 	nu.br     = uw.br;
 	nu.target = src.target;
 	nu.pred   = src.pred && (uw.br != BR_NONE);

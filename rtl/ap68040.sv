@@ -222,6 +222,7 @@ logic        dm_hold1, mt_v, mt_ng, mt_wr, mt_done, mt_fault;
 logic  [2:0] mt_op, mt_fc;
 logic  [1:0] mt_scope, mt_caches;
 logic [31:0] mt_addr, mt_mmusr, mt_faddr, urp, srp, dm_st_faddr;
+logic [127:0] pb_data;
 logic [15:0] mt_fssw;
 logic  [2:0] iack_lvl;
 logic  [1:0] dm_ack;
@@ -230,7 +231,7 @@ logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
-logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
+logic        dm_lock, dm_locke, dm_wi, dm_super, dm_noalloc, dm_older;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic        bht_dis;
@@ -256,7 +257,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_wi(dm_wi), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
@@ -269,7 +270,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.dm_hold1(dm_hold1), .mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope),
 	.mt_caches(mt_caches), .mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng),
 	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault),
-	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .dm_st_faddr(dm_st_faddr),
+	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .pb_data(pb_data), .dm_st_faddr(dm_st_faddr),
 	.urp(urp), .srp(srp),
 	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
@@ -280,7 +281,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 ap68040_dmu #(.DC1_ATC(DC1_ATC), .DC_WRITETHROUGH(DC_WRITETHROUGH)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
-	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
+	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_wi(dm_wi),
 	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
 	.dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
@@ -292,7 +293,7 @@ ap68040_dmu #(.DC1_ATC(DC1_ATC), .DC_WRITETHROUGH(DC_WRITETHROUGH)) dmu (
 	.mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope), .mt_caches(mt_caches),
 	.mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng), .mt_wr(mt_wr),
 	.mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault), .mt_fssw(mt_fssw),
-	.mt_faddr(mt_faddr),
+	.mt_faddr(mt_faddr), .pb_data(pb_data),
 	.cacr(cacr), .tc(tc), .urp(urp), .srp(srp),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1),
 	.cdis(cdis), .mdis(mdis), .tw_busy(tw_busy),

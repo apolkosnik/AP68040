@@ -73,6 +73,7 @@ module ap68040_backend
 	output logic  [2:0] dm_fc,
 	output logic        dm_lock,
 	output logic        dm_locke,
+	output logic        dm_wi,
 	output logic        dm_super,
 	output logic        dm_older,       // uops older than DC2 are in EX or WB
 	input  logic        sn_ihit,        // a snoop dropped valid instruction-cache data
@@ -105,6 +106,7 @@ module ap68040_backend
 	input  logic        mt_fault,       // CPUSH: a push ended in TEA (an access error)
 	input  logic [15:0] mt_fssw,
 	input  logic [31:0] mt_faddr,
+	input  logic [127:0] pb_data,       // the line of a push that ended in TEA (DMU)
 	output logic        adv_dc1,        // DC1 -> DC2
 	output logic        adv_dc2,        // DC2 -> EX
 	output logic        adv_ex,         // EX -> WB
@@ -187,6 +189,8 @@ logic [15:0] ex_fssw;
 // results carried into WB
 logic [31:0] wb_res;
 logic  [4:0] wb_ccr;          // CCR after this uop
+logic  [4:0] wb_ccr_ist;      // CCR before this uop's instruction (its restart's)
+logic  [4:0] ccr_ist;         // EX: the CCR at the start of the instruction in EX
 logic        wb_dwe;          // result register write (after EX kills)
 logic [31:0] wb_upd_val, wb_upd2_val;
 logic        wb_redir;        // the uop redirects the front end
@@ -256,7 +260,8 @@ logic [31:0] xi_pc, xi_addr;
 logic [15:0] xi_sr, xi_vecw, xi_ssw;
 logic [31:0] xi_vaddr, xi_ea, xi_w3a, xi_w3d;
 logic        xi_f7;           // the frame is format $7: T5-T7 too
-logic  [2:0] xw_ph;           // exception entry: back-file writes of T5-T13
+logic  [2:0] xw_ph;           // exception entry: back-file writes of T5-T13 (format $7: T0-T3 too)
+logic [127:0] xi_pd;          // format $7: PD0-PD3, a failed push's line (else zero)
 
 assign sr   = {sr_r[15:5], ccr_b};
 assign dtt0 = dtt0_r;
@@ -541,6 +546,7 @@ assign dm_mem     = ag_u.mem;
 assign dm_msz     = ag_msz;
 assign dm_lock    = ag_u.mlock;
 assign dm_locke   = ag_u.mlocke;
+assign dm_wi      = ag_u.mwi;
 // FC2 of the access selects the root and the supervisor checks: MOVES
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
@@ -1458,8 +1464,18 @@ always_comb begin
 			bwa[1] = R_T0 + 5'd6;  bwd[1] = xi_w3a;
 		end
 		3'd5: begin
-			bwe = 3'b001;
+			bwe = 3'b011;
 			bwa[0] = R_T0 + 5'd7;  bwd[0] = xi_w3d;
+			bwa[1] = R_T0;         bwd[1] = xi_pd[127:96];   // PD0 (WB1D)
+		end
+		3'd6: begin
+			bwe = 3'b011;
+			bwa[0] = R_T0 + 5'd1;  bwd[0] = xi_pd[95:64];    // PD1
+			bwa[1] = R_T0 + 5'd2;  bwd[1] = xi_pd[63:32];    // PD2
+		end
+		3'd7: begin
+			bwe = 3'b001;
+			bwa[0] = R_T0 + 5'd3;  bwd[0] = xi_pd[31:0];     // PD3
 		end
 		default: ;
 	endcase
@@ -1905,13 +1921,20 @@ always_ff @(posedge clk) begin
 			              ex_u.op == OP_RTE;
 			// CCR after this uop (CHK, CHK2, TRAPcc and divide-by-zero set
 			// their flags and then trap: the stacked SR carries them)
-			if (ex_u.exc == 8'd0 && !ex_fault) begin
-				logic [4:0] nf;
+			begin
+				logic [4:0] nf, c0, ist;
+				// the CCR before this instruction: an access error restarts it,
+				// so its frame carries that, not flags its earlier uops made
+				ist = ex_u.first ? ccr_f : ccr_ist;
+				if (ex_u.first) ccr_ist <= ccr_f;
+				wb_ccr_ist <= ist;
 				nf = (ex_u.op == OP_CAS) ? cas_flags : ex_flags;
-				ccr_f  <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
-				wb_ccr <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
+				c0 = (ex_u.exc == 8'd0 && !ex_fault) ? ((nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we)) :
+				     ex_fault ? ist : ccr_f;
+				wb_ccr <= c0;
+				if (ex_u.exc == 8'd0 && !ex_fault)
+					ccr_f <= c0;
 			end
-			else wb_ccr <= ccr_f;
 			if (ex_u.op == OP_MDHI)  md_hiin  <= ex_av;
 			if (ex_u.op == OP_LATCH || (ex_u.op == OP_IACKV && !ex_u.cond[0])) ex_latch <= ex_av;
 			if (ex_u.op == OP_RTEF && !ex_u.cond[0]) begin
@@ -2067,13 +2090,17 @@ always_ff @(posedge clk) begin
 			xi_ea    <= x_cm ? x_cm_ea : x_addr;
 			xi_w3a   <= x_wfault ? x_addr : 32'd0;
 			xi_w3d   <= x_wfault ? wb_st_data : 32'd0;
+			// a push that ended in TEA (SSW: a line write, TT 0, TM 0; LK and
+			// CM aside): the frame carries its line in PD0-PD3 (MC68040UM
+			// 8.4.6), the handler writes it; anything else, zeros
+			xi_pd    <= ((x_fmt == 4'h7) && ((x_ssw & 16'hEDFF) == 16'h0060)) ? pb_data : 128'd0;
 		end
 
 		// exception entry, continued: three cycles of back-file writes
 		// (five for a format $7 frame)
 		if (xw_ph != 3'd0) begin
 			xw_ph <= xw_ph + 3'd1;
-			if ((xw_ph == 3'd3 && !xi_f7) || xw_ph == 3'd5) begin
+			if ((xw_ph == 3'd3 && !xi_f7) || xw_ph == 3'd7) begin
 				xw_ph  <= 3'd0;
 				exc_go <= 1'b1;
 			end
@@ -2103,6 +2130,7 @@ always_ff @(posedge clk) begin
 			wb_stv      <= 1'b0;
 			wb_ok       <= 1'b0;
 			wb_exc      <= 8'd2;
+			wb_ccr      <= wb_ccr_ist;   // the restart's flags: the instruction's inputs
 			wb_exc_addr <= dm_st_faddr;
 			wb_exc_ssw  <= dm_st_fssw;
 		end

@@ -253,8 +253,22 @@ tb/build_decode.sh                   # the exhaustive decoder check
   beat of a fill the operand does not need takes no exception and the line
   is not allocated; a bus error on a line push is reported as an access
   error with the push's SSW (a write, SIZE line, TT normal, TM 0; figure
-  8-6).  Fetch faults on the lookahead are refetched once on demand before
-  they become access errors; FA is the faulting word's address.
+  8-6) and the line in PD0-PD3 (8.4.6): the cache no longer has it, the
+  handler writes it (audit_push_frame).  Fetch faults on the lookahead are
+  refetched once on demand before they become access errors; FA is the
+  faulting word's address.
+* The restart model and multi-write instructions: an access error restarts
+  the instruction, so nothing it wrote may be written again.  The locked
+  reads of TAS/CAS/CAS2 are translated as writes (8.4.6: both CAS2 pages
+  writable before either store), and the bit field instructions that write
+  (BFCHG/BFCLR/BFSET/BFINS) load their field with write intent (the
+  microcode's wi: translated and walked as a write, a fault reported as
+  one), so a write-protection fault comes before the first store.  The
+  frame's SR has the CCR from before the instruction, also after a store's
+  bus error at WB, so a retried NEGX/ROXL/ADDX... reads its own input X
+  (audit_cas2_*, audit_bf3_*, audit_bf5_*, audit_negx_*, audit_roxl_*; an
+  audit of 2026-10-24).  (The 68040 itself completes the instruction and
+  leaves pending writes to the handler in WB1-WB3.)
 * Odd change-of-flow targets: address error at the instruction, frame PC
   per gencpu (JMP +2/+6, JSR the target, handler fetch the vector offset),
   Bcc/DBcc validate the target taken or not, RTE commits its SR first.

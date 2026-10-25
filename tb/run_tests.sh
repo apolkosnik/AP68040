@@ -6,7 +6,7 @@
 # JOBS=<n> simulations run in parallel (default: half the CPUs).
 set -e
 cd "$(dirname "$0")"
-PROGS=${*:-"smoke t_nx8k t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_fpu_frame_class t_fpu_frame_snan t_fpu_frame_cmd t_snoop t_btb t_stld t_pins t_snstress t_snkill t_eredir t_cbsplit t_cmodes t_loops t_early t_irq7 t_iplglitch t_snirq t_xnest t_halt t_cache2 t_fpexc t_ipendsr"}
+PROGS=${*:-"smoke t_nx8k t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_fpu_frame_class t_fpu_frame_snan t_fpu_frame_cmd t_snoop t_btb t_stld t_pins t_snstress t_snkill t_eredir t_cbsplit t_cmodes t_loops t_early t_irq7 t_iplglitch t_snirq t_xnest t_halt t_cache2 t_fpexc t_ipendsr audit_cas2_0 audit_cas2_1 audit_cas2_cache_0 audit_cas2_cache_1 audit_bf3_0 audit_bf3_1 audit_bf3_cache_0 audit_bf3_cache_1 audit_bf5_0 audit_bf5_1 audit_bf5_cache_0 audit_bf5_cache_1 audit_negx_0 audit_negx_1 audit_negx_mmufault audit_roxl_0 audit_roxl_1 audit_roxl_mmufault audit_push_0 audit_push_frame"}
 WORK=${WORK:-$(cd .. && pwd)/obj}; export WORK
 JOBS=${JOBS:-$(( $(nproc) / 2 ))}
 ./build_asm.sh $PROGS

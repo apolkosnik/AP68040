@@ -649,8 +649,24 @@ always_ff @(posedge clk) begin
 end
 int          cap;
 
+// a write bus error injected once: a write to $F17C arms it, the next write
+// to +wtea=ADDR (default $8000) gets TEA (the restart tests: audit_*.s)
+int   wtea_addr;
+logic wtea_arm = 1'b0;
+initial if (!$value$plusargs("wtea=%h", wtea_addr)) wtea_addr = 32'h8000;
+always @(posedge clk) begin
+	if (ev && !ev_rd && !ev_err && ev_addr == 32'hF17C) wtea_arm <= 1'b1;
+	if (ev && !ev_rd && ev_err && ev_addr == wtea_addr) begin
+		wtea_arm <= 1'b0;
+		$display("AUDIT TEA address=%08x data=%08x", ev_addr, ev_data);
+	end
+	if (ev && !ev_rd && !ev_err && ev_addr >= 32'hF180 && ev_addr < 32'hF1C0)
+		$display("AUDIT address=%08x data=%08x", ev_addr, ev_data);
+end
+
 always_comb begin
 	tea_req = 1'b0;
+	if (wtea_arm && xfer_v && !xfer_rd && xfer_addr == wtea_addr) tea_req = 1'b1;
 	if (xfer_v) begin
 		if (berr_armed && xfer_addr[15:0] == 16'hF140 && xfer_tt != 2'd3 &&
 		    xfer_tm != 3'd2 && xfer_tm != 3'd6)
