@@ -257,6 +257,13 @@ tb/build_decode.sh                   # the exhaustive decoder check
   handler writes it (audit_push_frame).  Fetch faults on the lookahead are
   refetched once on demand before they become access errors; FA is the
   faulting word's address.
+* RTE: a format $7 frame's EA and SSW are read before SP moves past the
+  frame (the new SP goes to T6, committed after the reads), so a fault on
+  them stacks below the frame, which stays intact (audit_rte_fault_*,
+  audit_rte_natural_*, audit_rte_mmu).  A throwaway frame ($1) continues
+  the same RTE on the stack the restored SR selects, USP too (8.4.2): the
+  refetched RTE is fetched as supervisor and not checked for privilege,
+  and no interrupt or trace comes between the frames (audit_rte_throw_*).
 * The restart model and multi-write instructions: an access error restarts
   the instruction, so nothing it wrote may be written again.  The locked
   reads of TAS/CAS/CAS2 are translated as writes (8.4.6: both CAS2 pages

@@ -170,6 +170,15 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `ifndef AP_DC1_ATC
 `define AP_DC1_ATC 0
 `endif
+// the interrupt acknowledge tests (audit_iack_*): +audit_ivec=N supplies
+// vector N instead of an autovector, +audit_iacktea ends the IACK in TEA
+// (spurious); +audit_exc logs every exception entry
+int   audit_ivec;
+logic audit_iacktea;
+initial begin
+	if (!$value$plusargs("audit_ivec=%d", audit_ivec)) audit_ivec = 0;
+	audit_iacktea = $test$plusargs("audit_iacktea");
+end
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
           .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
@@ -214,7 +223,7 @@ m68040_bus_slave #(.AW(20)) mem (
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
 	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
-	.iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
+	.iack_vector(8'(audit_ivec)), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
@@ -665,7 +674,7 @@ always @(posedge clk) begin
 end
 
 always_comb begin
-	tea_req = 1'b0;
+	tea_req = audit_iacktea && xfer_v && xfer_tt == 2'd3 && xfer_tm != 3'd0;
 	if (wtea_arm && xfer_v && !xfer_rd && xfer_addr == wtea_addr) tea_req = 1'b1;
 	if (xfer_v) begin
 		if (berr_armed && xfer_addr[15:0] == 16'hF140 && xfer_tt != 2'd3 &&
@@ -1153,6 +1162,13 @@ initial begin
 	else
 		$display("FAIL %s", prog);
 	$finish;
+end
+
+always @(posedge clk) begin
+	if ($test$plusargs("audit_exc") && dut.be.x_go)
+		$display("EXCEPTION vec=%0d pc=%08h sr=%04h fmt=%h ssw=%04h addr=%08h", dut.be.x_vec, dut.be.x_pc, dut.be.x_osr, dut.be.x_fmt, dut.be.x_ssw, dut.be.x_addr);
+	if ($test$plusargs("audit_exc") && ev && !ev_rd && ev_addr >= 32'hf180 && ev_addr < 32'hf200)
+		$display("OBS addr=%08h data=%08h be=%b", ev_addr, ev_data, ev_be);
 end
 
 endmodule

@@ -120,6 +120,8 @@ module ap68040_backend
 	input  logic [31:0] dm_faddr,
 	input  logic [15:0] dm_fssw,        // ... its special status word
 	output logic        dm_st_v,        // WB store data valid this cycle
+	output logic        rte_cont,       // an RTE continues after a throwaway frame (8.4.2): its
+	                                    // refetch is supervisor and not privilege-checked
 	output logic [31:0] dm_st_data,
 	input  logic        dm_st_rdy,      // store accepted (WB may complete)
 	input  logic        dm_st_fault,
@@ -1222,6 +1224,10 @@ ap68040_alu cmp_alu (
 );
 logic        cas2_eq;           // CAS2: both pairs equal so far
 logic        rte_fmt1;          // RTE: the frame is a throwaway ($1)
+// (the RTE then goes on with the next frame on the stack the restored SR
+// selects -- USP too: the instruction is refetched, and the refetch is
+// the same RTE continuing, fetched as supervisor and not checked for
+// privilege; no interrupt or trace comes between its frames)
 wire  [31:0] ex_szm = (ex_u.sz == SZ_B) ? 32'h0000_00FF :
                       (ex_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
 
@@ -1386,9 +1392,12 @@ wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != s
 // 8.3: the interrupt's processing follows the other exception's at once)
 wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
 // a MOVEM continuation armed by RTE runs before a pending interrupt
-wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v);
+wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v) ||
+                   (wb_v && wb_u.op == OP_RTE && rte_fmt1) || rte_cont;
 wire take_irq    = irq_pend && !cm_block && (wb_bound || (stopped && !wb_v));
-wire take_trace  = trace_due && !take_irq;
+// (a throwaway frame's RTE goes on: its trace is the whole RTE's, judged
+// at its end with the SR it ends with)
+wire take_trace  = trace_due && !take_irq && !(wb_v && wb_u.op == OP_RTE && rte_fmt1);
 wire wb_refetch;
 // a speculative fetch fault (code 1) is no exception: WB refetches the
 // instruction once on demand, and only a second fault there is an access
@@ -1631,6 +1640,7 @@ always_ff @(posedge clk) begin
 		md_hiin <= 32'd0;
 		cas2_eq <= 1'b0;
 		rte_fmt1 <= 1'b0;
+		rte_cont <= 1'b0;
 		rte_fmt7 <= 1'b0;
 		cm_n_v   <= 1'b0;
 		cm_n_ea  <= 32'd0;
@@ -2023,6 +2033,7 @@ always_ff @(posedge clk) begin
 				// RTE of a format $7 frame with CM arms the continuation of
 				// the MOVEM it returns to; any other instruction ends it
 				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
+				rte_cont <= (wb_u.op == OP_RTE) && rte_fmt1;
 				cm_ea   <= cm_n_ea;
 				cm_pc   <= wb_next;
 				cm_wr   = 1'b1;
@@ -2059,6 +2070,7 @@ always_ff @(posedge clk) begin
 			redir_v  <= 1'b0;
 			ras_rv   <= 1'b0;
 			xw_ph    <= 3'd1;          // T8-T13 (and T5-T7) first, then exc_go
+			rte_cont <= 1'b0;
 			xi_f7    <= (x_fmt == 4'h7);
 			exc_kind <= x_kind;
 			exc_ssp  <= x_ssp;

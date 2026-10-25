@@ -474,10 +474,15 @@ R('RTE',
   U(op='MOV', sz='L', msz='L', a='LD', d='T2', ag='BASED', agb='SP', const=2, mfc='SUP'),
   U(op='MOV', sz='W', msz='W', a='LD', d='T3', ag='BASED', agb='SP', const=6, mfc='SUP'),
   U(op='RTEF', sz='W', a='T3', d='T0'),
-  U(ag='ADDT0', agb='SP', agw='SP'),
-  U(op='MOV', sz='L', msz='L', a='LD', d='T4', ag='BASED', agb='SP', const=-52, cond=11, mfc='SUP'),
-  U(op='MOV', sz='L', msz='W', a='LD', b='ZERO', d='T5', ag='BASED', agb='SP', const=-48,
+  # (a format $7 frame's EA and SSW are read before SP moves: a fault on
+  # them stacks its frame below this one, which stays intact.  The new SP
+  # goes to T6 first: that uop waits for RTEF's T0, and so the format-7
+  # reads after it see RTEF's format)
+  U(ag='ADDT0', agb='SP', agw='T6'),
+  U(op='MOV', sz='L', msz='L', a='LD', d='T4', ag='BASED', agb='SP', const=8, cond=11, mfc='SUP'),
+  U(op='MOV', sz='L', msz='W', a='LD', b='ZERO', d='T5', ag='BASED', agb='SP', const=12,
     cond=11, mfc='SUP'),
+  U(ag='ADDC', agb='T6', agw='SP', const=0),
   U(op='MISC', cond=6, sz='L', a='T4', b='T5'),
   U(op='RTE', sz='W', a='T1', b='T2', last=1))
 # RTR: CCR = (SP)+ word, PC = (SP)+ long
