@@ -148,6 +148,9 @@ module ap68040_backend
 	// debug
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
+	output logic        dbg_xgo,        // exception processing starts (one clock)
+	output logic  [7:0] dbg_xvec,       // ... its vector
+	output logic [31:0] dbg_xpc,        // ... the PC it stacks
 	output logic        halted,
 	output logic        fetch_stop      // no new instruction fetches: stopped
                                         // (STOP) or halted
@@ -2221,6 +2224,9 @@ assign iack_lvl   = irq_lvl_r;
 assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
 assign dbg_pc     = wb_u.pc;
+assign dbg_xgo    = x_go;
+assign dbg_xvec   = x_vec;
+assign dbg_xpc    = x_pc;
 assign ucond      = 1'b0;
 
 // processor status (MC68040UM 5.9.1, table 5-6): the end of an instruction
