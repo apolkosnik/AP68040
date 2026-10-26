@@ -200,8 +200,8 @@ logic [15:0] dbg_rinfo;
 logic [31:0] dbg_pc_d;
 always @(posedge clk) dbg_pc_d <= dbg_pc;
 always @(posedge clk) if ($test$plusargs("audit_fe") && dbg_retire)
-	$display("RT %0d %08h exc=%02h exr=%b first=%b last=%b kill=%b eredir=%b excpend=%b", cycles, dbg_pc_d,
-	         dbg_rinfo[15:8], dbg_rinfo[7], dbg_rinfo[6], dbg_rinfo[5], dbg_rinfo[4], dbg_rinfo[3], dbg_rinfo[2]);
+	$display("RT %0d %08h exc=%02h exr=%b first=%b last=%b", cycles, dbg_pc_d,
+	         dbg_rinfo[15:8], dbg_rinfo[7], dbg_rinfo[6], dbg_rinfo[5]);
 int          audit_dbgvec, dbgvec_hit = 0, dbgvec_bad = 0;
 initial if (!$value$plusargs("audit_dbgvec=%d", audit_dbgvec)) audit_dbgvec = -1;
 always @(posedge clk) if (audit_dbgvec >= 0 && dbg_xgo) begin

@@ -75,7 +75,7 @@ module ap68040
 	// debug / test
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
-	output logic [15:0] dbg_rinfo,     // ... the committed uop's {exc, exr, first, last, kill, eredir, exc_pend, 0}
+	output logic [15:0] dbg_rinfo,     // ... the committed uop's {exc, exr, first, last, 5'b0}
 	output logic        dbg_xgo,       // debug: exception processing starts,
 	output logic  [7:0] dbg_xvec,      // ... its vector and
 	output logic [31:0] dbg_xpc,       // ... the PC it stacks
