@@ -360,7 +360,12 @@ function automatic logic [5:0] chk_dec(input logic [15:0] ow, input logic [15:0]
 		3'b010: begin
 			if (fm != 3'd7 && oc == 2'd1) x = 1'b1;
 			else if (fm != 3'd7 && oc == 2'd2) begin x = 1'b1; ill = 1'b1; end
-			else if (fm == 3'd7) ;
+			else if (fm == 3'd7) begin
+				// FMOVECR: an <ea> field other than 0 is not one; F-line
+				// (format $0; the M68040FPSP's x_fline.sa handles "an
+				// fmovecr with a non-zero <ea> field")
+				if (ow[5:0] != 6'd0) x = 1'b1;
+			end
 			else if (dn && fp_bytes(fm) > 4'd4) begin
 				// an unimplemented Dn source format records FPIAR first;
 				// a software opmode reports through the FPSP route
