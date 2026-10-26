@@ -75,6 +75,7 @@ module ap68040
 	// debug / test
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
+	output logic [15:0] dbg_rinfo,     // ... the committed uop's {exc, exr, first, last, kill, eredir, exc_pend, 0}
 	output logic        dbg_xgo,       // debug: exception processing starts,
 	output logic  [7:0] dbg_xvec,      // ... its vector and
 	output logic [31:0] dbg_xpc,       // ... the PC it stacks
@@ -289,7 +290,7 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc),
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_rinfo(dbg_rinfo), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc),
 	.dbg_hfgo(dbg_hfgo), .dbg_hfld(dbg_hfld), .dbg_hfa(dbg_hfa), .dbg_hff(dbg_hff), .dbg_hfpc(dbg_hfpc),
 	.halted(dbg_halted), .fetch_stop(be_fstop)
 );

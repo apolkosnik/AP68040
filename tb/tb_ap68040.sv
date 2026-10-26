@@ -186,6 +186,22 @@ end
 logic        dbg_xgo;
 logic  [7:0] dbg_xvec;
 logic [31:0] dbg_xpc;
+// +audit_fe: every front-end event (the debug outputs: 1 back-end
+// redirect, 2 decoder redirect, 3 BTB, 4 flush at an exception entry,
+// 5 handler fetch) with the cycle and the PC in WB
+logic  [2:0] dbg_ev;
+logic [31:0] dbg_evpc;
+always @(posedge clk) if ($test$plusargs("audit_fe") && dbg_ev != 3'd0)
+	$display("FE %0d %s %08h (wb pc %08h)", cycles, dbg_ev == 3'd1 ? "BE-redirect" : dbg_ev == 3'd2 ? "D1-redirect" :
+	         dbg_ev == 3'd3 ? "BTB" : dbg_ev == 3'd4 ? "exc-flush" : "handler-fetch", dbg_evpc, dbg_pc);
+// (dbg_retire is registered at the commit: the committed uop's PC is the
+// previous cycle's dbg_pc)
+logic [15:0] dbg_rinfo;
+logic [31:0] dbg_pc_d;
+always @(posedge clk) dbg_pc_d <= dbg_pc;
+always @(posedge clk) if ($test$plusargs("audit_fe") && dbg_retire)
+	$display("RT %0d %08h exc=%02h exr=%b first=%b last=%b kill=%b eredir=%b excpend=%b", cycles, dbg_pc_d,
+	         dbg_rinfo[15:8], dbg_rinfo[7], dbg_rinfo[6], dbg_rinfo[5], dbg_rinfo[4], dbg_rinfo[3], dbg_rinfo[2]);
 int          audit_dbgvec, dbgvec_hit = 0, dbgvec_bad = 0;
 initial if (!$value$plusargs("audit_dbgvec=%d", audit_dbgvec)) audit_dbgvec = -1;
 always @(posedge clk) if (audit_dbgvec >= 0 && dbg_xgo) begin
@@ -210,7 +226,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_ev(), .dbg_evpc(), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_rinfo(dbg_rinfo), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_ev(dbg_ev), .dbg_evpc(dbg_evpc), .dbg_halted(dbg_halted)
 );
 
 // slave

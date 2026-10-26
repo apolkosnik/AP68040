@@ -149,6 +149,7 @@ module ap68040_backend
 	// debug
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
+	output logic [15:0] dbg_rinfo,      // with dbg_retire: the committed uop's {exc, exr, first, last, kill, eredir, exc_pend, 0}
 	output logic        dbg_xgo,        // exception processing starts (one clock)
 	output logic  [7:0] dbg_xvec,       // ... its vector
 	output logic [31:0] dbg_xpc,        // ... the PC it stacks
@@ -1629,6 +1630,7 @@ always_ff @(posedge clk) begin
 	fe_flush <= 1'b0;
 	ucond_v <= 1'b0;
 	dbg_retire <= 1'b0;
+	dbg_rinfo  <= 16'd0;
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
@@ -2001,6 +2003,7 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (wb_commit) begin
 			dbg_retire <= wb_u.last;
+			dbg_rinfo  <= {wb_u.exc, wb_u.exr, wb_u.first, wb_u.last, kill_now, eredir_pend, exc_pend, 2'b00};
 			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
