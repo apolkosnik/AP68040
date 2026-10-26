@@ -23,7 +23,10 @@ module ap68040
 	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	// system options
-	parameter bit         DC_WRITETHROUGH = 0    // copyback pages cached write-through (DMA reads not snooped)
+	parameter bit         DC_WRITETHROUGH = 0,   // copyback pages cached write-through (DMA reads not snooped)
+	// debug
+	parameter bit         DEBUG        = 1       // the dbg_* outputs' logic (0: they stay at zero and load nothing;
+	                                             // dbg_halted is kept)
 )(
 
 	input  logic        clk,
@@ -263,7 +266,7 @@ uop_t        uq0;
 logic        uo_rdy;
 
 ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES),
-                  .SKID(SKID), .DIV_STEPS(DIV_STEPS)) be (
+                  .SKID(SKID), .DIV_STEPS(DIV_STEPS), .DEBUG(DEBUG)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
@@ -367,7 +370,8 @@ logic        dbg_btgo;
 logic [31:0] dbg_btpc;
 always_comb begin
 	dbg_ev = 3'd0; dbg_evpc = 32'd0;
-	if (redir_v)        begin dbg_ev = 3'd1; dbg_evpc = redir_pc; end
+	if (!DEBUG)         begin end
+	else if (redir_v)   begin dbg_ev = 3'd1; dbg_evpc = redir_pc; end
 	else if (d_redir_v) begin dbg_ev = 3'd2; dbg_evpc = d_redir_pc; end
 	else if (dbg_btgo)  begin dbg_ev = 3'd3; dbg_evpc = dbg_btpc; end
 	else if (dbg_hfgo)  begin dbg_ev = 3'd5; dbg_evpc = dbg_hfld; end
@@ -377,7 +381,7 @@ logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch fetch (
+ap68040_fetch #(.DEBUG(DEBUG)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),

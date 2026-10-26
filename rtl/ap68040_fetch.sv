@@ -53,7 +53,9 @@
 
 module ap68040_fetch
 	import ap68040_pkg::*, ap68040_upkg::*;
-(
+#(
+	parameter bit DEBUG = 1          // the debug outputs' logic (0: they stay at zero)
+)(
 	input  logic        clk,
 	input  logic        nreset,
 
@@ -451,8 +453,8 @@ wire f1_deliver = f1_go && x_hit;
 wire [5:0] inflight = (f1_v ? 6'd2 : 6'd0) + {4'd0, f2_n} + {4'd0, f3_n};
 // the target FIFO cannot overflow: count the flagged words on their way
 // (debug: the BTB's redirect as F1 delivers, its target as below)
-assign dbg_btgo = f1_deliver && f1_bt && !(f1_bkind == 2'd2 && fras_n == 4'd0);
-assign dbg_btpc = {((f1_bkind == 2'd2) ? fras[fras_tp] : f1_btgt), 1'b0};
+assign dbg_btgo = DEBUG && f1_deliver && f1_bt && !(f1_bkind == 2'd2 && fras_n == 4'd0);
+assign dbg_btpc = DEBUG ? {((f1_bkind == 2'd2) ? fras[fras_tp] : f1_btgt), 1'b0} : 32'd0;
 wire       bt_room  = ({1'b0, tq_n} + {3'd0, f1_v && f1_bt} + {3'd0, |f2_b} + {3'd0, |f3_b}) < 4'd4;
 wire       room     = {1'b0, cnt} + inflight <= 6'(QN - 2);
 // a snooped invalidation goes first (the snooper has priority, 4.5)

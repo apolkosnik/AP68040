@@ -29,7 +29,8 @@ module ap68040_backend
 	parameter bit         FPU_PIPE  = 1,
 	parameter bit         EARLY_RES = 1,
 	parameter bit         SKID      = 1,      // the skid register in front of AG
-	parameter int         DIV_STEPS = 2       // divide steps per cycle
+	parameter int         DIV_STEPS = 2,      // divide steps per cycle
+	parameter bit         DEBUG     = 1       // the debug outputs' logic (0: they stay at zero and load nothing)
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -2002,10 +2003,12 @@ always_ff @(posedge clk) begin
 		// WB commit
 		//------------------------------------------------------------------
 		if (wb_commit) begin
-			dbg_retire <= wb_u.last;
-			// (only the uop's own registers: a load on kill_now or exc_pend
-			// costs the fit)
-			dbg_rinfo  <= {wb_u.exc, wb_u.exr, wb_u.first, wb_u.last, 5'b00000};
+			if (DEBUG) begin
+				dbg_retire <= wb_u.last;
+				// (only the uop's own registers: a load on kill_now or exc_pend
+				// costs the fit)
+				dbg_rinfo  <= {wb_u.exc, wb_u.exr, wb_u.first, wb_u.last, 5'b00000};
+			end
 			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
@@ -2240,18 +2243,18 @@ always_ff @(posedge clk)
 assign iack_lvl   = irq_lvl_r;
 assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
-assign dbg_pc     = wb_u.pc;
+assign dbg_pc     = DEBUG ? wb_u.pc : 32'd0;
 // (an interrupt's event waits for its IACK, which resolves the vector --
 // autovector, supplied, or spurious 24 -- and carries the PC stacked at
 // its entry)
 logic        dbg_ig;
 logic  [7:0] dbg_iv;
 logic [31:0] dbg_ip, dbg_ipc;
-wire         dbg_xirq = x_go && take_irq && !(adv_wb && wb_is_exc);
+wire         dbg_xirq = DEBUG && x_go && take_irq && !(adv_wb && wb_is_exc);
 always_ff @(posedge clk) begin
 	dbg_ig <= 1'b0;
 	if (dbg_xirq) dbg_ip <= x_pc;
-	if (adv_ex && ex_u.op == OP_IACKV && !ex_u.cond[0]) begin
+	if (DEBUG && adv_ex && ex_u.op == OP_IACKV && !ex_u.cond[0]) begin
 		dbg_ig  <= 1'b1;
 		dbg_iv  <= ex_av[9] ? 8'd24 : ex_av[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_av[7:0];
 		dbg_ipc <= dbg_ip;
@@ -2259,14 +2262,14 @@ always_ff @(posedge clk) begin
 end
 // the handler fetch of an exception routine (its last uop: the vector
 // load, the branch to its data) as it leaves EX
-assign dbg_hfgo   = adv_ex && ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF;
-assign dbg_hfld   = ex_ld;
-assign dbg_hfa    = ex_a;
-assign dbg_hff    = {ex_u.a_src, ex_ldj, 5'd0};
-assign dbg_hfpc   = ex_u.pc;
-assign dbg_xgo    = (x_go && !dbg_xirq) || dbg_ig;
-assign dbg_xvec   = dbg_ig ? dbg_iv  : x_vec;
-assign dbg_xpc    = dbg_ig ? dbg_ipc : x_pc;
+assign dbg_hfgo   = DEBUG && adv_ex && ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF;
+assign dbg_hfld   = DEBUG ? ex_ld : 32'd0;
+assign dbg_hfa    = DEBUG ? ex_a : 32'd0;
+assign dbg_hff    = DEBUG ? {ex_u.a_src, ex_ldj, 5'd0} : 8'd0;
+assign dbg_hfpc   = DEBUG ? ex_u.pc : 32'd0;
+assign dbg_xgo    = DEBUG && ((x_go && !dbg_xirq) || dbg_ig);
+assign dbg_xvec   = !DEBUG ? 8'd0 : dbg_ig ? dbg_iv  : x_vec;
+assign dbg_xpc    = !DEBUG ? 32'd0 : dbg_ig ? dbg_ipc : x_pc;
 assign ucond      = 1'b0;
 
 // processor status (MC68040UM 5.9.1, table 5-6): the end of an instruction
