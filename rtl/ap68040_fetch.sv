@@ -54,7 +54,7 @@
 module ap68040_fetch
 	import ap68040_pkg::*, ap68040_upkg::*;
 #(
-	parameter bit DEBUG = 1          // the debug outputs' logic (0: they stay at zero)
+	parameter bit DEBUG = 0          // the debug outputs' logic (0: they stay at zero)
 )(
 	input  logic        clk,
 	input  logic        nreset,

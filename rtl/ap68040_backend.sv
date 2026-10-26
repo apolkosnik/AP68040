@@ -30,7 +30,7 @@ module ap68040_backend
 	parameter bit         EARLY_RES = 1,
 	parameter bit         SKID      = 1,      // the skid register in front of AG
 	parameter int         DIV_STEPS = 2,      // divide steps per cycle
-	parameter bit         DEBUG     = 1       // the debug outputs' logic (0: they stay at zero and load nothing)
+	parameter bit         DEBUG     = 0       // the debug outputs' logic (0: they stay at zero and load nothing)
 )(
 	input  logic        clk,
 	input  logic        nreset,

@@ -212,7 +212,7 @@ always @(posedge clk) if (audit_dbgvec >= 0 && dbg_xgo) begin
 	end
 end
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
-          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
+          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC), .DEBUG(1)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),

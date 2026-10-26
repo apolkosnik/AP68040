@@ -25,7 +25,7 @@ module ap68040
 	// system options
 	parameter bit         DC_WRITETHROUGH = 0,   // copyback pages cached write-through (DMA reads not snooped)
 	// debug
-	parameter bit         DEBUG        = 1       // the dbg_* outputs' logic (0: they stay at zero and load nothing;
+	parameter bit         DEBUG        = 0       // the dbg_* outputs' logic (0: they stay at zero and load nothing;
 	                                             // dbg_halted is kept)
 )(
 
