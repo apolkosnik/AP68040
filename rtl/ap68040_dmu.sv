@@ -74,6 +74,7 @@ module ap68040_dmu
 	input  logic  [2:0] dm_fc,
 	input  logic        dm_lock,
 	input  logic        dm_locke,
+	input  logic        dm_wi,          // a load checked as a write
 	input  logic        dm_super,
 	input  logic        dm_noalloc,
 	input  logic  [1:0] dm_ack,         // acknowledge cycle: 1 IACK, 2 BKPT
@@ -89,6 +90,7 @@ module ap68040_dmu
 	output logic [31:0] ldata,
 	output logic [31:0] ldata_al,       // the aligned long (or word, low half)
 	output logic        ldata_alv,      // ... is the load's data
+	output logic        ldata_job,      // debug: ldata is the slow-path job's answer
 	output logic        fault,
 	output logic  [7:0] fvec,
 	output logic [31:0] faddr,
@@ -114,6 +116,7 @@ module ap68040_dmu
 	output logic        mt_fault,       // CPUSH: a push ended in TEA (an access error),
 	output logic [15:0] mt_fssw,        // ... its SSW and
 	output logic [31:0] mt_faddr,       // ... the push's address
+	output logic [127:0] pb_data,       // the line of the last push that ended in TEA (PD0-PD3)
 
 	// control registers
 	input  logic [31:0] cacr,
@@ -187,7 +190,16 @@ always_ff @(posedge clk) mdis_q <= mdis;
 wire tc_e   = tc[15] && !mdis_q;
 wire tc_e_n = tc[15] && !mdis;      // (tc_e at the next clock)
 wire tc_p  = tc[14];
-wire dc_en = cacr[31] && !cdis;
+// CACR.DE clear stops allocation only: the cache is still searched, a hit
+// is served and written (the MC68040UM 4.3.2 notes a locked access that
+// hit "and the data cache was disabled"; cputest on real 68040/68060
+// boards pushes a return address through copyback memory, clears DE with
+// MOVEC and pops it with RTS, so the hit must still serve it).  CDIS
+// bypasses the caches and leaves their contents alone (4.2; an emulator
+// feature).  WinUAE's data cache (off by default) bypasses on DE clear:
+// a divergence, knowingly.
+wire dc_en   = cacr[31] && !cdis;   // allocation
+wire dc_look = !cdis;               // hits served
 
 //--------------------------------------------------------------------------
 // stage records
@@ -200,6 +212,7 @@ typedef struct packed {
 	logic  [2:0] fc;
 	logic        lock;
 	logic        locke;
+	logic        wi;       // write intent: a load translated and walked as a write
 	logic        smode;    // FC2
 	logic        noalloc;
 	logic  [1:0] ack;      // acknowledge cycle (TT=3): 1 IACK, 2 BKPT
@@ -593,7 +606,9 @@ function automatic xres_t xlate(input logic [31:0] la, input logic s, input logi
 endfunction
 
 // DC1
-wire        m1_wr  = (m1.mem == M_ST) || (m1.mem == M_RMW);
+// (a locked read -- TAS, CAS, CAS2 -- is a write for protection, MC68040UM
+// 8.4.6; a write-intent load (wi) too: the stores after it must not fault)
+wire        m1_wr  = (m1.mem == M_ST) || (m1.mem == M_RMW) || m1.lock || m1.wi;
 // DC1's cache tag compare in parallel with the translation (the timing
 // path): each way's tag against the untranslated address and against the
 // physical page of each of the ATC's four ways; the ATC's hit vector, not
@@ -686,12 +701,12 @@ wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
 wire  [7:0] lsd_q    = lsd[m1.a[9:4]];
 wire        m1_sfast = ((m1.mem == M_LD) || (m1.mem == M_ST && x_dc1.cm == 2'b01)) &&
                        m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
-                       !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) && !m1.lock;
+                       !x_dc1.cm[1] && dc_look && (m1.ack == 2'd0) && !m1.lock;
 // (locked accesses -- TAS, CAS, CAS2 -- are noncachable (MC68040UM 7.4.1):
 // the slow path pushes and invalidates a hit first)
 wire        m1_fast  = (m1.mem == M_LD || m1.mem == M_RMW) && !m1.lock &&
                        x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
-                       !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) &&
+                       !x_dc1.cm[1] && dc_look && (m1.ack == 2'd0) &&
                        (m1.msz != SZ_Q) && !m1_split;
 
 //--------------------------------------------------------------------------
@@ -819,6 +834,8 @@ logic        pv_lock;             // E_PUSHV: the push is part of a locked seque
 logic  [1:0] pv_for;              // E_PUSHV: the push serves 0 a DC2 job, 1 a WB store, 2 CPUSH
 logic        pbe_r;               // a push ended in TEA: an access error at once (7.6.1)
 logic [31:0] pbe_a;               // ... the push's address
+logic [127:0] pbe_d;              // ... and its line: the frame's PD0-PD3 (8.4.6)
+assign pb_data = pbe_d;
 logic [127:0] mv_line;            // MOVE16 line buffer
 
 // the RAM write data: a fill or a restored victim (the buffers hold until
@@ -905,7 +922,7 @@ endfunction
 //--------------------------------------------------------------------------
 wire wb_st   = m4.r.v && st_v && (m4.r.mem == M_ST || m4.r.mem == M_RMW);
 wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
-               m4.x.cm == 2'b01 && dc_en && !m4.r.lock && (m4.r.msz != SZ_Q) &&
+               m4.x.cm == 2'b01 && dc_look && !m4.r.lock && (m4.r.msz != SZ_Q) &&
                (e_st == E_IDLE) && !e_wst_done;
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
@@ -919,7 +936,7 @@ always_ff @(posedge clk) dwp <= nreset && wfm;
 // cycle, the second the next (wfs_p1), without the engine
 logic        wfs_p1;
 wire wb_fs = wb_st && m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && m4.x.cm == 2'b01 &&
-             m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_en &&
+             m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_look &&
              !m4.r.lock && (m4.r.msz != SZ_Q) && (e_st == E_IDLE) && !e_wst_done && !wfs_p1;
 wire   [2:0] wfs_n0  = 3'(5'd16 - {1'b0, m4.r.a[3:0]});
 wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
@@ -1053,7 +1070,7 @@ always_ff @(posedge clk) begin
 		steal <= 1'b0; st_la <= '0; st_fc2 <= 1'b0; st_set <= '0;
 		f_set <= '0; f_way <= '0; f_tag <= '0;
 		pv_v <= 1'b0; pv_line <= '0; pv_lpa <= '0; pv_dirty <= 1'b0; pv_tln <= '0; pv_lock <= 1'b0;
-		pv_for <= 2'd0; pbe_r <= 1'b0; pbe_a <= '0;
+		pv_for <= 2'd0; pbe_r <= 1'b0; pbe_a <= '0; pbe_d <= '0;
 		mv_line <= '0;
 		ms_i <= '0;
 		sc_set <= '0; sc_lv <= '0; sc_ld <= '0;
@@ -1104,6 +1121,7 @@ always_ff @(posedge clk) begin
 			m1.fc      <= dm_fc;
 			m1.lock    <= dm_lock;
 			m1.locke   <= dm_locke;
+			m1.wi      <= dm_wi;
 			m1.smode   <= dm_super;
 			m1.noalloc <= dm_noalloc;
 			m1.ack     <= dm_ack;
@@ -1313,7 +1331,7 @@ always_ff @(posedge clk) begin
 		end
 		E_SP_2: begin
 			xres_t x;
-			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD),
+			x  = xlate({m2.r.a[31:4] + 28'd1, 4'd0}, m2.r.smode, (m2.r.mem != M_LD || m2.r.lock || m2.r.wi),
 			           fc_tt(m2.r.fc) == TT_ALT, atc_hit, atc_e,
 			           tq_a[0], tq_a[1], tq_a[2], tq_a[3], lve_q);
 			// the second part's translation and lookup, registered (the
@@ -1337,7 +1355,7 @@ always_ff @(posedge clk) begin
 			xres_t x;
 			// (after a search: the ATC holds its result, a nonresident
 			// entry for a failed one)
-			x = xlate(e_va, m2.r.smode, (m2.r.mem != M_LD), fc_tt(m2.r.fc) == TT_ALT,
+			x = xlate(e_va, m2.r.smode, (m2.r.mem != M_LD || m2.r.lock || m2.r.wi), fc_tt(m2.r.fc) == TT_ALT,
 			          atc_hit, atc_e, tq_a[0], tq_a[1], tq_a[2], tq_a[3], lve_q);
 			if (m2.r.ack != 2'd0) begin
 				x    = '0;
@@ -1360,7 +1378,7 @@ always_ff @(posedge clk) begin
 				e_st  <= E_IDLE;
 			end
 			else if (x.walk) begin
-				tw_va <= e_va; tw_s <= m2.r.smode; tw_wr <= (m2.r.mem != M_LD);
+				tw_va <= e_va; tw_s <= m2.r.smode; tw_wr <= (m2.r.mem != M_LD || m2.r.lock || m2.r.wi);
 				tw_pt <= 1'b0; tw_i <= 1'b0;
 				tw_upd <= atc_hit;          // a first write: the entry's M
 				tw_hw  <= atc_hv;           // (its way: the install rewrites it)
@@ -1381,15 +1399,15 @@ always_ff @(posedge clk) begin
 		else begin
 			logic cach, alloc, rd, move16;
 			move16 = (m2.r.msz == SZ_Q);
-			cach   = dc_en && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16;
-			alloc  = cach && !m2.r.noalloc;
+			cach   = dc_look && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16;
+			alloc  = cach && dc_en && !m2.r.noalloc;
 			rd     = (m2.r.mem == M_LD) || (m2.r.mem == M_RMW);
 			if (e_x.flt) begin
 				e_flt   <= 1'b1;
 				// FA is the operand's first byte even when a later part
 				// faulted; MA marks an ATC fault on the second page
 				e_faddr <= m2.r.a;
-				e_fssw  <= mk_ssw(1'b1, m2.r.lock, m2.r.mem == M_LD, m2.r.msz, m2.r.fc) |
+				e_fssw  <= mk_ssw(1'b1, m2.r.lock, m2.r.mem == M_LD && !m2.r.wi, m2.r.msz, m2.r.fc) |
 				           (e_part ? 16'h0800 : 16'h0000);
 				e_st    <= E_S_DONE;
 			end
@@ -1423,15 +1441,15 @@ always_ff @(posedge clk) begin
 				steal <= 1'b0;
 				e_st  <= E_IDLE;
 			end
-			else if (move16 && m2.r.mem == M_LD && e_x.hit && dc_en) begin
+			else if (move16 && m2.r.mem == M_LD && e_x.hit && dc_look) begin
 				// MOVE16 source hit: read from the cache, no allocation
 				e_st <= E_S_RD;
 			end
 			else if (move16 && m2.r.mem == M_ST) begin
 				// MOVE16 destination: a write hit invalidates the line (the
-				// write replaces all of it, 4.3.2) -- unless the data cache
-				// is disabled, which leaves its contents alone
-				if (e_x.hit && dc_en) begin
+				// write replaces all of it, 4.3.2) -- unless CDIS, which
+				// leaves the contents alone
+				if (e_x.hit && dc_look) begin
 					vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1;
 					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 					e_x.hit <= 1'b0;
@@ -1475,10 +1493,9 @@ always_ff @(posedge clk) begin
 				// cache inhibited, no-allocate miss, locked, MOVE16 miss,
 				// IACK: a matching line is pushed (if dirty) and invalidated
 				// first (4.3.2, 4.6.2; with LOCK for a locked access); the
-				// bus access goes in program order.  With the data cache
-				// disabled (CACR.DE clear, CDIS) the cache's contents are
-				// left alone
-				if (e_x.hit && dc_en && (m2.r.lock || e_x.cm[1] || move16)) begin
+				// bus access goes in program order.  With CDIS the cache's
+				// contents are left alone
+				if (e_x.hit && dc_look && (m2.r.lock || e_x.cm[1] || move16)) begin
 					f_set  <= e_va[9:4];
 					f_way  <= e_x.way;
 					pv_lock <= m2.r.lock;
@@ -1603,13 +1620,13 @@ always_ff @(posedge clk) begin
 		E_W_PART: begin
 			logic [15:0] be; logic upd;
 			be  = bmask(e_va[3:0], e_n);
-			upd = e_x.hit && dc_en && !e_x.cm[1] && !m4.r.lock && (m4.r.msz != SZ_Q);
-			if (e_x.hit && dc_en && (m4.r.lock || e_x.cm[1])) begin
+			upd = e_x.hit && dc_look && !e_x.cm[1] && !m4.r.lock && (m4.r.msz != SZ_Q);
+			if (e_x.hit && dc_look && (m4.r.lock || e_x.cm[1])) begin
 				// a locked write (TAS, CAS: noncachable, 7.4.1) and a
 				// cache-inhibited write bypass the cache: a line they hit is
 				// pushed if dirty and invalidated before the bus write
-				// (4.3.2, 4.6.2) -- unless the data cache is disabled, which
-				// leaves its contents alone
+				// (4.3.2, 4.6.2) -- unless CDIS, which leaves the contents
+				// alone
 				f_set   <= e_va[9:4];
 				f_way   <= e_x.way;
 				pv_lock <= m4.r.lock;
@@ -2021,7 +2038,7 @@ always_ff @(posedge clk) begin
 				// search as a bus error.
 				if (bo.line && !bo.rd && bo.tm == TM_PUSH) begin
 					if (pv_for == 2'd3) begin tw_fail <= 1'b1; tw_berr <= 1'b1; end
-					else begin pbe_r <= 1'b1; pbe_a <= bo_pa; end
+					else begin pbe_r <= 1'b1; pbe_a <= bo_pa; pbe_d <= bo_line; end
 				end
 				else bo_err <= 1'b1;
 				e_st   <= e_ret;
@@ -2071,7 +2088,7 @@ always_ff @(posedge clk) begin
 		E_TW_DESCW:  e_st <= E_TW_DESCW2;
 		E_TW_DESCW2: e_st <= E_TW_DLK;    // (the tags of the set valid: the compare registers)
 		E_TW_DLK: begin
-			if (tw_hhq && dc_en) begin
+			if (tw_hhq && dc_look) begin
 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
 				e_st <= E_TW_EVAL;
 			end
@@ -2481,6 +2498,7 @@ assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DE
 // once the engine has taken the DC2 uop, only its completion releases it
 assign dc2_rdy = !m2.r.v || e_dc2_done || (!e_job && (fast_now || st_simple));
 assign ldata   = e_dc2_done ? e_ldata : fast_data;
+assign ldata_job = e_dc2_done;
 // for AG's capture of a load into a base or index (a short path): the long
 // word of the line the address points at -- the operand itself for an
 // aligned long or an even word (in the low half), else not offered

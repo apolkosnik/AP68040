@@ -170,8 +170,49 @@ assign       ta_n     = slv_ta_n & (cpu_ta_oe ? cpu_ta_n : 1'b1);
 `ifndef AP_DC1_ATC
 `define AP_DC1_ATC 0
 `endif
+// the interrupt acknowledge tests (audit_iack_*): +audit_ivec=N supplies
+// vector N instead of an autovector, +audit_iacktea ends the IACK in TEA
+// (spurious); +audit_exc logs every exception entry
+int   audit_ivec;
+logic audit_iacktea;
+initial begin
+	if (!$value$plusargs("audit_ivec=%d", audit_ivec)) audit_ivec = 0;
+	audit_iacktea = $test$plusargs("audit_iacktea");
+end
+// the debug outputs (the exception's start, vector, stacked PC): with
+// +audit_dbgvec=N the run passes only if the debug interface reported
+// vector N (an interrupt: the one its IACK resolved, not the provisional
+// autovector) and no other interrupt vector
+logic        dbg_xgo;
+logic  [7:0] dbg_xvec;
+logic [31:0] dbg_xpc;
+// +audit_fe: every front-end event (the debug outputs: 1 back-end
+// redirect, 2 decoder redirect, 3 BTB, 4 flush at an exception entry,
+// 5 handler fetch) with the cycle and the PC in WB
+logic  [2:0] dbg_ev;
+logic [31:0] dbg_evpc;
+always @(posedge clk) if ($test$plusargs("audit_fe") && dbg_ev != 3'd0)
+	$display("FE %0d %s %08h (wb pc %08h)", cycles, dbg_ev == 3'd1 ? "BE-redirect" : dbg_ev == 3'd2 ? "D1-redirect" :
+	         dbg_ev == 3'd3 ? "BTB" : dbg_ev == 3'd4 ? "exc-flush" : "handler-fetch", dbg_evpc, dbg_pc);
+// (dbg_retire is registered at the commit: the committed uop's PC is the
+// previous cycle's dbg_pc)
+logic [15:0] dbg_rinfo;
+logic [31:0] dbg_pc_d;
+always @(posedge clk) dbg_pc_d <= dbg_pc;
+always @(posedge clk) if ($test$plusargs("audit_fe") && dbg_retire)
+	$display("RT %0d %08h exc=%02h exr=%b first=%b last=%b", cycles, dbg_pc_d,
+	         dbg_rinfo[15:8], dbg_rinfo[7], dbg_rinfo[6], dbg_rinfo[5]);
+int          audit_dbgvec, dbgvec_hit = 0, dbgvec_bad = 0;
+initial if (!$value$plusargs("audit_dbgvec=%d", audit_dbgvec)) audit_dbgvec = -1;
+always @(posedge clk) if (audit_dbgvec >= 0 && dbg_xgo) begin
+	if (dbg_xvec == 8'(audit_dbgvec)) dbgvec_hit++;
+	else if ((dbg_xvec >= 8'd24 && dbg_xvec < 8'd32) || dbg_xvec >= 8'd64) begin   // an interrupt's vectors
+		dbgvec_bad++;
+		$display("FAIL: debug interface reported vector %0d (pc=%h), expected %0d", dbg_xvec, dbg_xpc, audit_dbgvec);
+	end
+end
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
-          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
+          .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC), .DEBUG(1)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
@@ -185,7 +226,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_rinfo(dbg_rinfo), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_ev(dbg_ev), .dbg_evpc(dbg_evpc), .dbg_halted(dbg_halted)
 );
 
 // slave
@@ -204,7 +245,25 @@ logic  [1:0] ev_siz, ev_tt;
 logic  [2:0] ev_tm;
 logic        itci_on;
 logic [15:0] itci_a;
-wire         itci_req = itci_on && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
+// +slowlo=N: a region of slow memory below $1000 (as the A4000's chip RAM
+// is to its CPU): every transfer there waits N more clocks, and an
+// instruction fetch there is cache-inhibited
+int          slowlo;
+initial if (!$value$plusargs("slowlo=%d", slowlo)) slowlo = 0;
+logic [15:0] lo_cnt = '0;
+logic        lo_v_d = 1'b0;
+logic [31:0] lo_a_d = '0;
+wire         lo_new = xfer_v && (!lo_v_d || xfer_addr != lo_a_d);
+always @(posedge clk) begin
+	lo_v_d <= xfer_v;
+	lo_a_d <= xfer_addr;
+	if (lo_new) lo_cnt <= (slowlo != 0 && xfer_addr < 32'h1000) ? 16'(slowlo) : 16'd0;
+	else if (lo_cnt != 0) lo_cnt <= lo_cnt - 1'd1;
+end
+wire         lo_hold = (lo_new && slowlo != 0 && xfer_addr < 32'h1000) || lo_cnt != 0;
+wire         lo_tci  = slowlo != 0 && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
+                       xfer_addr < 32'h1000;
+wire         itci_req = (lo_tci) || itci_on && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
                         xfer_addr[15:4] == itci_a[15:4];
 
 m68040_bus_slave #(.AW(20)) mem (
@@ -213,8 +272,8 @@ m68040_bus_slave #(.AW(20)) mem (
 	.d_mem(d_mem), .ta_n(slv_ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
-	.iack_vector(8'd0), .ext_rdata(32'd0), .ext_inmem(1'b0),
+	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n || lo_hold), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
+	.iack_vector(8'(audit_ivec)), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),
 	.ev(ev), .ev_rd(ev_rd), .ev_addr(ev_addr), .ev_data(ev_data), .ev_be(ev_be),
@@ -649,8 +708,24 @@ always_ff @(posedge clk) begin
 end
 int          cap;
 
+// a write bus error injected once: a write to $F17C arms it, the next write
+// to +wtea=ADDR (default $8000) gets TEA (the restart tests: audit_*.s)
+int   wtea_addr;
+logic wtea_arm = 1'b0;
+initial if (!$value$plusargs("wtea=%h", wtea_addr)) wtea_addr = 32'h8000;
+always @(posedge clk) begin
+	if (ev && !ev_rd && !ev_err && ev_addr == 32'hF17C) wtea_arm <= 1'b1;
+	if (ev && !ev_rd && ev_err && ev_addr == wtea_addr) begin
+		wtea_arm <= 1'b0;
+		$display("AUDIT TEA address=%08x data=%08x", ev_addr, ev_data);
+	end
+	if (ev && !ev_rd && !ev_err && ev_addr >= 32'hF180 && ev_addr < 32'hF1C0)
+		$display("AUDIT address=%08x data=%08x", ev_addr, ev_data);
+end
+
 always_comb begin
-	tea_req = 1'b0;
+	tea_req = audit_iacktea && xfer_v && xfer_tt == 2'd3 && xfer_tm != 3'd0;
+	if (wtea_arm && xfer_v && !xfer_rd && xfer_addr == wtea_addr) tea_req = 1'b1;
 	if (xfer_v) begin
 		if (berr_armed && xfer_addr[15:0] == 16'hF140 && xfer_tt != 2'd3 &&
 		    xfer_tm != 3'd2 && xfer_tm != 3'd6)
@@ -1128,7 +1203,10 @@ initial begin
 	dmu_bad = dut.dmu.sim_xchk || dut.dmu.sim_kchk;
 	if (dmu_bad)
 		$display("FAIL: a DMU self-check tripped (tag compare %0d, dead job %0d)", dut.dmu.sim_xchk, dut.dmu.sim_kchk);
-	if (result == 1 && errors == 0 && halt_bad == 0 && !dmu_bad)
+	if (audit_dbgvec >= 0 && dbgvec_hit == 0)
+		$display("FAIL: the debug interface never reported vector %0d", audit_dbgvec);
+	if (result == 1 && errors == 0 && halt_bad == 0 && !dmu_bad &&
+	    (audit_dbgvec < 0 || (dbgvec_hit != 0 && dbgvec_bad == 0)))
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)
 		$display("FAIL %s: %s at pc=%h, last test %0d", prog,
@@ -1137,6 +1215,13 @@ initial begin
 	else
 		$display("FAIL %s", prog);
 	$finish;
+end
+
+always @(posedge clk) begin
+	if ($test$plusargs("audit_exc") && dut.be.x_go)
+		$display("EXCEPTION vec=%0d pc=%08h sr=%04h fmt=%h ssw=%04h addr=%08h", dut.be.x_vec, dut.be.x_pc, dut.be.x_osr, dut.be.x_fmt, dut.be.x_ssw, dut.be.x_addr);
+	if ($test$plusargs("audit_exc") && ev && !ev_rd && ev_addr >= 32'hf180 && ev_addr < 32'hf200)
+		$display("OBS addr=%08h data=%08h be=%b", ev_addr, ev_data, ev_be);
 end
 
 endmodule

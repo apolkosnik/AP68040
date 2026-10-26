@@ -23,7 +23,10 @@ module ap68040
 	parameter bit         SKID         = 0,      // the skid register in front of AG (timing)
 	parameter int         DIV_STEPS    = 2,      // divide steps per cycle (2 or 4)
 	// system options
-	parameter bit         DC_WRITETHROUGH = 0    // copyback pages cached write-through (DMA reads not snooped)
+	parameter bit         DC_WRITETHROUGH = 0,   // copyback pages cached write-through (DMA reads not snooped)
+	// debug
+	parameter bit         DEBUG        = 0       // the dbg_* outputs' logic (0: they stay at zero and load nothing;
+	                                             // dbg_halted is kept)
 )(
 
 	input  logic        clk,
@@ -75,6 +78,19 @@ module ap68040
 	// debug / test
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
+	output logic [15:0] dbg_rinfo,     // ... the committed uop's {exc, exr, first, last, 5'b0}
+	output logic        dbg_xgo,       // debug: exception processing starts,
+	output logic  [7:0] dbg_xvec,      // ... its vector and
+	output logic [31:0] dbg_xpc,       // ... the PC it stacks
+	output logic        dbg_hfgo,      // debug: an exception routine's handler fetch leaves EX,
+	output logic [31:0] dbg_hfld,      // ... its load data,
+	output logic [31:0] dbg_hfa,       // ... its A operand register value,
+	output logic  [7:0] dbg_hff,       // ... {A source, DMU job answer, 5'0}
+	output logic [31:0] dbg_hfpc,      // ... and its PC field
+	output logic  [2:0] dbg_ev,        // debug: a front-end event this clock: 1 back-end redirect,
+	                                   // 2 decoder redirect, 3 BTB redirect, 4 front-end flush
+	                                   // without a redirect (exception entry), 5 handler fetch
+	output logic [31:0] dbg_evpc,      // ... its target (5: the handler address loaded)
 	output logic        dbg_halted
 );
 
@@ -222,6 +238,7 @@ logic        dm_hold1, mt_v, mt_ng, mt_wr, mt_done, mt_fault;
 logic  [2:0] mt_op, mt_fc;
 logic  [1:0] mt_scope, mt_caches;
 logic [31:0] mt_addr, mt_mmusr, mt_faddr, urp, srp, dm_st_faddr;
+logic [127:0] pb_data;
 logic [15:0] mt_fssw;
 logic  [2:0] iack_lvl;
 logic  [1:0] dm_ack;
@@ -230,15 +247,17 @@ logic        dm_req, adv_dc1, adv_dc2, adv_ex, adv_wb;
 logic [31:0] dm_va;
 logic  [1:0] dm_mem, dm_msz;
 logic  [2:0] dm_fc;
-logic        dm_lock, dm_locke, dm_super, dm_noalloc, dm_older;
+logic        dm_lock, dm_locke, dm_wi, dm_super, dm_noalloc, dm_older;
 logic        bht_we, tw_busy;
 logic  [7:0] bht_wa;
 logic        bht_dis;
 logic        lp_we, lp_tk, lp_mp;
 logic [11:0] lp_wa;
 logic        dm_dc2_rdy, dm_fault, dm_st_v, dm_st_rdy, dm_st_fault;
+logic        rte_cont;
 logic [31:0] dm_ldata, dm_faddr, dm_st_data, dm_ldata_al;
 logic        dm_ldata_alv;
+logic        dm_ldata_job;
 logic  [7:0] dm_fvec;
 logic [15:0] dm_fssw, dm_st_fssw;
 
@@ -247,7 +266,7 @@ uop_t        uq0;
 logic        uo_rdy;
 
 ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(EARLY_RES),
-                  .SKID(SKID), .DIV_STEPS(DIV_STEPS)) be (
+                  .SKID(SKID), .DIV_STEPS(DIV_STEPS), .DEBUG(DEBUG)) be (
 	.clk(clk), .nreset(nreset),
 	.in_v(uq_n != 2'd0), .in_u(uq0), .in_rdy(uo_rdy),
 	.redir_v(redir_v), .redir_pc(redir_pc), .flush(flush), .fe_flush(fe_flush),
@@ -256,43 +275,45 @@ ap68040_backend #(.FPU_REVISION(FPU_REVISION), .FPU_PIPE(FPU_PIPE), .EARLY_RES(E
 	.ucond_v(ucond_v), .ucond(ucond),
 	.sr(sr), .vbr(vbr), .cacr(cacr), .sfc(sfc), .dfc(dfc),
 	.dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem), .dm_msz(dm_msz),
-	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
+	.dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_wi(dm_wi), .dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .dm_older(dm_older),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),
 	.lp_we(lp_we), .lp_wa(lp_wa), .lp_tk(lp_tk), .lp_mp(lp_mp), .sn_ihit(sn_ihit),
 	.tw_busy(tw_busy), .pst_ev(pst_ev), .pst_code(pst_code), .pst_st(pst_st),
 	.irq_pending(irq_pending),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
-	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_ldata_al(dm_ldata_al), .dm_ldata_alv(dm_ldata_alv), .dm_fault(dm_fault),
+	.dm_dc2_rdy(dm_dc2_rdy), .dm_ldata(dm_ldata), .dm_ldata_al(dm_ldata_al), .dm_ldata_alv(dm_ldata_alv), .dm_ldata_job(dm_ldata_job), .dm_fault(dm_fault),
 	.dm_fvec(dm_fvec), .dm_faddr(dm_faddr), .dm_fssw(dm_fssw),
-	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy),
+	.dm_st_v(dm_st_v), .dm_st_data(dm_st_data), .dm_st_rdy(dm_st_rdy), .rte_cont(rte_cont),
 	.dm_st_fault(dm_st_fault), .dm_st_fssw(dm_st_fssw),
 	.dm_hold1(dm_hold1), .mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope),
 	.mt_caches(mt_caches), .mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng),
 	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault),
-	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .dm_st_faddr(dm_st_faddr),
+	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .pb_data(pb_data), .dm_st_faddr(dm_st_faddr),
 	.urp(urp), .srp(srp),
 	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted), .fetch_stop(be_fstop)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_rinfo(dbg_rinfo), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc),
+	.dbg_hfgo(dbg_hfgo), .dbg_hfld(dbg_hfld), .dbg_hfa(dbg_hfa), .dbg_hff(dbg_hff), .dbg_hfpc(dbg_hfpc),
+	.halted(dbg_halted), .fetch_stop(be_fstop)
 );
 
 ap68040_dmu #(.DC1_ATC(DC1_ATC), .DC_WRITETHROUGH(DC_WRITETHROUGH)) dmu (
 	.clk(clk), .nreset(nreset),
 	.adv_ag(adv_ag), .dm_req(dm_req), .dm_va(dm_va), .dm_mem(dm_mem),
-	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke),
+	.dm_msz(dm_msz), .dm_fc(dm_fc), .dm_lock(dm_lock), .dm_locke(dm_locke), .dm_wi(dm_wi),
 	.dm_super(dm_super), .dm_noalloc(dm_noalloc), .dm_ack(dm_ack), .iack_lvl(iack_lvl),
 	.dm_older(dm_older),
 	.adv_dc1(adv_dc1), .adv_dc2(adv_dc2), .adv_ex(adv_ex), .adv_wb(adv_wb),
 	.kill_now(kill_now), .dm_hold1(dm_hold1),
-	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .ldata_al(dm_ldata_al), .ldata_alv(dm_ldata_alv), .fault(dm_fault), .fvec(dm_fvec),
+	.dc2_rdy(dm_dc2_rdy), .ldata(dm_ldata), .ldata_al(dm_ldata_al), .ldata_alv(dm_ldata_alv), .ldata_job(dm_ldata_job), .fault(dm_fault), .fvec(dm_fvec),
 	.faddr(dm_faddr), .fssw(dm_fssw),
 	.st_v(dm_st_v), .st_data(dm_st_data), .st_rdy(dm_st_rdy),
 	.st_fault(dm_st_fault), .st_fssw(dm_st_fssw), .st_faddr(dm_st_faddr),
 	.mt_v(mt_v), .mt_op(mt_op), .mt_scope(mt_scope), .mt_caches(mt_caches),
 	.mt_addr(mt_addr), .mt_fc(mt_fc), .mt_ng(mt_ng), .mt_wr(mt_wr),
 	.mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault), .mt_fssw(mt_fssw),
-	.mt_faddr(mt_faddr),
+	.mt_faddr(mt_faddr), .pb_data(pb_data),
 	.cacr(cacr), .tc(tc), .urp(urp), .srp(srp),
 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1),
 	.cdis(cdis), .mdis(mdis), .tw_busy(tw_busy),
@@ -345,16 +366,28 @@ logic [31:0] qpc;
 logic  [2:0] consume;
 logic        d_redir_v;
 logic [31:0] d_redir_pc;
+logic        dbg_btgo;
+logic [31:0] dbg_btpc;
+always_comb begin
+	dbg_ev = 3'd0; dbg_evpc = 32'd0;
+	if (!DEBUG)         begin end
+	else if (redir_v)   begin dbg_ev = 3'd1; dbg_evpc = redir_pc; end
+	else if (d_redir_v) begin dbg_ev = 3'd2; dbg_evpc = d_redir_pc; end
+	else if (dbg_btgo)  begin dbg_ev = 3'd3; dbg_evpc = dbg_btpc; end
+	else if (dbg_hfgo)  begin dbg_ev = 3'd5; dbg_evpc = dbg_hfld; end
+	else if (fe_flush)  begin dbg_ev = 3'd4; dbg_evpc = 32'd0; end
+end
 logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
 
-ap68040_fetch fetch (
+ap68040_fetch #(.DEBUG(DEBUG)) fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
+	.dbg_btgo(dbg_btgo), .dbg_btpc(dbg_btpc),
 	// no fetches while stopped or halted, nor while RSTO is asserted
-	.stop(be_fstop || rsto_busy), .smode(sr[13]),
+	.stop(be_fstop || rsto_busy), .smode(sr[13] || rte_cont),
 	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1), .cdis(cdis), .mdis(mdis),
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
@@ -385,7 +418,7 @@ ap68040_decode #(.LOOP_PRED(LOOP_PRED)) dec (
 	.win(win), .win_flt(win_flt), .win_fdem(win_fdem), .win_fatc(win_fatc),
 	.win_bt(win_bt), .bt_tgt(bt_tgt),
 	.pd0(pd0), .pd0_n(pd0_n), .qcnt(qcnt), .qpc(qpc), .q_odd(q_odd),
-	.smode(sr[13]),
+	.smode(sr[13] || rte_cont),
 	.consume(consume), .d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
 	.rq_n(rq_n), .rq0(rq0), .rq1(rq1), .rq_pop(rq_pop), .rq_pop_e(rq_pop_e),
 	.bht_we(bht_we), .bht_wa(bht_wa), .bht_dis(bht_dis),

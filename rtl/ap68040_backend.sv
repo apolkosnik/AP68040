@@ -29,7 +29,8 @@ module ap68040_backend
 	parameter bit         FPU_PIPE  = 1,
 	parameter bit         EARLY_RES = 1,
 	parameter bit         SKID      = 1,      // the skid register in front of AG
-	parameter int         DIV_STEPS = 2       // divide steps per cycle
+	parameter int         DIV_STEPS = 2,      // divide steps per cycle
+	parameter bit         DEBUG     = 0       // the debug outputs' logic (0: they stay at zero and load nothing)
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -73,6 +74,7 @@ module ap68040_backend
 	output logic  [2:0] dm_fc,
 	output logic        dm_lock,
 	output logic        dm_locke,
+	output logic        dm_wi,
 	output logic        dm_super,
 	output logic        dm_older,       // uops older than DC2 are in EX or WB
 	input  logic        sn_ihit,        // a snoop dropped valid instruction-cache data
@@ -105,6 +107,7 @@ module ap68040_backend
 	input  logic        mt_fault,       // CPUSH: a push ended in TEA (an access error)
 	input  logic [15:0] mt_fssw,
 	input  logic [31:0] mt_faddr,
+	input  logic [127:0] pb_data,       // the line of a push that ended in TEA (DMU)
 	output logic        adv_dc1,        // DC1 -> DC2
 	output logic        adv_dc2,        // DC2 -> EX
 	output logic        adv_ex,         // EX -> WB
@@ -113,11 +116,14 @@ module ap68040_backend
 	input  logic [31:0] dm_ldata,       // load data, right aligned
 	input  logic [31:0] dm_ldata_al,    // the aligned operand (AG's capture)
 	input  logic        dm_ldata_alv,   // ... is the load's data
+	input  logic        dm_ldata_job,   // debug: the load data is the DMU job's answer
 	input  logic        dm_fault,       // DC2 access fault (with info below)
 	input  logic  [7:0] dm_fvec,        // 2 access error, 3 address error
 	input  logic [31:0] dm_faddr,
 	input  logic [15:0] dm_fssw,        // ... its special status word
 	output logic        dm_st_v,        // WB store data valid this cycle
+	output logic        rte_cont,       // an RTE continues after a throwaway frame (8.4.2): its
+	                                    // refetch is supervisor and not privilege-checked
 	output logic [31:0] dm_st_data,
 	input  logic        dm_st_rdy,      // store accepted (WB may complete)
 	input  logic        dm_st_fault,
@@ -144,6 +150,15 @@ module ap68040_backend
 	// debug
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
+	output logic [15:0] dbg_rinfo,      // with dbg_retire: the committed uop's {exc, exr, first, last, 5'b0}
+	output logic        dbg_xgo,        // exception processing starts (one clock)
+	output logic  [7:0] dbg_xvec,       // ... its vector
+	output logic [31:0] dbg_xpc,        // ... the PC it stacks
+	output logic        dbg_hfgo,       // an exception routine's handler fetch leaves EX
+	output logic [31:0] dbg_hfld,       // ... its load data
+	output logic [31:0] dbg_hfa,        // ... its A operand (the register value)
+	output logic  [7:0] dbg_hff,        // ... {A source, the DMU job's answer, 5'd0}
+	output logic [31:0] dbg_hfpc,       // ... its PC field
 	output logic        halted,
 	output logic        fetch_stop      // no new instruction fetches: stopped
                                         // (STOP) or halted
@@ -179,6 +194,7 @@ logic [31:0] dc1_er, dc2_er, ex_er;
 logic        erb, erx;         // agb_q / agx_q hold the youngest writer's early result
 logic [31:0] dc2_a, dc2_b, dc2_ea;
 logic [31:0] ex_a,  ex_b,  ex_ea,  ex_ld;
+logic        ex_ldj;           // (debug) ex_ld was the DMU job's answer
 logic        ex_fault;
 logic  [7:0] ex_fvec;
 logic [31:0] ex_faddr;
@@ -187,6 +203,8 @@ logic [15:0] ex_fssw;
 // results carried into WB
 logic [31:0] wb_res;
 logic  [4:0] wb_ccr;          // CCR after this uop
+logic  [4:0] wb_ccr_ist;      // CCR before this uop's instruction (its restart's)
+logic  [4:0] ccr_ist;         // EX: the CCR at the start of the instruction in EX
 logic        wb_dwe;          // result register write (after EX kills)
 logic [31:0] wb_upd_val, wb_upd2_val;
 logic        wb_redir;        // the uop redirects the front end
@@ -256,7 +274,8 @@ logic [31:0] xi_pc, xi_addr;
 logic [15:0] xi_sr, xi_vecw, xi_ssw;
 logic [31:0] xi_vaddr, xi_ea, xi_w3a, xi_w3d;
 logic        xi_f7;           // the frame is format $7: T5-T7 too
-logic  [2:0] xw_ph;           // exception entry: back-file writes of T5-T13
+logic  [2:0] xw_ph;           // exception entry: back-file writes of T5-T13 (format $7: T0-T3 too)
+logic [127:0] xi_pd;          // format $7: PD0-PD3, a failed push's line (else zero)
 
 assign sr   = {sr_r[15:5], ccr_b};
 assign dtt0 = dtt0_r;
@@ -541,6 +560,7 @@ assign dm_mem     = ag_u.mem;
 assign dm_msz     = ag_msz;
 assign dm_lock    = ag_u.mlock;
 assign dm_locke   = ag_u.mlocke;
+assign dm_wi      = ag_u.mwi;
 // FC2 of the access selects the root and the supervisor checks: MOVES
 // translates its SFC/DFC space (WinUAE: super = (sfc & 4) != 0)
 assign dm_super   = dm_fc[2];
@@ -1216,6 +1236,10 @@ ap68040_alu cmp_alu (
 );
 logic        cas2_eq;           // CAS2: both pairs equal so far
 logic        rte_fmt1;          // RTE: the frame is a throwaway ($1)
+// (the RTE then goes on with the next frame on the stack the restored SR
+// selects -- USP too: the instruction is refetched, and the refetch is
+// the same RTE continuing, fetched as supervisor and not checked for
+// privilege; no interrupt or trace comes between its frames)
 wire  [31:0] ex_szm = (ex_u.sz == SZ_B) ? 32'h0000_00FF :
                       (ex_u.sz == SZ_W) ? 32'h0000_FFFF : 32'hFFFF_FFFF;
 
@@ -1379,10 +1403,17 @@ wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != s
 // exception processing, stacking the handler's entry address (MC68040UM
 // 8.3: the interrupt's processing follows the other exception's at once)
 wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
-// a MOVEM continuation armed by RTE runs before a pending interrupt
-wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v);
+// a MOVEM continuation armed by RTE runs before a pending interrupt; no
+// interrupt between an RTE's throwaway frame and the frame after it --
+// the RTE that pops the last frame ends at a boundary like any other, so
+// an interrupt its SR unmasks is taken before the instruction it returns to
+wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v) ||
+                   (wb_v && wb_u.op == OP_RTE && rte_fmt1) ||
+                   (rte_cont && !(wb_v && wb_u.op == OP_RTE));
 wire take_irq    = irq_pend && !cm_block && (wb_bound || (stopped && !wb_v));
-wire take_trace  = trace_due && !take_irq;
+// (a throwaway frame's RTE goes on: its trace is the whole RTE's, judged
+// at its end with the SR it ends with)
+wire take_trace  = trace_due && !take_irq && !(wb_v && wb_u.op == OP_RTE && rte_fmt1);
 wire wb_refetch;
 // a speculative fetch fault (code 1) is no exception: WB refetches the
 // instruction once on demand, and only a second fault there is an access
@@ -1458,8 +1489,18 @@ always_comb begin
 			bwa[1] = R_T0 + 5'd6;  bwd[1] = xi_w3a;
 		end
 		3'd5: begin
-			bwe = 3'b001;
+			bwe = 3'b011;
 			bwa[0] = R_T0 + 5'd7;  bwd[0] = xi_w3d;
+			bwa[1] = R_T0;         bwd[1] = xi_pd[127:96];   // PD0 (WB1D)
+		end
+		3'd6: begin
+			bwe = 3'b011;
+			bwa[0] = R_T0 + 5'd1;  bwd[0] = xi_pd[95:64];    // PD1
+			bwa[1] = R_T0 + 5'd2;  bwd[1] = xi_pd[63:32];    // PD2
+		end
+		3'd7: begin
+			bwe = 3'b001;
+			bwa[0] = R_T0 + 5'd3;  bwd[0] = xi_pd[31:0];     // PD3
 		end
 		default: ;
 	endcase
@@ -1590,6 +1631,7 @@ always_ff @(posedge clk) begin
 	fe_flush <= 1'b0;
 	ucond_v <= 1'b0;
 	dbg_retire <= 1'b0;
+	dbg_rinfo  <= 16'd0;
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
@@ -1615,6 +1657,7 @@ always_ff @(posedge clk) begin
 		md_hiin <= 32'd0;
 		cas2_eq <= 1'b0;
 		rte_fmt1 <= 1'b0;
+		rte_cont <= 1'b0;
 		rte_fmt7 <= 1'b0;
 		cm_n_v   <= 1'b0;
 		cm_n_ea  <= 32'd0;
@@ -1761,6 +1804,7 @@ always_ff @(posedge clk) begin
 			ex_b     <= (exw_v && dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) ? exw_val : dc2_b;
 			ex_ea    <= dc2_ea;
 			ex_ld    <= dm_ldata;
+			ex_ldj   <= dm_ldata_job;
 			ex_upd   <= dc2_upd;
 			ex_upd2  <= dc2_upd2;
 			ex_fault <= (dc2_u.mem != M_NONE) && dm_fault;
@@ -1905,13 +1949,20 @@ always_ff @(posedge clk) begin
 			              ex_u.op == OP_RTE;
 			// CCR after this uop (CHK, CHK2, TRAPcc and divide-by-zero set
 			// their flags and then trap: the stacked SR carries them)
-			if (ex_u.exc == 8'd0 && !ex_fault) begin
-				logic [4:0] nf;
+			begin
+				logic [4:0] nf, c0, ist;
+				// the CCR before this instruction: an access error restarts it,
+				// so its frame carries that, not flags its earlier uops made
+				ist = ex_u.first ? ccr_f : ccr_ist;
+				if (ex_u.first) ccr_ist <= ccr_f;
+				wb_ccr_ist <= ist;
 				nf = (ex_u.op == OP_CAS) ? cas_flags : ex_flags;
-				ccr_f  <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
-				wb_ccr <= (nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we);
+				c0 = (ex_u.exc == 8'd0 && !ex_fault) ? ((nf & ex_u.ccr_we) | (ccr_f & ~ex_u.ccr_we)) :
+				     ex_fault ? ist : ccr_f;
+				wb_ccr <= c0;
+				if (ex_u.exc == 8'd0 && !ex_fault)
+					ccr_f <= c0;
 			end
-			else wb_ccr <= ccr_f;
 			if (ex_u.op == OP_MDHI)  md_hiin  <= ex_av;
 			if (ex_u.op == OP_LATCH || (ex_u.op == OP_IACKV && !ex_u.cond[0])) ex_latch <= ex_av;
 			if (ex_u.op == OP_RTEF && !ex_u.cond[0]) begin
@@ -1952,7 +2003,12 @@ always_ff @(posedge clk) begin
 		// WB commit
 		//------------------------------------------------------------------
 		if (wb_commit) begin
-			dbg_retire <= wb_u.last;
+			if (DEBUG) begin
+				dbg_retire <= wb_u.last;
+				// (only the uop's own registers: a load on kill_now or exc_pend
+				// costs the fit)
+				dbg_rinfo  <= {wb_u.exc, wb_u.exr, wb_u.first, wb_u.last, 5'b00000};
+			end
 			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
@@ -2000,6 +2056,7 @@ always_ff @(posedge clk) begin
 				// RTE of a format $7 frame with CM arms the continuation of
 				// the MOVEM it returns to; any other instruction ends it
 				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
+				rte_cont <= (wb_u.op == OP_RTE) && rte_fmt1;
 				cm_ea   <= cm_n_ea;
 				cm_pc   <= wb_next;
 				cm_wr   = 1'b1;
@@ -2036,6 +2093,7 @@ always_ff @(posedge clk) begin
 			redir_v  <= 1'b0;
 			ras_rv   <= 1'b0;
 			xw_ph    <= 3'd1;          // T8-T13 (and T5-T7) first, then exc_go
+			rte_cont <= 1'b0;
 			xi_f7    <= (x_fmt == 4'h7);
 			exc_kind <= x_kind;
 			exc_ssp  <= x_ssp;
@@ -2067,13 +2125,17 @@ always_ff @(posedge clk) begin
 			xi_ea    <= x_cm ? x_cm_ea : x_addr;
 			xi_w3a   <= x_wfault ? x_addr : 32'd0;
 			xi_w3d   <= x_wfault ? wb_st_data : 32'd0;
+			// a push that ended in TEA (SSW: a line write, TT 0, TM 0; LK and
+			// CM aside): the frame carries its line in PD0-PD3 (MC68040UM
+			// 8.4.6), the handler writes it; anything else, zeros
+			xi_pd    <= ((x_fmt == 4'h7) && ((x_ssw & 16'hEDFF) == 16'h0060)) ? pb_data : 128'd0;
 		end
 
 		// exception entry, continued: three cycles of back-file writes
 		// (five for a format $7 frame)
 		if (xw_ph != 3'd0) begin
 			xw_ph <= xw_ph + 3'd1;
-			if ((xw_ph == 3'd3 && !xi_f7) || xw_ph == 3'd5) begin
+			if ((xw_ph == 3'd3 && !xi_f7) || xw_ph == 3'd7) begin
 				xw_ph  <= 3'd0;
 				exc_go <= 1'b1;
 			end
@@ -2103,6 +2165,7 @@ always_ff @(posedge clk) begin
 			wb_stv      <= 1'b0;
 			wb_ok       <= 1'b0;
 			wb_exc      <= 8'd2;
+			wb_ccr      <= wb_ccr_ist;   // the restart's flags: the instruction's inputs
 			wb_exc_addr <= dm_st_faddr;
 			wb_exc_ssw  <= dm_st_fssw;
 		end
@@ -2180,7 +2243,33 @@ always_ff @(posedge clk)
 assign iack_lvl   = irq_lvl_r;
 assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
-assign dbg_pc     = wb_u.pc;
+assign dbg_pc     = DEBUG ? wb_u.pc : 32'd0;
+// (an interrupt's event waits for its IACK, which resolves the vector --
+// autovector, supplied, or spurious 24 -- and carries the PC stacked at
+// its entry)
+logic        dbg_ig;
+logic  [7:0] dbg_iv;
+logic [31:0] dbg_ip, dbg_ipc;
+wire         dbg_xirq = DEBUG && x_go && take_irq && !(adv_wb && wb_is_exc);
+always_ff @(posedge clk) begin
+	dbg_ig <= 1'b0;
+	if (dbg_xirq) dbg_ip <= x_pc;
+	if (DEBUG && adv_ex && ex_u.op == OP_IACKV && !ex_u.cond[0]) begin
+		dbg_ig  <= 1'b1;
+		dbg_iv  <= ex_av[9] ? 8'd24 : ex_av[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_av[7:0];
+		dbg_ipc <= dbg_ip;
+	end
+end
+// the handler fetch of an exception routine (its last uop: the vector
+// load, the branch to its data) as it leaves EX
+assign dbg_hfgo   = DEBUG && adv_ex && ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF;
+assign dbg_hfld   = DEBUG ? ex_ld : 32'd0;
+assign dbg_hfa    = DEBUG ? ex_a : 32'd0;
+assign dbg_hff    = DEBUG ? {ex_u.a_src, ex_ldj, 5'd0} : 8'd0;
+assign dbg_hfpc   = DEBUG ? ex_u.pc : 32'd0;
+assign dbg_xgo    = DEBUG && ((x_go && !dbg_xirq) || dbg_ig);
+assign dbg_xvec   = !DEBUG ? 8'd0 : dbg_ig ? dbg_iv  : x_vec;
+assign dbg_xpc    = !DEBUG ? 32'd0 : dbg_ig ? dbg_ipc : x_pc;
 assign ucond      = 1'b0;
 
 // processor status (MC68040UM 5.9.1, table 5-6): the end of an instruction
