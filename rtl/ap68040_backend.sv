@@ -1394,9 +1394,13 @@ wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != s
 // exception processing, stacking the handler's entry address (MC68040UM
 // 8.3: the interrupt's processing follows the other exception's at once)
 wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
-// a MOVEM continuation armed by RTE runs before a pending interrupt
+// a MOVEM continuation armed by RTE runs before a pending interrupt; no
+// interrupt between an RTE's throwaway frame and the frame after it --
+// the RTE that pops the last frame ends at a boundary like any other, so
+// an interrupt its SR unmasks is taken before the instruction it returns to
 wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v) ||
-                   (wb_v && wb_u.op == OP_RTE && rte_fmt1) || rte_cont;
+                   (wb_v && wb_u.op == OP_RTE && rte_fmt1) ||
+                   (rte_cont && !(wb_v && wb_u.op == OP_RTE));
 wire take_irq    = irq_pend && !cm_block && (wb_bound || (stopped && !wb_v));
 // (a throwaway frame's RTE goes on: its trace is the whole RTE's, judged
 // at its end with the SR it ends with)
@@ -2224,9 +2228,25 @@ assign iack_lvl   = irq_lvl_r;
 assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
 assign dbg_pc     = wb_u.pc;
-assign dbg_xgo    = x_go;
-assign dbg_xvec   = x_vec;
-assign dbg_xpc    = x_pc;
+// (an interrupt's event waits for its IACK, which resolves the vector --
+// autovector, supplied, or spurious 24 -- and carries the PC stacked at
+// its entry)
+logic        dbg_ig;
+logic  [7:0] dbg_iv;
+logic [31:0] dbg_ip, dbg_ipc;
+wire         dbg_xirq = x_go && take_irq && !(adv_wb && wb_is_exc);
+always_ff @(posedge clk) begin
+	dbg_ig <= 1'b0;
+	if (dbg_xirq) dbg_ip <= x_pc;
+	if (adv_ex && ex_u.op == OP_IACKV && !ex_u.cond[0]) begin
+		dbg_ig  <= 1'b1;
+		dbg_iv  <= ex_av[9] ? 8'd24 : ex_av[8] ? (8'd24 + {5'd0, irq_lvl_r}) : ex_av[7:0];
+		dbg_ipc <= dbg_ip;
+	end
+end
+assign dbg_xgo    = (x_go && !dbg_xirq) || dbg_ig;
+assign dbg_xvec   = dbg_ig ? dbg_iv  : x_vec;
+assign dbg_xpc    = dbg_ig ? dbg_ipc : x_pc;
 assign ucond      = 1'b0;
 
 // processor status (MC68040UM 5.9.1, table 5-6): the end of an instruction

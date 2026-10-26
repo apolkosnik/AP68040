@@ -179,6 +179,22 @@ initial begin
 	if (!$value$plusargs("audit_ivec=%d", audit_ivec)) audit_ivec = 0;
 	audit_iacktea = $test$plusargs("audit_iacktea");
 end
+// the debug outputs (the exception's start, vector, stacked PC): with
+// +audit_dbgvec=N the run passes only if the debug interface reported
+// vector N (an interrupt: the one its IACK resolved, not the provisional
+// autovector) and no other interrupt vector
+logic        dbg_xgo;
+logic  [7:0] dbg_xvec;
+logic [31:0] dbg_xpc;
+int          audit_dbgvec, dbgvec_hit = 0, dbgvec_bad = 0;
+initial if (!$value$plusargs("audit_dbgvec=%d", audit_dbgvec)) audit_dbgvec = -1;
+always @(posedge clk) if (audit_dbgvec >= 0 && dbg_xgo) begin
+	if (dbg_xvec == 8'(audit_dbgvec)) dbgvec_hit++;
+	else if ((dbg_xvec >= 8'd24 && dbg_xvec < 8'd32) || dbg_xvec >= 8'd64) begin   // an interrupt's vectors
+		dbgvec_bad++;
+		$display("FAIL: debug interface reported vector %0d (pc=%h), expected %0d", dbg_xvec, dbg_xpc, audit_dbgvec);
+	end
+end
 ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
           .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
@@ -194,7 +210,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(), .dbg_xvec(), .dbg_xpc(), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_halted(dbg_halted)
 );
 
 // slave
@@ -1153,7 +1169,10 @@ initial begin
 	dmu_bad = dut.dmu.sim_xchk || dut.dmu.sim_kchk;
 	if (dmu_bad)
 		$display("FAIL: a DMU self-check tripped (tag compare %0d, dead job %0d)", dut.dmu.sim_xchk, dut.dmu.sim_kchk);
-	if (result == 1 && errors == 0 && halt_bad == 0 && !dmu_bad)
+	if (audit_dbgvec >= 0 && dbgvec_hit == 0)
+		$display("FAIL: the debug interface never reported vector %0d", audit_dbgvec);
+	if (result == 1 && errors == 0 && halt_bad == 0 && !dmu_bad &&
+	    (audit_dbgvec < 0 || (dbgvec_hit != 0 && dbgvec_bad == 0)))
 		$display("PASS %s cycles=%0d", prog, cycles);
 	else if (result == 0)
 		$display("FAIL %s: %s at pc=%h, last test %0d", prog,
