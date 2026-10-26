@@ -77,7 +77,7 @@ ap68040 dut (
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(1'b0), .bb_n_i(1'b1), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(), .dbg_xvec(), .dbg_xpc(), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(), .dbg_xvec(), .dbg_xpc(), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_halted(dbg_halted)
 );
 
 logic        xfer_v, xfer_rd;

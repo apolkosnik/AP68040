@@ -90,6 +90,7 @@ module ap68040_dmu
 	output logic [31:0] ldata,
 	output logic [31:0] ldata_al,       // the aligned long (or word, low half)
 	output logic        ldata_alv,      // ... is the load's data
+	output logic        ldata_job,      // debug: ldata is the slow-path job's answer
 	output logic        fault,
 	output logic  [7:0] fvec,
 	output logic [31:0] faddr,
@@ -2489,6 +2490,7 @@ assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DE
 // once the engine has taken the DC2 uop, only its completion releases it
 assign dc2_rdy = !m2.r.v || e_dc2_done || (!e_job && (fast_now || st_simple));
 assign ldata   = e_dc2_done ? e_ldata : fast_data;
+assign ldata_job = e_dc2_done;
 // for AG's capture of a load into a base or index (a short path): the long
 // word of the line the address points at -- the operand itself for an
 // aligned long or an even word (in the low half), else not offered

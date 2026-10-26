@@ -115,6 +115,7 @@ module ap68040_backend
 	input  logic [31:0] dm_ldata,       // load data, right aligned
 	input  logic [31:0] dm_ldata_al,    // the aligned operand (AG's capture)
 	input  logic        dm_ldata_alv,   // ... is the load's data
+	input  logic        dm_ldata_job,   // debug: the load data is the DMU job's answer
 	input  logic        dm_fault,       // DC2 access fault (with info below)
 	input  logic  [7:0] dm_fvec,        // 2 access error, 3 address error
 	input  logic [31:0] dm_faddr,
@@ -151,6 +152,11 @@ module ap68040_backend
 	output logic        dbg_xgo,        // exception processing starts (one clock)
 	output logic  [7:0] dbg_xvec,       // ... its vector
 	output logic [31:0] dbg_xpc,        // ... the PC it stacks
+	output logic        dbg_hfgo,       // an exception routine's handler fetch leaves EX
+	output logic [31:0] dbg_hfld,       // ... its load data
+	output logic [31:0] dbg_hfa,        // ... its A operand (the register value)
+	output logic  [7:0] dbg_hff,        // ... {A source, the DMU job's answer, 5'd0}
+	output logic [31:0] dbg_hfpc,       // ... its PC field
 	output logic        halted,
 	output logic        fetch_stop      // no new instruction fetches: stopped
                                         // (STOP) or halted
@@ -186,6 +192,7 @@ logic [31:0] dc1_er, dc2_er, ex_er;
 logic        erb, erx;         // agb_q / agx_q hold the youngest writer's early result
 logic [31:0] dc2_a, dc2_b, dc2_ea;
 logic [31:0] ex_a,  ex_b,  ex_ea,  ex_ld;
+logic        ex_ldj;           // (debug) ex_ld was the DMU job's answer
 logic        ex_fault;
 logic  [7:0] ex_fvec;
 logic [31:0] ex_faddr;
@@ -1794,6 +1801,7 @@ always_ff @(posedge clk) begin
 			ex_b     <= (exw_v && dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) ? exw_val : dc2_b;
 			ex_ea    <= dc2_ea;
 			ex_ld    <= dm_ldata;
+			ex_ldj   <= dm_ldata_job;
 			ex_upd   <= dc2_upd;
 			ex_upd2  <= dc2_upd2;
 			ex_fault <= (dc2_u.mem != M_NONE) && dm_fault;
@@ -2244,6 +2252,13 @@ always_ff @(posedge clk) begin
 		dbg_ipc <= dbg_ip;
 	end
 end
+// the handler fetch of an exception routine (its last uop: the vector
+// load, the branch to its data) as it leaves EX
+assign dbg_hfgo   = adv_ex && ex_u.br == BR_A && ex_u.op == OP_MOV && ex_u.cond == 4'hF;
+assign dbg_hfld   = ex_ld;
+assign dbg_hfa    = ex_a;
+assign dbg_hff    = {ex_u.a_src, ex_ldj, 5'd0};
+assign dbg_hfpc   = ex_u.pc;
 assign dbg_xgo    = (x_go && !dbg_xirq) || dbg_ig;
 assign dbg_xvec   = dbg_ig ? dbg_iv  : x_vec;
 assign dbg_xpc    = dbg_ig ? dbg_ipc : x_pc;
