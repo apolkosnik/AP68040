@@ -190,7 +190,16 @@ always_ff @(posedge clk) mdis_q <= mdis;
 wire tc_e   = tc[15] && !mdis_q;
 wire tc_e_n = tc[15] && !mdis;      // (tc_e at the next clock)
 wire tc_p  = tc[14];
-wire dc_en = cacr[31] && !cdis;
+// CACR.DE clear stops allocation only: the cache is still searched, a hit
+// is served and written (the MC68040UM 4.3.2 notes a locked access that
+// hit "and the data cache was disabled"; cputest on real 68040/68060
+// boards pushes a return address through copyback memory, clears DE with
+// MOVEC and pops it with RTS, so the hit must still serve it).  CDIS
+// bypasses the caches and leaves their contents alone (4.2; an emulator
+// feature).  WinUAE's data cache (off by default) bypasses on DE clear:
+// a divergence, knowingly.
+wire dc_en   = cacr[31] && !cdis;   // allocation
+wire dc_look = !cdis;               // hits served
 
 //--------------------------------------------------------------------------
 // stage records
@@ -692,12 +701,12 @@ wire        m1_split = (m1.msz != SZ_Q) && (m1_end > 5'd16);
 wire  [7:0] lsd_q    = lsd[m1.a[9:4]];
 wire        m1_sfast = ((m1.mem == M_LD) || (m1.mem == M_ST && x_dc1.cm == 2'b01)) &&
                        m1_split && x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
-                       !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) && !m1.lock;
+                       !x_dc1.cm[1] && dc_look && (m1.ack == 2'd0) && !m1.lock;
 // (locked accesses -- TAS, CAS, CAS2 -- are noncachable (MC68040UM 7.4.1):
 // the slow path pushes and invalidates a hit first)
 wire        m1_fast  = (m1.mem == M_LD || m1.mem == M_RMW) && !m1.lock &&
                        x_dc1.ok && !x_dc1.flt && x_dc1.hit &&
-                       !x_dc1.cm[1] && dc_en && (m1.ack == 2'd0) &&
+                       !x_dc1.cm[1] && dc_look && (m1.ack == 2'd0) &&
                        (m1.msz != SZ_Q) && !m1_split;
 
 //--------------------------------------------------------------------------
@@ -913,7 +922,7 @@ endfunction
 //--------------------------------------------------------------------------
 wire wb_st   = m4.r.v && st_v && (m4.r.mem == M_ST || m4.r.mem == M_RMW);
 wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
-               m4.x.cm == 2'b01 && dc_en && !m4.r.lock && (m4.r.msz != SZ_Q) &&
+               m4.x.cm == 2'b01 && dc_look && !m4.r.lock && (m4.r.msz != SZ_Q) &&
                (e_st == E_IDLE) && !e_wst_done;
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
 wire  [15:0] wbf_be   = bmask(m4.r.a[3:0], nbytes(m4.r.msz));
@@ -927,7 +936,7 @@ always_ff @(posedge clk) dwp <= nreset && wfm;
 // cycle, the second the next (wfs_p1), without the engine
 logic        wfs_p1;
 wire wb_fs = wb_st && m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && m4.x.cm == 2'b01 &&
-             m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_en &&
+             m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_look &&
              !m4.r.lock && (m4.r.msz != SZ_Q) && (e_st == E_IDLE) && !e_wst_done && !wfs_p1;
 wire   [2:0] wfs_n0  = 3'(5'd16 - {1'b0, m4.r.a[3:0]});
 wire  [31:0] wfs_acc = lalign(st_data, m4.r.msz);
@@ -1390,8 +1399,8 @@ always_ff @(posedge clk) begin
 		else begin
 			logic cach, alloc, rd, move16;
 			move16 = (m2.r.msz == SZ_Q);
-			cach   = dc_en && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16;
-			alloc  = cach && !m2.r.noalloc;
+			cach   = dc_look && !e_x.cm[1] && !m2.r.lock && (m2.r.ack == 2'd0) && !move16;
+			alloc  = cach && dc_en && !m2.r.noalloc;
 			rd     = (m2.r.mem == M_LD) || (m2.r.mem == M_RMW);
 			if (e_x.flt) begin
 				e_flt   <= 1'b1;
@@ -1432,15 +1441,15 @@ always_ff @(posedge clk) begin
 				steal <= 1'b0;
 				e_st  <= E_IDLE;
 			end
-			else if (move16 && m2.r.mem == M_LD && e_x.hit && dc_en) begin
+			else if (move16 && m2.r.mem == M_LD && e_x.hit && dc_look) begin
 				// MOVE16 source hit: read from the cache, no allocation
 				e_st <= E_S_RD;
 			end
 			else if (move16 && m2.r.mem == M_ST) begin
 				// MOVE16 destination: a write hit invalidates the line (the
-				// write replaces all of it, 4.3.2) -- unless the data cache
-				// is disabled, which leaves its contents alone
-				if (e_x.hit && dc_en) begin
+				// write replaces all of it, 4.3.2) -- unless CDIS, which
+				// leaves the contents alone
+				if (e_x.hit && dc_look) begin
 					vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1;
 					vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 					e_x.hit <= 1'b0;
@@ -1484,10 +1493,9 @@ always_ff @(posedge clk) begin
 				// cache inhibited, no-allocate miss, locked, MOVE16 miss,
 				// IACK: a matching line is pushed (if dirty) and invalidated
 				// first (4.3.2, 4.6.2; with LOCK for a locked access); the
-				// bus access goes in program order.  With the data cache
-				// disabled (CACR.DE clear, CDIS) the cache's contents are
-				// left alone
-				if (e_x.hit && dc_en && (m2.r.lock || e_x.cm[1] || move16)) begin
+				// bus access goes in program order.  With CDIS the cache's
+				// contents are left alone
+				if (e_x.hit && dc_look && (m2.r.lock || e_x.cm[1] || move16)) begin
 					f_set  <= e_va[9:4];
 					f_way  <= e_x.way;
 					pv_lock <= m2.r.lock;
@@ -1612,13 +1620,13 @@ always_ff @(posedge clk) begin
 		E_W_PART: begin
 			logic [15:0] be; logic upd;
 			be  = bmask(e_va[3:0], e_n);
-			upd = e_x.hit && dc_en && !e_x.cm[1] && !m4.r.lock && (m4.r.msz != SZ_Q);
-			if (e_x.hit && dc_en && (m4.r.lock || e_x.cm[1])) begin
+			upd = e_x.hit && dc_look && !e_x.cm[1] && !m4.r.lock && (m4.r.msz != SZ_Q);
+			if (e_x.hit && dc_look && (m4.r.lock || e_x.cm[1])) begin
 				// a locked write (TAS, CAS: noncachable, 7.4.1) and a
 				// cache-inhibited write bypass the cache: a line they hit is
 				// pushed if dirty and invalidated before the bus write
-				// (4.3.2, 4.6.2) -- unless the data cache is disabled, which
-				// leaves its contents alone
+				// (4.3.2, 4.6.2) -- unless CDIS, which leaves the contents
+				// alone
 				f_set   <= e_va[9:4];
 				f_way   <= e_x.way;
 				pv_lock <= m4.r.lock;
@@ -2080,7 +2088,7 @@ always_ff @(posedge clk) begin
 		E_TW_DESCW:  e_st <= E_TW_DESCW2;
 		E_TW_DESCW2: e_st <= E_TW_DLK;    // (the tags of the set valid: the compare registers)
 		E_TW_DLK: begin
-			if (tw_hhq && dc_en) begin
+			if (tw_hhq && dc_look) begin
 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
 				e_st <= E_TW_EVAL;
 			end
