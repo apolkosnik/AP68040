@@ -210,7 +210,7 @@ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EAR
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl_sk), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(am_bg_n), .bb_n_i((bb_oe ? bb_n_o : 1'b1) & am_bb_n),
 	.bb_n_o(bb_n_o), .bb_oe(bb_oe), .rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_xgo(dbg_xgo), .dbg_xvec(dbg_xvec), .dbg_xpc(dbg_xpc), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_ev(), .dbg_evpc(), .dbg_halted(dbg_halted)
 );
 
 // slave
@@ -229,7 +229,25 @@ logic  [1:0] ev_siz, ev_tt;
 logic  [2:0] ev_tm;
 logic        itci_on;
 logic [15:0] itci_a;
-wire         itci_req = itci_on && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
+// +slowlo=N: a region of slow memory below $1000 (as the A4000's chip RAM
+// is to its CPU): every transfer there waits N more clocks, and an
+// instruction fetch there is cache-inhibited
+int          slowlo;
+initial if (!$value$plusargs("slowlo=%d", slowlo)) slowlo = 0;
+logic [15:0] lo_cnt = '0;
+logic        lo_v_d = 1'b0;
+logic [31:0] lo_a_d = '0;
+wire         lo_new = xfer_v && (!lo_v_d || xfer_addr != lo_a_d);
+always @(posedge clk) begin
+	lo_v_d <= xfer_v;
+	lo_a_d <= xfer_addr;
+	if (lo_new) lo_cnt <= (slowlo != 0 && xfer_addr < 32'h1000) ? 16'(slowlo) : 16'd0;
+	else if (lo_cnt != 0) lo_cnt <= lo_cnt - 1'd1;
+end
+wire         lo_hold = (lo_new && slowlo != 0 && xfer_addr < 32'h1000) || lo_cnt != 0;
+wire         lo_tci  = slowlo != 0 && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
+                       xfer_addr < 32'h1000;
+wire         itci_req = (lo_tci) || itci_on && xfer_v && xfer_rd && (xfer_tm == 3'd2 || xfer_tm == 3'd6) &&
                         xfer_addr[15:4] == itci_a[15:4];
 
 m68040_bus_slave #(.AW(20)) mem (
@@ -238,7 +256,7 @@ m68040_bus_slave #(.AW(20)) mem (
 	.d_mem(d_mem), .ta_n(slv_ta_n), .tea_n(tea_n), .tbi_n(tbi_n), .tci_n(tci_n),
 	.avec_n(avec_n),
 	.wait_mode(wait_mode), .tbi_mode(tbi_mode), .retry_pct(retry_pct),
-	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
+	.tea_req(tea_req), .tci_req(itci_req), .hold(fetch_hold || !mi_n || lo_hold), .oth_ta_n(cpu_ta_oe ? cpu_ta_n : 1'b1),
 	.iack_vector(8'(audit_ivec)), .ext_rdata(32'd0), .ext_inmem(1'b0),
 	.xfer_v(xfer_v), .xfer_addr(xfer_addr), .xfer_rd(xfer_rd), .xfer_siz(xfer_siz),
 	.xfer_tt(xfer_tt), .xfer_tm(xfer_tm), .xfer_beat(xfer_beat),

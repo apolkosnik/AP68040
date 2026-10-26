@@ -83,6 +83,10 @@ module ap68040
 	output logic [31:0] dbg_hfa,       // ... its A operand register value,
 	output logic  [7:0] dbg_hff,       // ... {A source, DMU job answer, 5'0}
 	output logic [31:0] dbg_hfpc,      // ... and its PC field
+	output logic  [2:0] dbg_ev,        // debug: a front-end event this clock: 1 back-end redirect,
+	                                   // 2 decoder redirect, 3 BTB redirect, 4 front-end flush
+	                                   // without a redirect (exception entry), 5 handler fetch
+	output logic [31:0] dbg_evpc,      // ... its target (5: the handler address loaded)
 	output logic        dbg_halted
 );
 
@@ -358,6 +362,16 @@ logic [31:0] qpc;
 logic  [2:0] consume;
 logic        d_redir_v;
 logic [31:0] d_redir_pc;
+logic        dbg_btgo;
+logic [31:0] dbg_btpc;
+always_comb begin
+	dbg_ev = 3'd0; dbg_evpc = 32'd0;
+	if (redir_v)        begin dbg_ev = 3'd1; dbg_evpc = redir_pc; end
+	else if (d_redir_v) begin dbg_ev = 3'd2; dbg_evpc = d_redir_pc; end
+	else if (dbg_btgo)  begin dbg_ev = 3'd3; dbg_evpc = dbg_btpc; end
+	else if (dbg_hfgo)  begin dbg_ev = 3'd5; dbg_evpc = dbg_hfld; end
+	else if (fe_flush)  begin dbg_ev = 3'd4; dbg_evpc = 32'd0; end
+end
 logic  [1:0] rq_n;
 dinst_t      rq0, rq1;
 logic        rq_pop, rq_pop_e;
@@ -366,6 +380,7 @@ ap68040_fetch fetch (
 	.clk(clk), .nreset(nreset),
 	.redir_v(redir_v), .redir_pc(redir_pc),
 	.d_redir_v(d_redir_v), .d_redir_pc(d_redir_pc),
+	.dbg_btgo(dbg_btgo), .dbg_btpc(dbg_btpc),
 	// no fetches while stopped or halted, nor while RSTO is asserted
 	.stop(be_fstop || rsto_busy), .smode(sr[13] || rte_cont),
 	.cacr(cacr), .tc(tc), .itt0(itt0), .itt1(itt1), .cdis(cdis), .mdis(mdis),
