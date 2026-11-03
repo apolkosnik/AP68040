@@ -2024,7 +2024,10 @@ always @(posedge clk) begin
 							a_s <= r_din[95];
 							a_t <= (r_din[95:64] == 32'd0) ? T_ZERO : T_NUM;
 							a_m <= unp_m;
-							a_e <= 17'd16383 + 17'd31;   // integer bit at 63
+							a_e <= (r_din[95:64] == 0) ? 17'd0 : 17'd16383 + 17'd31;
+							// integer bit at 63; a zero gets exponent 0 too, as
+							// F_NORM passes it by and an unimplemented-instruction
+							// frame (FSCALE.L #0) would carry an unnormal ETEMP
 							r_stag <= (r_din[95:64] == 32'd0) ? 3'd1 : 3'd0;
 							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
@@ -2032,7 +2035,7 @@ always @(posedge clk) begin
 							a_s <= r_din[95];
 							a_t <= (r_din[95:80] == 16'd0) ? T_ZERO : T_NUM;
 							a_m <= unp_m;
-							a_e <= 17'd16383 + 17'd15;
+							a_e <= (r_din[95:80] == 0) ? 17'd0 : 17'd16383 + 17'd15;
 							r_stag <= (r_din[95:80] == 16'd0) ? 3'd1 : 3'd0;
 							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
@@ -2040,7 +2043,7 @@ always @(posedge clk) begin
 							a_s <= r_din[95];
 							a_t <= (r_din[95:88] == 8'd0) ? T_ZERO : T_NUM;
 							a_m <= unp_m;
-							a_e <= 17'd16383 + 17'd7;
+							a_e <= (r_din[95:88] == 0) ? 17'd0 : 17'd16383 + 17'd7;
 							r_stag <= (r_din[95:88] == 8'd0) ? 3'd1 : 3'd0;
 							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
