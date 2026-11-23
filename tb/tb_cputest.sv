@@ -64,7 +64,7 @@ logic        mi_n, cpu_ta_n, cpu_ta_oe;
 
 // no other master on this bus: the snoop inputs stay idle, and memory
 // still waits for MI as the 68040 bus requires
-ap68040 dut (
+ap68040 #(.DEBUG(1)) dut (
 	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
 	.a_o(a_o), .a_oe(a_oe),
 	.a_i(a_o), .ts_n_i(1'b1), .rw_n_i(1'b1), .siz_i(2'd0), .tt_i(2'd0), .sc(2'd0),
@@ -77,7 +77,7 @@ ap68040 dut (
 	.tci_n(tci_n), .tbi_n(tbi_n), .ipl_n(~ipl), .avec_n(avec_n),
 	.br_n(br_n), .bg_n(1'b0), .bb_n_i(1'b1), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n),
-	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_halted(dbg_halted)
+	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .dbg_rinfo(), .dbg_xgo(), .dbg_xvec(), .dbg_xpc(), .dbg_hfgo(), .dbg_hfld(), .dbg_hfa(), .dbg_hff(), .dbg_hfpc(), .dbg_ev(), .dbg_evpc(), .dbg_halted(dbg_halted)
 );
 
 logic        xfer_v, xfer_rd;

@@ -259,6 +259,26 @@ always_ff @(posedge clk)
 // synthesis translate_on
 wire [15:0] opw = win[0];
 
+// An FPU general instruction of opclass 000 (register to register): the
+// source is FPm and its EA field is not evaluated, so it has no extension
+// words -- the next instruction follows the command word (the 68881
+// protocol asks the CPU for no EA, the 68040 the same; WinUAE's
+// get_fp_value).  The predecode sized the EA from the operation word
+// alone; this one, from the command word, is the decode's.  (Its mode set
+// stays FPP's: an invalid mode is still illegal.)
+wire  fp_rr = (a0.rt == UA_FPU_GEN) && (win[1][15:13] == 3'b000);
+pd_t  pdx;
+always_comb begin
+	pdx = pd0;
+	if (fp_rr) begin
+		pdx.i0   = EM_NONE;
+		pdx.x0   = 1'b0;
+		pdx.slow = 1'b0;
+		pdx.p1   = pd0.b;
+		pdx.tot  = {1'b0, pd0.b};
+	end
+end
+
 //--------------------------------------------------------------------------
 // state
 //--------------------------------------------------------------------------
@@ -273,11 +293,11 @@ logic        hold_redir;    // a predicted branch is redirecting fetch
 //--------------------------------------------------------------------------
 // fast path
 //--------------------------------------------------------------------------
-wire  [2:0] fb    = pd0.b;
-wire  [2:0] fp1   = pd0.p1;
-wire        full0 = pd0.x0 && win[fb][8];
-wire        full1 = pd0.x1 && win[fp1][8];
-wire        fast  = pd0.legal && !pd0.slow && !full0 && !full1 && (pd0.tot <= 4'd7);
+wire  [2:0] fb    = pdx.b;
+wire  [2:0] fp1   = pdx.p1;
+wire        full0 = pdx.x0 && win[fb][8];
+wire        full1 = pdx.x1 && win[fp1][8];
+wire        fast  = pdx.legal && !pdx.slow && !full0 && !full1 && (pdx.tot <= 4'd7);
 
 //--------------------------------------------------------------------------
 // record assembly
@@ -526,15 +546,15 @@ always_comb begin
 		nrec.opw   = opw;
 		nrec.ext1  = win[1];
 		nrec.ext2  = win[2];
-		nrec.sz    = pd0.sz;
+		nrec.sz    = pdx.sz;
 		nrec.eop   = a0.eop;
 		nrec.econd = a0.econd;
 		nrec.ccr   = a0.ccr;
 		nrec.t0    = a0.t0;
 		pi   = 3'd1 + {1'b0, a0.nfix};
-		nimm = pd0.b - pi;
+		nimm = pdx.b - pi;
 		case (nimm)
-			3'd1:    nrec.imm = (a0.immk == 3'd2 || (a0.immk == 3'd1 && pd0.sz == SZ_B)) ?
+			3'd1:    nrec.imm = (a0.immk == 3'd2 || (a0.immk == 3'd1 && pdx.sz == SZ_B)) ?
 			                    {24'd0, win[pi][7:0]} : sx16(win[pi]);
 			3'd2:    nrec.imm = {win[pi], win[3'(pi + 1)]};
 			default: nrec.imm = 32'd0;
@@ -542,7 +562,7 @@ always_comb begin
 		nrec.ea0 = '0; nrec.ea0.m = EM_NONE;
 		nrec.ea1 = '0; nrec.ea1.m = EM_NONE;
 
-		if (!pd0.legal) begin
+		if (!pdx.legal) begin
 			// illegal / unimplemented operation word
 			use_n    = 4'd1;
 			go       = 1'b1;
@@ -551,41 +571,41 @@ always_comb begin
 			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
 		else if (fast) begin
-			if (pd0.tot <= qcnt || q_flt) begin
+			if (pdx.tot <= qcnt || q_flt) begin
 				go    = 1'b1;
-				use_n = (pd0.tot <= qcnt) ? pd0.tot : qcnt;
-				flt   = |(win_flt & ((9'd1 << pd0.tot) - 9'd1));
-				nrec.ea0 = mk_ea(pd0.i0, opw[2:0], {1'b0, fb},
-				                 (pd0.sz == SZ_L) ? 3'd2 : 3'd1,
+				use_n = (pdx.tot <= qcnt) ? pdx.tot : qcnt;
+				flt   = |(win_flt & ((9'd1 << pdx.tot) - 9'd1));
+				nrec.ea0 = mk_ea(pdx.i0, opw[2:0], {1'b0, fb},
+				                 (pdx.sz == SZ_L) ? 3'd2 : 3'd1,
 				                 qpc + {28'd0, fb, 1'b0},
 				                 win[fb], win[3'(fb + 1)], 16'd0, 16'd0, 16'd0);
 				// (EA1 is MOVE's destination, data alterable: never
 				// PC-relative, so it takes no PC base and no adder)
-				nrec.ea1 = mk_ea(pd0.i1, opw[11:9], {1'b0, fp1}, 3'd0,
+				nrec.ea1 = mk_ea(pdx.i1, opw[11:9], {1'b0, fp1}, 3'd0,
 				                 32'd0,
 				                 win[fp1], win[3'(fp1 + 1)], 16'd0, 16'd0, 16'd0);
 			end
 		end
-		else if ({1'b0, pd0.b} <= qcnt || q_flt) begin
+		else if ({1'b0, pdx.b} <= qcnt || q_flt) begin
 			// slow path, first phase: operation word, fixed words, immediate;
 			// the EAs without extension words are complete already
-			nrec.ea0 = mk_ea(pd0.i0, opw[2:0], 4'd0, 3'd0, 32'd0,
+			nrec.ea0 = mk_ea(pdx.i0, opw[2:0], 4'd0, 3'd0, 32'd0,
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
-			nrec.ea1 = mk_ea(pd0.i1, opw[11:9], 4'd0, 3'd0, 32'd0,
+			nrec.ea1 = mk_ea(pdx.i1, opw[11:9], 4'd0, 3'd0, 32'd0,
 			                 16'd0, 16'd0, 16'd0, 16'd0, 16'd0);
-			use_n = ({1'b0, pd0.b} <= qcnt) ? {1'b0, pd0.b} : qcnt;
-			flt   = |(win_flt & ((8'd1 << pd0.b) - 8'd1));
+			use_n = ({1'b0, pdx.b} <= qcnt) ? {1'b0, pdx.b} : qcnt;
+			flt   = |(win_flt & ((8'd1 << pdx.b) - 8'd1));
 			if (flt) begin
 				go = 1'b1;                   // stop at the faulted part
 			end
 			else begin
 				go_part = 1'b1;
-				nph     = has_ext(pd0.i0) ? PH_EA0 : PH_EA1;
+				nph     = has_ext(pdx.i0) ? PH_EA0 : PH_EA1;
 			end
 		end
 
 		nrec.ilen = use_n;
-		nrec.rt  = (jcond(a0.jc0, pd0.i0, pd0.i1, win[1], pd0.sz, opw[2:0])) ? a0.jt0 :
+		nrec.rt  = (jcond(a0.jc0, pdx.i0, pdx.i1, win[1], pdx.sz, opw[2:0])) ? a0.jt0 :
 		           (a0.jc0 != JC_NEVER) ? a0.rt + 10'd1 : a0.rt;
 		// fixed operand forms: (Ay)+,(Ax)+ and -(Ay),-(Ax); MOVE16
 		if (a0.fea == 2'd3) begin
@@ -609,7 +629,7 @@ always_comb begin
 			nrec.ea1.r = opw[11:9];
 		end
 
-		if (pd0.legal) begin
+		if (pdx.legal) begin
 			if (a0.priv && !smode)
 				nrec.exc = 8'd8;
 			else if (a0.rt == UA_TRAP)
@@ -690,7 +710,7 @@ always_comb begin
 		if (a0.rt == UA_FPU_GEN && nrec.ea0.m == EM_IMM)
 			nrec.ea0.bd = qpc + 32'd4;
 		nrec.target = flt ? f_addr : ntarget;
-		nrec.pred   = nredir && (nrec.exc == 8'd0) && pd0.legal;
+		nrec.pred   = nredir && (nrec.exc == 8'd0) && pdx.legal;
 	end
 end
 
@@ -924,10 +944,10 @@ always_ff @(posedge clk) begin
 					part_call <= rcall;
 					part_ret  <= rret;
 					part_fpg  <= fpg;
-					part_pd   <= pd0;
+					part_pd   <= pdx;
 					part_len  <= use_n;
 					part_imml <= (a0.rt == UA_FPU_GEN) ? fp_immlen(win[1]) :
-					             (pd0.sz == SZ_L) ? 3'd2 : 3'd1;
+					             (pdx.sz == SZ_L) ? 3'd2 : 3'd1;
 				end
 				else
 					part_len <= part_len + use_n;

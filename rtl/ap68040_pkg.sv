@@ -246,6 +246,7 @@ typedef struct packed {
 	logic  [2:0] mfc;
 	logic        mlock;
 	logic        mlocke;    // last transfer of the locked sequence
+	logic        mwi;       // a load checked as a write (write intent)
 	logic        mprog;     // program space (PC-relative operand)
 	// result
 	logic        d_v;

@@ -360,7 +360,12 @@ function automatic logic [5:0] chk_dec(input logic [15:0] ow, input logic [15:0]
 		3'b010: begin
 			if (fm != 3'd7 && oc == 2'd1) x = 1'b1;
 			else if (fm != 3'd7 && oc == 2'd2) begin x = 1'b1; ill = 1'b1; end
-			else if (fm == 3'd7) ;
+			else if (fm == 3'd7) begin
+				// FMOVECR: an <ea> field other than 0 is not one; F-line
+				// (format $0; the M68040FPSP's x_fline.sa handles "an
+				// fmovecr with a non-zero <ea> field")
+				if (ow[5:0] != 6'd0) x = 1'b1;
+			end
 			else if (dn && fp_bytes(fm) > 4'd4) begin
 				// an unimplemented Dn source format records FPIAR first;
 				// a software opmode reports through the FPSP route
@@ -402,7 +407,6 @@ wire chk_ill = cq[4];
 wire chk_un  = cq[3];
 wire chk_ia  = cq[2];
 wire chk_fs  = cq[1];           // FSAVE or FRESTORE
-wire chk_cc  = cq[0];           // FScc FDBcc FTRAPcc
 // synthesis translate_off
 always_ff @(posedge clk)
 	if (nreset && ex_v && sub == FC_CHK && cq != chk_dec(bw, aw)) begin
@@ -844,9 +848,12 @@ always_ff @(posedge clk) begin
 				go    <= 1'b0;
 				done_q <= 1'b0;
 				if (chk_pend) pend <= 1'b0;
-				// FScc FDBcc FTRAPcc record FPIAR once decoded; so do the
-				// encodings that fault after recording it
-				else if ((chk_cc || (chk_x && chk_ia))) begin
+				// the encodings that fault after recording FPIAR.  The
+				// conditionals (FBcc FScc FDBcc FTRAPcc) leave it alone:
+				// their only exception is BSUN, and the M68040FPSP copies
+				// the stacked PC to FPIAR "for MC68881/MC68882
+				// compatibility" (MC68040UM 9.7.1, x_bsun.sa)
+				else if (chk_x && chk_ia) begin
 					f_iawe <= 1'b1;
 					f_iapc <= pc;
 				end

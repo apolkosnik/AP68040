@@ -33,9 +33,11 @@
 ;        copyback line: the line is pushed and invalidated before the bus
 ;        write (4.6.2): a cached read then gets the new data from memory,
 ;        and no later push overwrites it
-;   18-20 with the data cache disabled (CACR.DE clear, CDIS) accesses bypass
-;        it and leave its contents alone (4.4.1): memory's data, no push;
-;        the dirty line is still there for CPUSHA afterwards
+;   18-20 with CACR.DE clear the cache is still searched: a read hits the
+;        dirty line (cputest on real boards pops a return address pushed
+;        through copyback memory after clearing DE); with CDIS accesses
+;        bypass the cache and leave its contents alone (4.2): memory's
+;        data, no push; the dirty line is still there for CPUSHA afterwards
 ;   21-22 a TCI instruction fill serves only the stream it was fetched for:
 ;        after the code there changes, a new call fetches it again (the
 ;        buffer is invalidated after the burst, not copied into the cache,
@@ -45,8 +47,9 @@
 ;        data, a cached store right after allocates the line again and is
 ;        not lost (user data copyback through DTT0, MOVES; supervisor
 ;        inhibited through DTT1; no MOVEC between)
-;   25-26 MOVE16 onto a dirty line with the data cache disabled (CACR.DE
-;        clear, then CDIS) leaves the line alone (4.4.1)
+;   25-26 MOVE16 onto a dirty line with CACR.DE clear invalidates it as
+;        when enabled (the write replaces the line, 4.3.2): the memory it
+;        wrote is read afterwards; with CDIS the line is left alone (4.2)
 ;   27   a TCI instruction line is not kept for the next sequential fetch
 ;        (4.5.1): the bench rewrites the line's second long word after it
 ;        is fetched ($F16C); the instruction there must be the new one
@@ -311,10 +314,11 @@ ma_back:
 	movec	d0,cacr
 	move.l	#$AAAABBBB,($A200).l	; dirty in the cache
 	moveq	#0,d0
-	movec	d0,dtt0
-	movec	d0,cacr		; DE clear
-	move.l	($A200).l,d1	; inhibited: memory, the line untouched
-	chkl	d1,$11112222,18
+	movec	d0,cacr		; DE clear (the page still copyback: a
+	move.l	($A200).l,d1	; hit, the dirty line's data, no push)
+	chkl	d1,$AAAABBBB,18
+	moveq	#0,d0
+	movec	d0,dtt0		; (the bench's registers noncachable again)
 	move.l	#$80000000,d0
 	movec	d0,cacr
 	move.w	#1,(PINS).l	; CDIS
@@ -397,11 +401,13 @@ ma_back:
 	movec	d0,cacr		; DE clear
 	lea	($A500).l,a2
 	lea	($A400).l,a3
-	move16	(a2)+,(a3)+
+	move16	(a2)+,(a3)+	; the hit invalidated the line
 	move.l	#$80008000,d0
 	movec	d0,cacr
-	moves.l	(a0),d1		; the dirty line is still there
-	chkl	d1,$AAAABBBB,25
+	moves.l	(a0),d1		; a miss: the MOVE16's data from memory
+	chkl	d1,$CCCCDDDD,25
+	move.l	#$AAAABBBB,d2
+	moves.l	d2,(a0)		; dirty again
 	move.w	#1,(PINS).l	; CDIS
 	nop
 	nop
