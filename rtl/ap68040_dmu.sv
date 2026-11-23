@@ -134,6 +134,17 @@ module ap68040_dmu
 	output logic  [1:0] ic_inv_scope,   // 1 line, 2 page, 3 all
 	output logic [31:0] ic_inv_pa,
 	input  logic        ic_inv_done,
+	// self-snoop (see ss_hit): the instruction cache's tag copies are read
+	// at ssl_ra and compared with ssl_pa (the store at WB); ss_v/ss_pa ask
+	// the fetch unit to drop a line a store at WB wrote; ss_redir tells WB
+	// to refetch what follows the store
+	input  logic        ss_en,          // ic_self: the self-snoop is on
+	output logic  [5:0] ssl_ra,
+	output logic [31:4] ssl_pa,
+	input  logic        ssl_hit,
+	output logic        ss_v,
+	output logic [31:4] ss_pa,
+	output logic        ss_redir,
 	output logic        iatc_flush_all,
 	output logic        iatc_flush_page,
 	output logic        iatc_flush_ng,
@@ -895,7 +906,21 @@ endfunction
 // WB fast store: a copyback store that hit, within one line
 //--------------------------------------------------------------------------
 wire wb_st   = m4.r.v && st_v && (m4.r.mem == M_ST || m4.r.mem == M_RMW);
-wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit &&
+// Self-snoop (ic_self; not a 68040 behaviour): software for the 68000-68030 copies
+// or patches code and runs it without CINV/CPUSH, which a 68030's 256-byte
+// cache let pass (a packed program unpacking itself over its depacker).  A
+// store at WB whose line the instruction cache holds (ssl_hit: the fetch
+// unit's tag copies, read at the address of the uop entering WB) takes the
+// engine and is written through to memory even in copyback mode; when it is
+// done the fetch unit drops the line (ss_v) and WB refetches everything
+// after the store (ss_redir), which the front end may have fetched from
+// the old line.  A store that misses costs nothing.
+assign ssl_ra = adv_ex ? m3.x.pa[9:4] : m4.x.pa[9:4];
+assign ssl_pa = m4.x.pa[31:4];
+wire   ss_hit = ss_en && wb_st && m4.x.ok && !m4.x.flt && ssl_hit;
+logic  ss_wt;                 // the engine's store: written through for the I-cache
+assign ss_redir = ss_wt;
+wire wb_fast = wb_st && !m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && !ss_hit &&
                m4.x.cm == 2'b01 && dc_en && !m4.r.lock && (m4.r.msz != SZ_Q) &&
                (e_st == E_IDLE) && !e_wst_done;
 wire  [31:0] wbf_word = lanes32(lalign(st_data, m4.r.msz), m4.r.a[1:0]);
@@ -909,7 +934,7 @@ always_ff @(posedge clk) dwp <= nreset && wfm;
 // a copyback store across a line, both parts hits: the first part this
 // cycle, the second the next (wfs_p1), without the engine
 logic        wfs_p1;
-wire wb_fs = wb_st && m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && m4.x.cm == 2'b01 &&
+wire wb_fs = wb_st && m4.split && m4.x.ok && !m4.x.flt && m4.x.hit && m4.x.cm == 2'b01 && !ss_hit &&
              m4.x1.ok && !m4.x1.flt && m4.x1.hit && m4.x1.cm == 2'b01 && dc_en &&
              !m4.r.lock && (m4.r.msz != SZ_Q) && (e_st == E_IDLE) && !e_wst_done && !wfs_p1;
 wire   [2:0] wfs_n0  = 3'(5'd16 - {1'b0, m4.r.a[3:0]});
@@ -1011,6 +1036,7 @@ always_ff @(posedge clk) begin
 	// cycle it comes), and e_wst_done keeps the engine from doing the store
 	// again -- a pulse there was lost and WB waited for it forever
 	if (adv_wb || !wb_st) st_rdy_r <= 1'b0;
+	if (adv_wb) ss_wt <= 1'b0;         // (E_W_START below sets it for its store)
 	mt_done   <= 1'b0;
 	iw_done   <= 1'b0;
 	atc_wr    <= 1'b0;
@@ -1020,6 +1046,7 @@ always_ff @(posedge clk) begin
 	iatc_flush_page <= 1'b0;
 	iatc_wr   <= 1'b0;
 	tw_b      <= 1'b0;
+	ss_v      <= 1'b0;
 	dw        <= 1'b0;
 	steal_q   <= steal;
 	atc_la_q  <= steal  ? st_la[31:12] : adv_ag ? dm_va[31:12] : m1.a[31:12];
@@ -1065,6 +1092,7 @@ always_ff @(posedge clk) begin
 		sp_dw  <= 1'b0;
 		sp_job <= 1'b0;
 		wfs_p1 <= 1'b0;
+		ss_wt  <= 1'b0; ss_v <= 1'b0; ss_pa <= '0;
 		e_job <= 1'b0;
 		m1_stale <= 1'b0;
 		sn_ph <= SN_IDLE; sn_src <= '0; sn_way <= '0; bo_cancel <= 1'b0;
@@ -1583,6 +1611,7 @@ always_ff @(posedge clk) begin
 		// locked, split, MOVE16)
 		//==============================================================
 		E_W_START: begin
+			ss_wt  <= ss_hit;
 			e_part <= 1'b0;
 			e_acc  <= lalign(st_data, m4.r.msz);
 			e_va   <= m4.r.a;
@@ -1622,7 +1651,7 @@ always_ff @(posedge clk) begin
 						vp_set = e_va[9:4]; vp_wm[e_x.way] = 1'b1; vp_dwe = 1'b1; vp_dv = 1'b1;
 					end
 			end
-			if (upd && e_x.cm == 2'b01) begin
+			if (upd && e_x.cm == 2'b01 && !ss_wt) begin
 				e_st <= E_W_DONE;            // copyback: no bus write
 			end
 			else begin
@@ -1671,6 +1700,8 @@ always_ff @(posedge clk) begin
 				st_fault_r   <= 1'b0;
 				e_wst_done <= 1'b1;
 				e_st       <= E_IDLE;
+				ss_v       <= ss_wt;
+				ss_pa      <= m4.x.pa[31:4];
 			end
 		end
 

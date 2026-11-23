@@ -121,6 +121,7 @@ module ap68040_backend
 	output logic [31:0] dm_st_data,
 	input  logic        dm_st_rdy,      // store accepted (WB may complete)
 	input  logic        dm_st_fault,
+	input  logic        dm_ss_redir,    // the store at WB rewrote a cached instruction line
 	input  logic [15:0] dm_st_fssw,
 	input  logic [31:0] dm_st_faddr,
 
@@ -1361,6 +1362,14 @@ logic        wb_cof;          // the uop's control transfer was taken
 
 wire wb_is_exc   = wb_v && !wb_ok;
 wire wb_commit   = adv_wb && !wb_is_exc;
+// A store that rewrote a line the instruction cache held (the DMU's
+// self-snoop, dm_ss_redir) refetches what follows it: the front end may
+// have fetched it from the old line.  A store uop before the instruction's
+// last defers the refetch to the instruction's end (ss_pend), as smc_pend
+// does: redirecting there would drop the remaining uops.
+logic ss_pend;
+wire  wb_ssr   = wb_v && wb_u.last && (ss_pend || (wb_st && dm_ss_redir));
+wire  wb_rdx   = wb_redir || wb_ssr;      // the redirect, either cause
 wire wb_bound    = wb_commit && wb_u.last;
 // the mask an IPEND claim is made against: sr_r, or the new mask on the
 // cycle an SR write commits (sr_r takes it at the end of that cycle)
@@ -1489,7 +1498,7 @@ assign mt_wr     = (wb_u.cond == 4'd5) && !wb_u.imm_b[5];   // PTESTW $F548, PTE
 logic        rst_seq;         // reset exception pending (first cycles)
 
 // same-cycle kill of every younger uop: WB takes an exception or redirects
-assign kill_now = (adv_wb && (wb_is_exc || wb_redir)) || x_go;
+assign kill_now = (adv_wb && (wb_is_exc || wb_rdx)) || x_go;
 
 // exception entry values
 logic  [7:0] x_vec;
@@ -1597,6 +1606,7 @@ always_ff @(posedge clk) begin
 		sk_vr <= 1'b0;
 		eredir_pend <= 1'b0;
 		wb_eredir   <= 1'b0;
+		ss_pend     <= 1'b0;
 		fv <= 32'd0;
 		xw_ph <= 3'd0;
 		ccr_f   <= 5'd0;
@@ -1953,6 +1963,8 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (wb_commit) begin
 			dbg_retire <= wb_u.last;
+			if (wb_u.last) ss_pend <= 1'b0;
+			else if (wb_st && dm_ss_redir) ss_pend <= 1'b1;
 			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
@@ -1982,9 +1994,9 @@ always_ff @(posedge clk) begin
 				stopped <= 1'b1;
 				stop_pc <= wb_npc;
 			end
-			if (wb_redir) begin
+			if (wb_rdx) begin
 				flush    <= 1'b1;
-				if (!wb_eredir) begin
+				if (!wb_eredir || wb_ssr) begin
 					fe_flush <= 1'b1;
 					redir_v  <= 1'b1;
 					redir_pc <= wb_redir_pc;
@@ -2030,6 +2042,7 @@ always_ff @(posedge clk) begin
 			rt_armed <= 1'b0;
 			cm_pend  <= 1'b0;
 			smc_pend <= 1'b0;
+			ss_pend  <= 1'b0;
 			vw = {x_fmt, 2'b00, x_vec, 2'b00};
 			flush    <= 1'b1;
 			fe_flush <= 1'b1;
@@ -2089,7 +2102,7 @@ always_ff @(posedge clk) begin
 			m_ex = fwe[2] ? (32'd1 << fwa[2]) : 32'd0;
 			fv <= fv | (adv_ag ? m_ag : 32'd0) | m_ex;
 		end
-		if ((wb_commit && wb_redir) || wb_refetch || x_go) fv <= 32'd0;
+		if ((wb_commit && wb_rdx) || wb_refetch || x_go) fv <= 32'd0;
 		// synthesis translate_off
 		if (fwe[0] != (adv_ag && fwe_ag[0]) || fwe[1] != (adv_ag && fwe_ag[1])) begin
 			$display("FAIL: the front writes %b, the advance %b and AG's %b", fwe, adv_ag, fwe_ag);
